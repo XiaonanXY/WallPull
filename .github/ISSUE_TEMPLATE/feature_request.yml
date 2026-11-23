@@ -1,0 +1,19 @@
+name: 功能建议 / 体验优化
+description: 有希望新增的功能或界面交互改进思路？欢迎提出想法。
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 使用场景或痛点
+      description: 这个需求想解决什么日常使用问题？
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 期望的实现方式
+      description: 请描述你希望的功能交互、按钮位置或处理逻辑
+    validations:
+      required: true

@@ -1,0 +1,40 @@
+name: Bug 反馈 / 问题报告
+description: 遇到崩溃、解包异常、壁纸无法导出或界面显示问题？欢迎提交详细信息。
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你使用 **WallPull** 并帮助改进项目！请尽量补充复现步骤，方便快速定位问题。
+  - type: input
+    id: version
+    attributes:
+      label: 软件版本
+      description: 可在「设置 → 关于与反馈」中查看当前版本号
+      placeholder: "例如：v1.0.0"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: 操作系统环境
+      placeholder: "例如：Windows 11 24H2 x64"
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述与复现步骤
+      description: 请描述具体表现以及触发前进行的操作
+      placeholder: |
+        1. 打开 ...
+        2. 点击 ...
+        3. 出现异常 ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望表现与补充信息
+      description: 如有报错提示截图、Wallpaper Engine 目录结构说明或壁纸类型（scene / video / image），可一并补充（注意隐藏个人敏感信息）

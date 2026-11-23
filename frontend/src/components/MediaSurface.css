@@ -1,0 +1,73 @@
+.media-surface {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 16px;
+  overflow: hidden;
+  background: transparent;
+}
+
+.media-surface.is-interactive {
+  width: 100%;
+  height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: inherit;
+  overflow: hidden;
+  background: transparent;
+  outline: none;
+  box-shadow: none;
+}
+
+.media-content-layer {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  opacity: 0;
+  transition: opacity 220ms ease;
+}
+
+.media-surface.is-interactive .media-content-layer {
+  width: 100%;
+  height: 100%;
+}
+
+.media-content-layer.is-ready {
+  opacity: 1;
+}
+
+.fusion-image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  background: transparent;
+  pointer-events: none;
+}
+
+.media-surface.is-interactive .fusion-image {
+  width: 100%;
+  height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 0;
+  pointer-events: auto;
+}
+
+.media-surface.is-interactive .fusion-video,
+.media-surface.is-interactive .fusion-still {
+  width: calc(100% + 2px);
+  height: calc(100% + 2px);
+  max-width: none;
+  max-height: none;
+  margin: -1px;
+  border-radius: 0;
+}
+
+.fusion-still,
+.fusion-video {
+  object-fit: cover;
+}

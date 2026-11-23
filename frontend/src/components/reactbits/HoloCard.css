@@ -1,0 +1,52 @@
+.holo-card {
+  --hc-w: 230px;
+  --hc-ratio: 1;
+  --hc-radius: 16px;
+  --hc-gx: 50%;
+  --hc-gy: 50%;
+  --hc-angle: 125deg;
+
+  position: relative;
+  display: inline-block;
+  width: var(--hc-w);
+  max-width: 100%;
+  aspect-ratio: var(--hc-ratio);
+  border-radius: var(--hc-radius);
+  outline: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.holo-card__rotor {
+  position: absolute;
+  inset: 0;
+}
+
+.holo-card__face {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+  border-radius: var(--hc-radius);
+}
+
+/* Crisp subtle diagonal glass specular glint — ZERO foggy wash */
+.holo-card__glare {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 220ms ease;
+  background: radial-gradient(
+    circle at var(--hc-gx) var(--hc-gy),
+    rgb(255 255 255 / 22%) 0%,
+    rgb(255 255 255 / 6%) 32%,
+    transparent 62%
+  );
+  mix-blend-mode: overlay;
+}
+
+.holo-card:hover .holo-card__glare {
+  opacity: 1;
+}

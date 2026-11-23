@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="wv-bg" x1="64" y1="48" x2="448" y2="464" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#7c3aed" />
+      <stop offset="55%" stop-color="#5b21b6" />
+      <stop offset="100%" stop-color="#2e1065" />
+    </linearGradient>
+    <linearGradient id="wv-lavender" x1="160" y1="90" x2="420" y2="360" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ddd6fe" />
+      <stop offset="100%" stop-color="#a78bfa" />
+    </linearGradient>
+  </defs>
+
+  <!-- Main circular badge -->
+  <circle cx="256" cy="256" r="244" fill="url(#wv-bg)" />
+
+  <!-- Back-right frame flowing seamlessly into lower-left vault arc -->
+  <path
+    d="M 192 146
+       V 136
+       A 34 34 0 0 1 226 102
+       H 368
+       A 34 34 0 0 1 402 136
+       V 290
+       A 34 34 0 0 1 368 324
+       H 256
+       A 68 68 0 0 1 200 220"
+    fill="none"
+    stroke="url(#wv-lavender)"
+    stroke-width="30"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+
+  <!-- Front-left frame flowing seamlessly into upper-right vault arc -->
+  <path
+    d="M 320 366
+       V 376
+       A 34 34 0 0 1 286 410
+       H 144
+       A 34 34 0 0 1 110 376
+       V 222
+       A 34 34 0 0 1 144 188
+       H 256
+       A 68 68 0 0 1 312 292"
+    fill="none"
+    stroke="#ffffff"
+    stroke-width="30"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+
+  <!-- Center Vault "V" emblem -->
+  <path
+    d="M 226 238 L 256 282 L 286 238"
+    fill="none"
+    stroke="#ffffff"
+    stroke-width="24"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>

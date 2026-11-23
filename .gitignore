@@ -1,0 +1,23 @@
+# Rust build outputs
+/target/
+/release/
+*.pdb
+*.exe
+
+# Frontend dependencies & build bundle
+/frontend/node_modules/
+/frontend/dist/
+*.tsbuildinfo
+
+# Logs & temporary files
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment & IDE configs
+.env
+.env.*
+.vscode/
+.idea/

@@ -1,0 +1,88 @@
+.border-glow-card {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  border-radius: var(--border-radius);
+}
+
+.border-glow-card.is-selected {
+  isolation: isolate;
+}
+
+.border-glow-card::before {
+  content: none;
+  position: absolute;
+  z-index: -1;
+  inset: -4px;
+  border-radius: calc(var(--border-radius) + 4px);
+  background: conic-gradient(
+    from 0deg,
+    var(--selection-accent),
+    #0066ff,
+    #00c8ff,
+    #00d97e,
+    #ffe100,
+    #ff1744,
+    var(--selection-accent)
+  );
+  opacity: 0;
+  pointer-events: none;
+  padding: 3px;
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  transform-origin: center;
+}
+
+.border-glow-card.is-selected.selection-orbit::before {
+  content: "";
+  opacity: 1;
+  animation: border-glow-spin 3.8s linear infinite;
+}
+
+.border-glow-card.is-selected.selection-snake::before {
+  content: "";
+  opacity: 1;
+  background: conic-gradient(
+    from var(--snake-angle),
+    transparent 0deg 238deg,
+    #2563eb 258deg,
+    #00bfe8 278deg,
+    #00d97e 298deg,
+    #ffd500 318deg,
+    #ff1744 338deg,
+    transparent 360deg
+  );
+  animation: border-glow-snake 2.8s linear infinite;
+}
+
+.border-glow-inner {
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+}
+
+@keyframes border-glow-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@property --snake-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+
+@keyframes border-glow-snake {
+  to {
+    --snake-angle: 360deg;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .border-glow-card.is-selected::before {
+    animation: none;
+  }
+}
