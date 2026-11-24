@@ -1,4 +1,5 @@
 use crate::actions::is_archived_offline;
+use crate::duplicates::compute_visual_profile;
 use crate::media::{
     create_image_thumbnail_cancellable, detect_media_type, find_executable,
     is_recognized_media_path, probe_or_fallback_cancellable, try_create_video_preview_cancellable,
@@ -20,8 +21,45 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Copy)]
+pub struct ScanProgressInfo<'a> {
+    pub message: &'a str,
+    pub phase: &'a str,
+    pub current: usize,
+    pub total: usize,
+}
+
+fn enrich_item_visual_profile(item: &mut WallpaperItem) {
+    if item.color_bucket.is_some() && item.visual_fingerprint.is_some() {
+        return;
+    }
+    let img_path = if Path::new(&item.preview_path).is_file() {
+        Some(Path::new(&item.preview_path))
+    } else if item.item_type == "image" && Path::new(&item.source_path).is_file() {
+        Some(Path::new(&item.source_path))
+    } else {
+        None
+    };
+    let Some(img_path) = img_path else {
+        return;
+    };
+    let src_opt = if Path::new(&item.source_path).is_file() {
+        Some(Path::new(&item.source_path))
+    } else {
+        None
+    };
+    if let Some((bucket, fp)) = compute_visual_profile(img_path, src_opt) {
+        if item.color_bucket.is_none() {
+            item.color_bucket = Some(bucket);
+        }
+        if item.visual_fingerprint.is_none() {
+            item.visual_fingerprint = Some(fp);
+        }
+    }
+}
 
 fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
     cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false)
@@ -379,6 +417,35 @@ where
     FProgress: Fn(&str) + Sync,
     FBatch: Fn(&[WallpaperItem]) + Sync,
 {
+    scan_wallpapers_with_progress(
+        workshop_roots,
+        parse_scenes,
+        force_rescan,
+        fetch_online_titles,
+        use_hw_decode,
+        cache_path_override,
+        cancel,
+        |info| on_progress(info.message),
+        on_batch,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn scan_wallpapers_with_progress<FProgress, FBatch>(
+    workshop_roots: &[String],
+    parse_scenes: bool,
+    force_rescan: bool,
+    fetch_online_titles: bool,
+    use_hw_decode: bool,
+    cache_path_override: Option<&Path>,
+    cancel: Option<&AtomicBool>,
+    on_progress: FProgress,
+    on_batch: FBatch,
+) -> WallpaperScanResult
+where
+    FProgress: Fn(ScanProgressInfo<'_>) + Sync,
+    FBatch: Fn(&[WallpaperItem]) + Sync,
+{
     let catalog_path = cache_path_override
         .map(PathBuf::from)
         .unwrap_or_else(|| cache_root().join("wallpaper-catalog.json"));
@@ -392,7 +459,7 @@ where
     let scan_cache: WallpaperScanCache = fs::read(&catalog_path)
         .ok()
         .and_then(|b| serde_json::from_slice::<WallpaperScanCache>(&b).ok())
-        .filter(|c| c.version == WallpaperScanCache::CURRENT_VERSION)
+        .filter(|c| c.version == 5 || c.version == WallpaperScanCache::CURRENT_VERSION)
         .unwrap_or_else(WallpaperScanCache::empty);
 
     let mut cached_map: HashMap<String, WallpaperScanCacheProject> = HashMap::new();
@@ -417,6 +484,8 @@ where
     let mut live_projects: HashMap<String, (String, String)> = HashMap::new();
     let mut pending: Vec<(String, String, String)> = Vec::new();
     let mut freshly_parsed_ids: HashSet<String> = HashSet::new();
+    let mut reused_batch_buf: Vec<WallpaperItem> = Vec::with_capacity(200);
+    let mut backfill_indices: Vec<usize> = Vec::new();
 
     for root in &roots {
         let Ok(dir_entries) = fs::read_dir(root) else {
@@ -458,8 +527,18 @@ where
                 if let Some(cached) = cached_map.get(&key) {
                     if can_reuse_cached(cached, &ws_id, has_ffmpeg) {
                         if !cached.items.is_empty() && !is_cancelled(cancel) {
-                            on_batch(&cached.items);
-                            items.extend(cached.items.clone());
+                            for it in &cached.items {
+                                let idx = items.len();
+                                if it.color_bucket.is_none() || it.visual_fingerprint.is_none() {
+                                    backfill_indices.push(idx);
+                                }
+                                items.push(it.clone());
+                                reused_batch_buf.push(it.clone());
+                            }
+                            if reused_batch_buf.len() >= 200 {
+                                on_batch(&reused_batch_buf);
+                                reused_batch_buf.clear();
+                            }
                         }
                         let mut reused_entry = cached.entry.clone();
                         reused_entry.state = if reused_entry.state == "warning" {
@@ -478,11 +557,96 @@ where
         }
     }
 
+    if !reused_batch_buf.is_empty() && !is_cancelled(cancel) {
+        on_batch(&reused_batch_buf);
+        reused_batch_buf.clear();
+    }
+
+    let worker_threads = std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).clamp(4, 8))
+        .unwrap_or(4);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_threads)
+        .build()
+        .ok();
+
+    if !backfill_indices.is_empty() && !is_cancelled(cancel) {
+        let total = backfill_indices.len();
+        on_progress(ScanProgressInfo {
+            message: &format!("正在构建色彩光谱与视觉指纹 (0 / {total})…"),
+            phase: "color-index",
+            current: 0,
+            total,
+        });
+        let done_counter = AtomicUsize::new(0);
+        let last_emit = Mutex::new(Instant::now());
+        let snapshots: Vec<(usize, WallpaperItem)> = backfill_indices
+            .iter()
+            .map(|&idx| (idx, items[idx].clone()))
+            .collect();
+
+        let run_backfill = || {
+            snapshots
+                .into_par_iter()
+                .filter_map(|(idx, mut it)| {
+                    if is_cancelled(cancel) {
+                        return None;
+                    }
+                    enrich_item_visual_profile(&mut it);
+                    let done = done_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    let should_emit = done == total
+                        || last_emit
+                            .lock()
+                            .map(|mut t| {
+                                if t.elapsed() >= Duration::from_millis(60) {
+                                    *t = Instant::now();
+                                    true
+                                } else {
+                                    false
+                                }
+                            })
+                            .unwrap_or(false);
+                    if should_emit {
+                        on_progress(ScanProgressInfo {
+                            message: &format!("正在构建色彩光谱与视觉指纹 ({done} / {total})…"),
+                            phase: "color-index",
+                            current: done,
+                            total,
+                        });
+                    }
+                    Some((idx, it))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let enriched = match &pool {
+            Some(p) => p.install(run_backfill),
+            None => run_backfill(),
+        };
+        if !is_cancelled(cancel) {
+            let mut updated_batch = Vec::with_capacity(enriched.len());
+            for (idx, it) in enriched {
+                items[idx] = it.clone();
+                updated_batch.push(it);
+            }
+            for chunk in updated_batch.chunks(200) {
+                on_batch(chunk);
+            }
+        }
+    }
+
     if !pending.is_empty() && !is_cancelled(cancel) {
         let total = pending.len();
-        on_progress(&format!("正在解析壁纸 (0 / {total})…"));
+        on_progress(ScanProgressInfo {
+            message: &format!("正在解析壁纸 (0 / {total})…"),
+            phase: "scan",
+            current: 0,
+            total,
+        });
         let done_counter = AtomicUsize::new(0);
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().ok();
+        let last_emit = Mutex::new(Instant::now());
+        let pending_batch_buf: Mutex<Vec<WallpaperItem>> = Mutex::new(Vec::with_capacity(24));
+
         let run_pending = || {
             pending
                 .par_iter()
@@ -503,10 +667,39 @@ where
                         return None;
                     }
                     if !parsed_items.is_empty() {
-                        on_batch(&parsed_items);
+                        let flush_chunk = pending_batch_buf.lock().ok().and_then(|mut buf| {
+                            buf.extend(parsed_items.iter().cloned());
+                            if buf.len() >= 16 {
+                                Some(std::mem::take(&mut *buf))
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(chunk) = flush_chunk {
+                            on_batch(&chunk);
+                        }
                     }
                     let done = done_counter.fetch_add(1, Ordering::SeqCst) + 1;
-                    on_progress(&format!("正在解析壁纸 ({done} / {total})…"));
+                    let should_emit = done == total
+                        || last_emit
+                            .lock()
+                            .map(|mut t| {
+                                if t.elapsed() >= Duration::from_millis(60) {
+                                    *t = Instant::now();
+                                    true
+                                } else {
+                                    false
+                                }
+                            })
+                            .unwrap_or(false);
+                    if should_emit {
+                        on_progress(ScanProgressInfo {
+                            message: &format!("正在解析壁纸 ({done} / {total})…"),
+                            phase: "scan",
+                            current: done,
+                            total,
+                        });
+                    }
                     Some((ws_id.clone(), parsed_items, entry))
                 })
                 .collect::<Vec<_>>()
@@ -516,6 +709,13 @@ where
             Some(p) => p.install(run_pending),
             None => run_pending(),
         };
+
+        if let Ok(mut buf) = pending_batch_buf.lock() {
+            if !buf.is_empty() && !is_cancelled(cancel) {
+                on_batch(&buf);
+                buf.clear();
+            }
+        }
 
         for (ws_id, parsed_items, entry) in outcomes {
             if !parsed_items.is_empty() && matches!(entry.state.as_str(), "success" | "warning") {
@@ -958,7 +1158,7 @@ fn to_wallpaper_item(
     } else {
         format!("{workshop_id}:{}:{}", asset.media_type, index + 1)
     };
-    WallpaperItem {
+    let mut item = WallpaperItem {
         id,
         workshop_id: workshop_id.to_string(),
         title: title.to_string(),
@@ -984,7 +1184,11 @@ fn to_wallpaper_item(
             .map(strip_verbatim_prefix),
         folder_size,
         audio_paths: audio_paths.map(|v| v.into_iter().map(|s| strip_verbatim_prefix(&s)).collect()),
-    }
+        color_bucket: None,
+        visual_fingerprint: None,
+    };
+    enrich_item_visual_profile(&mut item);
+    item
 }
 
 fn format_duration(seconds: f64) -> String {

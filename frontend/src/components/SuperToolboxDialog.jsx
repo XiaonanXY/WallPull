@@ -18,6 +18,7 @@ import {
   X,
 } from '@phosphor-icons/react'
 import { formatBytes } from '../appConfig.js'
+import FluxProgressBar from './reactbits/FluxProgressBar.jsx'
 
 const LAYOUT_SCHEMES = [
   { id: 'sidebar', label: '侧面工作台' },
@@ -76,6 +77,9 @@ const BADGE_OPTIONS = [
 export default function SuperToolboxDialog({
   open,
   busy = false,
+  taskProgress = null,
+  cancelling = false,
+  onCancelTask,
   onClose,
   wallpapers = [],
   favoriteIds = [],
@@ -685,6 +689,26 @@ export default function SuperToolboxDialog({
                 </button>
               </div>
             </header>
+
+            <AnimatePresence initial={false}>
+              {busy && taskProgress ? (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                  transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
+                  className="shrink-0 overflow-hidden border-b border-base-300/60 bg-base-200/35 px-6"
+                >
+                  <div className="py-3">
+                    <FluxProgressBar
+                      progress={taskProgress}
+                      cancelling={cancelling}
+                      onCancel={onCancelTask}
+                    />
+                  </div>
+                </motion.div>
+              ) : null}
+            </AnimatePresence>
 
             {layoutScheme === 'sidebar' ? (
               <div className="flex min-h-0 flex-1 flex-col md:flex-row">

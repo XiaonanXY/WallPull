@@ -1,4 +1,4 @@
-import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
   ArrowsClockwise,
@@ -19,6 +19,11 @@ import {
   X,
 } from '@phosphor-icons/react'
 import { AnimatePresence, motion } from 'motion/react'
+import { formatColor } from '@appica/ui-react'
+import {
+  ColorSwatchPicker,
+  ColorSwatchPickerItem,
+} from '@appica/ui-react/color-swatch-picker'
 import FusionDemo from './components/FusionDemo.jsx'
 import CardContextMenu from './components/CardContextMenu.jsx'
 import ClickSpark from './components/ClickSpark.jsx'
@@ -27,6 +32,8 @@ import DuplicateInspectorDialog from './components/DuplicateInspectorDialog.jsx'
 import SceneLayerStudioDialog from './components/SceneLayerStudioDialog.jsx'
 import SuperToolboxDialog from './components/SuperToolboxDialog.jsx'
 import CallChip from './components/reactbits/CallChip.jsx'
+import FluxProgressBar from './components/reactbits/FluxProgressBar.jsx'
+import LatticeLoader from './components/reactbits/LatticeLoader.jsx'
 import ShinyText from './components/reactbits/ShinyText.jsx'
 import TechText from './components/reactbits/TechText.jsx'
 import SettingsPage from './components/SettingsPage.jsx'
@@ -61,6 +68,7 @@ export default function App() {
   const [specFilter, setSpecFilter] = useState('all')
   const [ratingFilter, setRatingFilter] = useState('all')
   const [colorFilter, setColorFilter] = useState(null)
+  const [hoveredColorBucket, setHoveredColorBucket] = useState(null)
   const [colorVersion, setColorVersion] = useState(0)
   const [sortBy, setSortBy] = useState('default')
   const [filterPopoverOpen, setFilterPopoverOpen] = useState(false)
@@ -95,12 +103,17 @@ export default function App() {
   const [activeHardwareAccelerationMode, setActiveHardwareAccelerationMode] = useState('gpu')
   const [toolboxOpen, setToolboxOpen] = useState(false)
   const [toolboxBusy, setToolboxBusy] = useState(false)
+  const [toolboxProgress, setToolboxProgress] = useState(null)
+  const [toolboxCancelling, setToolboxCancelling] = useState(false)
   const [toolboxFiles, setToolboxFiles] = useState([])
   const [migrationStatus, setMigrationStatus] = useState(null)
   const [wePropertiesState, setWePropertiesState] = useState({ id: null, loading: false, properties: [] })
   const [studioState, setStudioState] = useState({ open: false, loading: false, rendering: false })
   const [dupState, setDupState] = useState({ open: false, loading: false, result: null })
   const [deleteTargets, setDeleteTargets] = useState([])
+  const [scanProgress, setScanProgress] = useState(null)
+  const [colorIndexProgress, setColorIndexProgress] = useState({ running: false, indexed: 0, total: 0 })
+  const deferredQuery = useDeferredValue(query)
   const stageSectionRef = useRef(null)
   const wheelTurnStampRef = useRef(0)
   const latestScanRequestId = useRef(null)
@@ -118,6 +131,7 @@ export default function App() {
       resetRevealedMedia()
       resetColorCache()
       setWallpapers([])
+      setScanProgress(null)
       setLoading(true)
       latestScanRequestId.current = requestId
     }
@@ -132,6 +146,23 @@ export default function App() {
         activeToolboxRequestId.current = requestId
       }
       setToolboxBusy(true)
+      setToolboxCancelling(false)
+      setToolboxProgress({
+        taskKind: type === 'wallpapers.slim-videos.request'
+          ? 'slim-videos'
+          : type === 'toolbox.media.convert'
+            ? 'convert'
+            : type === 'wallpapers.archive-offline.request'
+              ? 'archive'
+              : type === 'toolbox.packages.unpack'
+                ? 'unpack'
+                : 'migration',
+        message: '正在准备任务…',
+        currentIndex: 0,
+        totalCount: 0,
+        overallPercent: null,
+        cancellable: type !== 'toolbox.migration.execute',
+      })
     }
     globalThis.chrome.webview.postMessage({
       version: 1,
@@ -235,6 +266,7 @@ export default function App() {
     }
     setWallpapers([])
     setErrorMessage(null)
+    setScanProgress(null)
     setCurrentPage(1)
     setLoading(true)
     setStatus(force ? '正在强制重新扫描创意工坊…' : '正在解析创意工坊中的原图与原视频…')
@@ -322,7 +354,14 @@ export default function App() {
         setSparkSizeText(String(message.payload?.sparkSizePercent ?? 0))
       }
       if (message.type === 'wallpapers.scan.status') {
-        setStatus(message.payload?.message ?? '正在扫描…')
+        const msg = message.payload?.message ?? '正在扫描…'
+        setStatus(msg)
+        setScanProgress({
+          message: msg,
+          phase: message.payload?.phase ?? 'scan',
+          current: Number(message.payload?.current) || 0,
+          total: Number(message.payload?.total) || 0,
+        })
       }
       if (message.type === 'wallpapers.item') {
         const incoming = message.payload?.items ?? []
@@ -348,6 +387,7 @@ export default function App() {
           setCacheSizeBytes(message.payload.cacheSizeBytes)
         }
         setStatus(message.payload?.status ?? '扫描完成')
+        setScanProgress(null)
         setLoading(false)
         setCurrentPage(1)
       }
@@ -363,6 +403,7 @@ export default function App() {
           setCacheSizeBytes(message.payload.cacheSizeBytes)
         }
         setStatus(message.payload?.status ?? '扫描完成')
+        setScanProgress(null)
         const addedCount = Number(message.payload?.addedCount) || 0
         const removedCount = Number(message.payload?.removedCount) || 0
         const firstAddedTitle = message.payload?.firstAddedTitle
@@ -391,6 +432,8 @@ export default function App() {
         if (!activeToolboxRequestId.current || !message.requestId || message.requestId === activeToolboxRequestId.current) {
           activeToolboxRequestId.current = null
           setToolboxBusy(false)
+          setToolboxProgress(null)
+          setToolboxCancelling(false)
         }
         const msg = message.payload?.message ?? '操作完成'
         setStatus(msg)
@@ -403,7 +446,16 @@ export default function App() {
         if (!activeToolboxRequestId.current || !message.requestId || message.requestId === activeToolboxRequestId.current) {
           activeToolboxRequestId.current = null
           setToolboxBusy(false)
+          setToolboxProgress(null)
+          setToolboxCancelling(false)
         }
+      }
+      if (message.type === 'toolbox.cancelled') {
+        activeToolboxRequestId.current = null
+        setToolboxBusy(false)
+        setToolboxProgress(null)
+        setToolboxCancelling(false)
+        showToast(message.payload?.message ?? '任务已安全停止')
       }
       if (message.type === 'wallpapers.sync-meta') {
         const archived = new Set(message.payload?.archivedIds ?? [])
@@ -420,7 +472,7 @@ export default function App() {
         })
       }
       if (message.type === 'toolbox.progress') {
-        showToast(message.payload?.message ?? '正在处理…', { status: 'running' })
+        setToolboxProgress(message.payload ?? null)
       }
       if (message.type === 'toolbox.media.picked') {
         const incoming = message.payload?.files ?? []
@@ -502,6 +554,8 @@ export default function App() {
         if (!activeToolboxRequestId.current || !message.requestId || message.requestId === activeToolboxRequestId.current) {
           activeToolboxRequestId.current = null
           setToolboxBusy(false)
+          setToolboxProgress(null)
+          setToolboxCancelling(false)
         }
         const msg = message.payload?.message ?? '操作失败'
         const isScanError = Boolean(
@@ -512,6 +566,7 @@ export default function App() {
         if (isScanError) {
           setStatus(msg)
           setErrorMessage(msg)
+          setScanProgress(null)
           setLoading(false)
         }
         showToast(msg, { status: 'error' })
@@ -553,10 +608,29 @@ export default function App() {
 
   useEffect(() => {
     if (loading || wallpapers.length === 0) return
-    sniffWallpaperColors(wallpapers, () => {
+    sniffWallpaperColors(wallpapers, info => {
       setColorVersion(v => v + 1)
+      if (info && typeof info === 'object') {
+        setColorIndexProgress({
+          running: Boolean(info.running),
+          indexed: Number(info.indexed) || 0,
+          total: Number(info.total) || wallpapers.length,
+        })
+      }
     })
   }, [loading, wallpapers])
+
+  const colorCounts = useMemo(() => {
+    void colorVersion
+    const counts = { dark: 0, light: 0, blue: 0, purple: 0, green: 0, warm: 0 }
+    for (const item of wallpapers) {
+      const bucket = getCachedColorBucket(item)
+      if (bucket && Object.prototype.hasOwnProperty.call(counts, bucket)) {
+        counts[bucket] += 1
+      }
+    }
+    return counts
+  }, [colorVersion, wallpapers])
 
   const favoriteIds = useMemo(
     () => (Array.isArray(settings.favoriteIds) ? settings.favoriteIds : []),
@@ -577,7 +651,7 @@ export default function App() {
 
   const filteredWallpapers = useMemo(() => {
     void colorVersion
-    const normalizedQuery = query.trim().toLocaleLowerCase()
+    const normalizedQuery = deferredQuery.trim().toLocaleLowerCase()
     const matched = wallpapers.filter(item => {
       const matchesType =
         filter === 'all' ||
@@ -607,7 +681,7 @@ export default function App() {
       }
 
       if (colorFilter) {
-        const bucket = getCachedColorBucket(item.id)
+        const bucket = getCachedColorBucket(item)
         if (bucket !== colorFilter) return false
       }
 
@@ -632,7 +706,7 @@ export default function App() {
       return [...matched].sort((a, b) => a.title.localeCompare(b.title, 'zh-CN'))
     }
     return matched
-  }, [colorFilter, colorVersion, favoriteSet, filter, query, ratingFilter, sortBy, specFilter, wallpapers])
+  }, [colorFilter, colorVersion, deferredQuery, favoriteSet, filter, ratingFilter, sortBy, specFilter, wallpapers])
 
   const effectiveColumns = Math.max(2, gridLayout.columns)
   const pageSize = effectiveColumns * gridLayout.rows
@@ -1230,16 +1304,45 @@ export default function App() {
             <section className="library-heading flex shrink-0 items-end justify-between gap-6">
               <div>
                 <h1 className="text-2xl font-semibold tracking-tight">本机壁纸</h1>
-                <p className="mt-1 text-sm text-base-content/65">
-                  {loading ? (
+                <div className="mt-1 flex flex-wrap items-center gap-2.5 text-sm text-base-content/65">
+                  {loading && scanProgress?.phase === 'color-index' ? (
+                    <LatticeLoader
+                      status="working"
+                      pattern="orbit"
+                      grid={3}
+                      cellSize={4}
+                      gap={2}
+                      fontSize={13}
+                      color={sparkColor}
+                      label={scanProgress.message}
+                      showTimer={false}
+                    />
+                  ) : loading ? (
                     <ShinyText
                       text={status}
                       color={isDark ? '#a0a0b4' : '#6d5f7c'}
                       shineColor={isDark ? '#ffffff' : sparkColor}
                       speed={1.8}
                     />
-                  ) : status}
-                </p>
+                  ) : (
+                    <>
+                      <span>{status}</span>
+                      {colorIndexProgress.running ? (
+                        <LatticeLoader
+                          status="working"
+                          pattern="dots"
+                          grid={3}
+                          cellSize={3.5}
+                          gap={1.5}
+                          fontSize={12}
+                          color={sparkColor}
+                          label={`色彩索引 ${colorIndexProgress.indexed}/${colorIndexProgress.total}`}
+                          showTimer={false}
+                        />
+                      ) : null}
+                    </>
+                  )}
+                </div>
               </div>
               <div className="library-controls flex flex-wrap items-center justify-end gap-2.5">
                 <div className="wv-segmented" role="group" aria-label="壁纸类型">
@@ -1364,24 +1467,60 @@ export default function App() {
                             ))}
                           </div>
                         </div>
-                        <div className="space-y-1.5">
-                          <p className="text-[11px] font-semibold text-base-content/55 uppercase">主色调筛选</p>
-                          <div className="color-dot-filter w-full justify-between" role="group" aria-label="按主色调筛选">
-                            {COLOR_BUCKETS.map(bucket => {
-                              const active = colorFilter === bucket.value
-                              return (
-                                <button
-                                  key={bucket.value}
-                                  type="button"
-                                  className="color-dot-btn"
-                                  style={{ '--dot-color': bucket.swatch }}
-                                  aria-pressed={active}
-                                  aria-label={`筛选色调：${bucket.label}`}
-                                  onClick={() => setColorFilter(prev => (prev === bucket.value ? null : bucket.value))}
-                                />
-                              )
-                            })}
+                        <div className="space-y-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <p className="text-[11px] font-semibold text-base-content/55 uppercase">主色调筛选</p>
+                            {colorIndexProgress.running || scanProgress?.phase === 'color-index' ? (
+                              <LatticeLoader
+                                status="working"
+                                pattern="dots"
+                                grid={3}
+                                cellSize={3}
+                                gap={1.5}
+                                fontSize={11}
+                                color={sparkColor}
+                                label="索引中"
+                                showTimer={false}
+                              />
+                            ) : (() => {
+                              const activeBucket = COLOR_BUCKETS.find(b => b.value === (hoveredColorBucket ?? colorFilter))
+                              return activeBucket ? (
+                                <span className="text-[11px] font-medium text-primary tabular-nums">
+                                  {activeBucket.label} · {colorCounts[activeBucket.value] || 0} 项
+                                </span>
+                              ) : null
+                            })()}
                           </div>
+                          <ColorSwatchPicker
+                            aria-label="按主色调筛选"
+                            shape="circle"
+                            size={34}
+                            className="w-full justify-between"
+                            value={COLOR_BUCKETS.find(b => b.value === colorFilter)?.swatch ?? '#00000000'}
+                            onValueChange={picked => {
+                              const hex = String(formatColor(picked, 'hex') || '').toLowerCase()
+                              const matched = COLOR_BUCKETS.find(b => b.swatch.toLowerCase() === hex)
+                              if (matched) {
+                                setColorFilter(matched.value)
+                              }
+                            }}
+                          >
+                            {COLOR_BUCKETS.map(bucket => (
+                              <ColorSwatchPickerItem
+                                key={bucket.value}
+                                color={bucket.swatch}
+                                colorName={`${bucket.label}（${colorCounts[bucket.value] || 0} 项）`}
+                                className="tooltip tooltip-top"
+                                data-tip={`${bucket.label}（${colorCounts[bucket.value] || 0} 项）`}
+                                onMouseEnter={() => setHoveredColorBucket(bucket.value)}
+                                onMouseLeave={() => setHoveredColorBucket(prev => (prev === bucket.value ? null : prev))}
+                                onClick={event => {
+                                  event.preventDefault()
+                                  setColorFilter(prev => (prev === bucket.value ? null : bucket.value))
+                                }}
+                              />
+                            ))}
+                          </ColorSwatchPicker>
                         </div>
                         {hasActiveFilter ? (
                           <div className="flex justify-end border-t border-base-300/60 pt-2">
@@ -1749,6 +1888,12 @@ export default function App() {
         <SuperToolboxDialog
           open={toolboxOpen}
           busy={toolboxBusy}
+          taskProgress={toolboxProgress}
+          cancelling={toolboxCancelling}
+          onCancelTask={() => {
+            setToolboxCancelling(true)
+            sendNativeMessage('toolbox.task.cancel', {})
+          }}
           onClose={() => setToolboxOpen(false)}
           wallpapers={wallpapers}
           favoriteIds={favoriteIds}
@@ -1763,7 +1908,37 @@ export default function App() {
         />
         {createPortal(
           <AnimatePresence>
-            {toastState ? (
+            {!toolboxOpen && toolboxBusy && toolboxProgress ? (
+              <motion.div
+                key="bg-toolbox-progress"
+                style={{ zIndex: 200 }}
+                className={`pointer-events-auto fixed left-1/2 w-[min(92vw,460px)] -translate-x-1/2 ${
+                  selectedIds.length > 0 &&
+                  page === 'library' &&
+                  !detailItem &&
+                  !toolboxOpen &&
+                  !studioState.open &&
+                  !dupState.open &&
+                  deleteTargets.length === 0
+                    ? 'bottom-[84px]'
+                    : 'bottom-6'
+                }`}
+                initial={{ opacity: 0, y: 12, scale: 0.96 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, y: 8, scale: 0.96 }}
+                transition={{ duration: 0.18 }}
+              >
+                <FluxProgressBar
+                  compact
+                  progress={toolboxProgress}
+                  cancelling={toolboxCancelling}
+                  onCancel={() => {
+                    setToolboxCancelling(true)
+                    sendNativeMessage('toolbox.task.cancel', {})
+                  }}
+                />
+              </motion.div>
+            ) : toastState ? (
               <motion.div
                 key={`${toastState.status}-${toastState.message}`}
                 style={{ zIndex: 200 }}

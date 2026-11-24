@@ -1,7 +1,11 @@
-use crate::media::{find_executable, pack_multi_size_ico_pure_rust};
-use crate::models::{AppSettings, WallpaperItem, is_reparse_point, strip_verbatim_prefix};
+use crate::media::{find_executable, pack_multi_size_ico_pure_rust, probe_or_fallback};
+use crate::models::{
+    AppSettings, ToolboxProgressPayload, WallpaperItem, is_reparse_point, strip_verbatim_prefix,
+};
 use crate::pkg::{decode_tex_file_to_png, unpack_pkg_file};
-use crate::process_runner::{os_args, run_output, run_status};
+use crate::process_runner::{
+    CANCELLED_ERR, os_args, remove_file_with_retry, run_ffmpeg_progress, run_output, run_status,
+};
 use crate::scanner::rewrite_as_offline_project_json;
 use crate::settings::{calculate_directory_bytes, cache_root, resolve_configured_workshop_roots};
 use crate::we_bridge::{
@@ -647,10 +651,11 @@ pub fn resolve_archive_directory(
 pub fn archive_wallpapers_offline<FProgress>(
     items: &[WallpaperItem],
     export_directory: &str,
+    cancel: Option<&AtomicBool>,
     mut on_progress: FProgress,
 ) -> Result<(Vec<String>, String, bool), String>
 where
-    FProgress: FnMut(&str),
+    FProgress: FnMut(ToolboxProgressPayload),
 {
     if items.is_empty() {
         return Err("请先选择或收藏至少一张要加入离线保险箱的壁纸。".to_string());
@@ -675,11 +680,25 @@ where
     let mut archived_ids = Vec::new();
     let total = items.len();
     for (idx, item) in items.iter().enumerate() {
+        if cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {
+            return Err(CANCELLED_ERR.to_string());
+        }
         let src_dir = Path::new(&item.workshop_directory);
         if item.workshop_directory.trim().is_empty() || !src_dir.is_dir() {
             continue;
         }
-        on_progress(&format!("正在离线备份 ({}/{total}): {}", idx + 1, item.title));
+        let overall = ((idx as f64 / total.max(1) as f64) * 100.0).clamp(0.0, 99.5);
+        on_progress(ToolboxProgressPayload {
+            task_kind: "archive".to_string(),
+            message: format!("正在离线典藏 ({}/{total}): {}", idx + 1, item.title),
+            current_index: idx + 1,
+            total_count: total,
+            file_percent: None,
+            overall_percent: Some(overall),
+            saved_bytes: None,
+            eta_seconds: None,
+            cancellable: true,
+        });
         let safe_title = get_safe_file_name(&item.title, &item.workshop_id);
         let folder_name = if into_we {
             format!("WallPull_{}_{}", item.workshop_id, safe_title)
@@ -1199,13 +1218,14 @@ pub fn slim_workshop_videos<FProgress>(
     mut on_progress: FProgress,
 ) -> Result<(usize, i64), String>
 where
-    FProgress: FnMut(&str),
+    FProgress: FnMut(ToolboxProgressPayload),
 {
     if targets.is_empty() {
         return Err("当前没有找到需要瘦身压制的大体积 MP4 视频壁纸。".to_string());
     }
     let ffmpeg = find_executable("ffmpeg.exe")
         .ok_or_else(|| "未找到 ffmpeg.exe，无法进行 H.265 无损感瘦身压制。".to_string())?;
+    let ffprobe = find_executable("ffprobe.exe");
 
     let mut slimmed = 0usize;
     let mut saved = 0i64;
@@ -1213,19 +1233,33 @@ where
 
     for (i, item) in targets.iter().enumerate() {
         if cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {
-            return Err("视频瘦身压制已取消。".to_string());
+            return Err(CANCELLED_ERR.to_string());
         }
         let src = Path::new(&item.source_path);
         if !src.is_file() {
             continue;
         }
         let old_bytes = fs::metadata(src).map(|m| m.len() as i64).unwrap_or(0);
+        let duration_secs = probe_or_fallback(src, ffprobe.as_deref())
+            .duration_seconds
+            .filter(|d| *d > 0.05);
         let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("video");
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let parent = src.parent().unwrap_or(Path::new("."));
         let tmp = parent.join(format!(".{stem}.h265_tmp_{}_{}.mp4", std::process::id(), seq));
 
-        on_progress(&format!("正在压制 ({}/{})：{}", i + 1, total, item.title));
+        let base_overall = ((i as f64 / total as f64) * 100.0).clamp(0.0, 99.5);
+        on_progress(ToolboxProgressPayload {
+            task_kind: "slim-videos".to_string(),
+            message: format!("正在压制 ({}/{})：{}", i + 1, total, item.title),
+            current_index: i + 1,
+            total_count: total,
+            file_percent: duration_secs.map(|_| 0.0),
+            overall_percent: Some(base_overall),
+            saved_bytes: (saved > 0).then_some(saved),
+            eta_seconds: None,
+            cancellable: true,
+        });
         let mut args = os_args(["-y", "-i"]);
         args.push(src.as_os_str().to_os_string());
         args.extend(os_args([
@@ -1244,36 +1278,78 @@ where
         ]));
         args.push(tmp.as_os_str().to_os_string());
 
-        let ok = match run_status(&ffmpeg, &args, None, Duration::from_secs(900), cancel) {
+        let started = std::time::Instant::now();
+        let ok = match run_ffmpeg_progress(
+            &ffmpeg,
+            &args,
+            None,
+            Duration::from_secs(900),
+            cancel,
+            |tick| {
+                let file_pct = duration_secs
+                    .map(|dur| ((tick.out_time_secs / dur) * 100.0).clamp(0.0, 99.5));
+                let overall_pct = if let Some(fp) = file_pct {
+                    (((i as f64) + fp / 100.0) / (total as f64) * 100.0).clamp(0.0, 99.8)
+                } else {
+                    base_overall
+                };
+                let eta_seconds = duration_secs.and_then(|dur| {
+                    let remain = (dur - tick.out_time_secs).max(0.0);
+                    if let Some(sp) = tick.speed_factor {
+                        if sp > 0.01 {
+                            return Some((remain / sp).ceil() as u64);
+                        }
+                    }
+                    let frac = (tick.out_time_secs / dur).clamp(0.0, 1.0);
+                    if frac >= 0.03 {
+                        let elapsed = started.elapsed().as_secs_f64();
+                        Some(((elapsed / frac) * (1.0 - frac)).ceil() as u64)
+                    } else {
+                        None
+                    }
+                });
+                on_progress(ToolboxProgressPayload {
+                    task_kind: "slim-videos".to_string(),
+                    message: format!("正在压制 ({}/{})：{}", i + 1, total, item.title),
+                    current_index: i + 1,
+                    total_count: total,
+                    file_percent: file_pct,
+                    overall_percent: Some(overall_pct),
+                    saved_bytes: (saved > 0).then_some(saved),
+                    eta_seconds,
+                    cancellable: true,
+                });
+            },
+        ) {
             Ok(success) => success,
             Err(err) => {
-                let _ = fs::remove_file(&tmp);
+                remove_file_with_retry(&tmp);
                 return Err(err);
             }
         };
 
         if !ok || !tmp.is_file() {
-            let _ = fs::remove_file(&tmp);
+            remove_file_with_retry(&tmp);
             continue;
         }
         let new_bytes = fs::metadata(&tmp).map(|m| m.len() as i64).unwrap_or(0);
         if new_bytes <= 1024 || new_bytes >= (old_bytes as f64 * 0.92) as i64 {
-            let _ = fs::remove_file(&tmp);
+            remove_file_with_retry(&tmp);
             continue;
         }
 
         let bak = parent.join(format!(".{stem}.orig_bak_{}_{}.mp4", std::process::id(), seq));
         if fs::rename(src, &bak).is_err() {
-            let _ = fs::remove_file(&tmp);
+            remove_file_with_retry(&tmp);
             continue;
         }
         if fs::rename(&tmp, src).is_err() {
             let _ = fs::rename(&bak, src);
-            let _ = fs::remove_file(&tmp);
+            remove_file_with_retry(&tmp);
             continue;
         }
         if !try_send_to_recycle_bin(&bak) {
-            let _ = fs::remove_file(&bak);
+            remove_file_with_retry(&bak);
         }
         saved += old_bytes - new_bytes;
         slimmed += 1;
@@ -1333,10 +1409,11 @@ pub fn convert_toolbox_media<FProgress>(
     strip_metadata: bool,
     trim_transparency: bool,
     export_directory: &str,
+    cancel: Option<&AtomicBool>,
     mut on_progress: FProgress,
 ) -> Result<(usize, String), String>
 where
-    FProgress: FnMut(&str),
+    FProgress: FnMut(ToolboxProgressPayload),
 {
     let valid_paths: Vec<PathBuf> = paths
         .iter()
@@ -1353,10 +1430,14 @@ where
     fs::create_dir_all(&out_folder).map_err(|e| format!("无法创建格式工坊目录：{e}"))?;
 
     let fmt = target_format.trim().to_ascii_lowercase();
+    let ffprobe = find_executable("ffprobe.exe");
     let mut success_count = 0usize;
     let total = valid_paths.len();
 
     for (i, src) in valid_paths.iter().enumerate() {
+        if cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {
+            return Err(CANCELLED_ERR.to_string());
+        }
         let name = src
             .file_name()
             .and_then(|n| n.to_str())
@@ -1365,7 +1446,18 @@ where
             src.file_stem().and_then(|s| s.to_str()).unwrap_or("item"),
             &format!("item-{}", i + 1),
         );
-        on_progress(&format!("格式工坊处理中 ({}/{}): {name}", i + 1, total));
+        let base_overall = ((i as f64 / total as f64) * 100.0).clamp(0.0, 99.5);
+        on_progress(ToolboxProgressPayload {
+            task_kind: "convert".to_string(),
+            message: format!("格式工坊处理中 ({}/{}): {name}", i + 1, total),
+            current_index: i + 1,
+            total_count: total,
+            file_percent: None,
+            overall_percent: Some(base_overall),
+            saved_bytes: None,
+            eta_seconds: None,
+            cancellable: true,
+        });
 
         if fmt == "ico" {
             let dest_ico = get_unique_destination_path(&out_folder, &format!("{base_name}.ico"));
@@ -1392,23 +1484,62 @@ where
         let ffmpeg = find_executable("ffmpeg.exe").ok_or_else(|| {
             "该高级音视频/特效格式转换需要 ffmpeg.exe，请放入同级 Tools 目录或配置系统 PATH。".to_string()
         })?;
+        let duration_secs = probe_or_fallback(src, ffprobe.as_deref())
+            .duration_seconds
+            .filter(|d| *d > 0.05);
         let (out_ext, args) = build_ffmpeg_args(src, &fmt, strip_metadata, trim_transparency);
         let dest = get_unique_destination_path(&out_folder, &format!("{base_name}.{out_ext}"));
         let mut full_args = args;
         full_args.push(dest.to_string_lossy().into_owned());
 
-        let ok = run_status(
+        let started = std::time::Instant::now();
+        let ok = run_ffmpeg_progress(
             &ffmpeg,
             &os_args(&full_args),
             None,
             Duration::from_secs(600),
-            None,
+            cancel,
+            |tick| {
+                let file_pct = duration_secs
+                    .map(|dur| ((tick.out_time_secs / dur) * 100.0).clamp(0.0, 99.5));
+                let overall_pct = if let Some(fp) = file_pct {
+                    (((i as f64) + fp / 100.0) / (total as f64) * 100.0).clamp(0.0, 99.8)
+                } else {
+                    base_overall
+                };
+                let eta_seconds = duration_secs.and_then(|dur| {
+                    let remain = (dur - tick.out_time_secs).max(0.0);
+                    if let Some(sp) = tick.speed_factor {
+                        if sp > 0.01 {
+                            return Some((remain / sp).ceil() as u64);
+                        }
+                    }
+                    let frac = (tick.out_time_secs / dur).clamp(0.0, 1.0);
+                    if frac >= 0.03 {
+                        let elapsed = started.elapsed().as_secs_f64();
+                        Some(((elapsed / frac) * (1.0 - frac)).ceil() as u64)
+                    } else {
+                        None
+                    }
+                });
+                on_progress(ToolboxProgressPayload {
+                    task_kind: "convert".to_string(),
+                    message: format!("格式工坊处理中 ({}/{}): {name}", i + 1, total),
+                    current_index: i + 1,
+                    total_count: total,
+                    file_percent: file_pct,
+                    overall_percent: Some(overall_pct),
+                    saved_bytes: None,
+                    eta_seconds,
+                    cancellable: true,
+                });
+            },
         )
         .inspect_err(|_| {
-            let _ = fs::remove_file(&dest);
+            remove_file_with_retry(&dest);
         })?;
         if !ok || !dest.is_file() {
-            let _ = fs::remove_file(&dest);
+            remove_file_with_retry(&dest);
             return Err(format!("转换 {name} 失败。"));
         }
         success_count += 1;
@@ -1525,10 +1656,11 @@ fn build_ffmpeg_args(
 
 pub fn unpack_external_packages<FProgress>(
     export_directory: &str,
+    cancel: Option<&AtomicBool>,
     mut on_progress: FProgress,
 ) -> Result<Option<(usize, usize, String)>, String>
 where
-    FProgress: FnMut(&str),
+    FProgress: FnMut(ToolboxProgressPayload),
 {
     let Some(picked) = rfd::FileDialog::new()
         .add_filter("Wallpaper Engine 包 (.pkg, .tex)", &["pkg", "tex"])
@@ -1547,8 +1679,12 @@ where
 
     let mut total_files = 0usize;
     let mut total_textures = 0usize;
+    let total = picked.len();
 
-    for src in picked {
+    for (idx, src) in picked.into_iter().enumerate() {
+        if cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {
+            return Err(CANCELLED_ERR.to_string());
+        }
         if !src.is_file() {
             continue;
         }
@@ -1556,7 +1692,18 @@ where
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("package");
-        on_progress(&format!("正在解包：{file_name}"));
+        let overall = ((idx as f64 / total.max(1) as f64) * 100.0).clamp(0.0, 99.5);
+        on_progress(ToolboxProgressPayload {
+            task_kind: "unpack".to_string(),
+            message: format!("正在解包 ({}/{total})：{file_name}", idx + 1),
+            current_index: idx + 1,
+            total_count: total,
+            file_percent: None,
+            overall_percent: Some(overall),
+            saved_bytes: None,
+            eta_seconds: None,
+            cancellable: true,
+        });
         let safe_name = get_safe_file_name(
             src.file_stem().and_then(|s| s.to_str()).unwrap_or("package"),
             "package",
@@ -1577,13 +1724,14 @@ where
                 ff_args.push(src.as_os_str().to_os_string());
                 ff_args.extend(os_args(["-frames:v", "1"]));
                 ff_args.push(dest_png.as_os_str().to_os_string());
-                let ok = run_status(&ffmpeg, &ff_args, None, Duration::from_secs(30), None)
+                let ok = run_status(&ffmpeg, &ff_args, None, Duration::from_secs(30), cancel)
+                    .inspect_err(|_| remove_file_with_retry(&dest_png))
                     .unwrap_or(false);
                 if ok && fs::metadata(&dest_png).map(|m| m.len() > 0).unwrap_or(false) {
                     total_files += 1;
                     total_textures += 1;
                 } else {
-                    let _ = fs::remove_file(&dest_png);
+                    remove_file_with_retry(&dest_png);
                 }
             }
         } else if ext == "pkg" {

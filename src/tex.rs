@@ -149,6 +149,62 @@ pub fn write_rgba_to_png(
     write_rgba_to_png_with_mode(output_png_path, rgba, stride_width, out_width, out_height, false)
 }
 
+pub fn encode_rgba_to_png_bytes(
+    rgba: &[u8],
+    stride_width: i32,
+    out_width: i32,
+    out_height: i32,
+    fast_preview: bool,
+) -> std::io::Result<Vec<u8>> {
+    if out_width <= 0 || out_height <= 0 || stride_width < out_width {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Invalid PNG dimensions",
+        ));
+    }
+
+    let ow = out_width as usize;
+    let oh = out_height as usize;
+    let sw = stride_width as usize;
+    let mut out = Vec::with_capacity((ow * oh).min(4 * 1024 * 1024));
+    let (compression, filter) = if fast_preview {
+        (CompressionType::Fast, FilterType::NoFilter)
+    } else {
+        (CompressionType::Default, FilterType::Adaptive)
+    };
+    let encoder = PngEncoder::new_with_quality(&mut out, compression, filter);
+
+    if sw == ow && rgba.len() >= ow * oh * 4 {
+        encoder
+            .write_image(
+                &rgba[..ow * oh * 4],
+                out_width as u32,
+                out_height as u32,
+                ColorType::Rgba8.into(),
+            )
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    } else {
+        let mut tight = vec![0u8; ow * oh * 4];
+        let row_bytes = ow * 4;
+        for y in 0..oh {
+            let src_off = y * sw * 4;
+            if src_off + row_bytes <= rgba.len() {
+                tight[y * row_bytes..(y + 1) * row_bytes]
+                    .copy_from_slice(&rgba[src_off..src_off + row_bytes]);
+            }
+        }
+        encoder
+            .write_image(
+                &tight,
+                out_width as u32,
+                out_height as u32,
+                ColorType::Rgba8.into(),
+            )
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    }
+    Ok(out)
+}
+
 pub fn write_rgba_to_png_with_mode(
     output_png_path: &Path,
     rgba: &[u8],

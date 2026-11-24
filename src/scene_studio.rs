@@ -1,6 +1,7 @@
 use crate::models::{SceneLayerGroup, SceneLayerItem, SceneLayerManifest};
 use crate::tex::{
-    DecodedTexRgba, try_decode_to_rgba, write_rgba_to_png, write_rgba_to_png_with_mode,
+    DecodedTexRgba, encode_rgba_to_png_bytes, try_decode_to_rgba, write_rgba_to_png,
+    write_rgba_to_png_with_mode,
 };
 use rayon::prelude::*;
 use regex::Regex;
@@ -284,6 +285,32 @@ pub fn try_composite_2d_scene(
 }
 
 impl SceneStudioSession {
+    pub fn render_subset_to_png_bytes(
+        &self,
+        visible_layer_indices: &HashSet<usize>,
+        max_dimension: i32,
+        preserve_transparency: bool,
+        trim_transparent_bounds: bool,
+    ) -> Result<(Vec<u8>, StudioRenderResult), String> {
+        let (rgba, width, height, has_pixels) = self.render_subset_rgba(
+            visible_layer_indices,
+            max_dimension,
+            preserve_transparency,
+            trim_transparent_bounds,
+        )?;
+        let fast_preview = max_dimension > 0;
+        let bytes = encode_rgba_to_png_bytes(&rgba, width, width, height, fast_preview)
+            .map_err(|e| format!("内存编码 PNG 失败：{e}"))?;
+        Ok((
+            bytes,
+            StudioRenderResult {
+                width,
+                height,
+                has_pixels,
+            },
+        ))
+    }
+
     pub fn render_subset_to_png(
         &self,
         output_png_path: &Path,
@@ -292,6 +319,29 @@ impl SceneStudioSession {
         preserve_transparency: bool,
         trim_transparent_bounds: bool,
     ) -> Result<StudioRenderResult, String> {
+        let (rgba, width, height, has_pixels) = self.render_subset_rgba(
+            visible_layer_indices,
+            max_dimension,
+            preserve_transparency,
+            trim_transparent_bounds,
+        )?;
+        let fast_preview = max_dimension > 0;
+        write_rgba_to_png_with_mode(output_png_path, &rgba, width, width, height, fast_preview)
+            .map_err(|e| format!("写入 PNG 失败：{e}"))?;
+        Ok(StudioRenderResult {
+            width,
+            height,
+            has_pixels,
+        })
+    }
+
+    fn render_subset_rgba(
+        &self,
+        visible_layer_indices: &HashSet<usize>,
+        max_dimension: i32,
+        preserve_transparency: bool,
+        trim_transparent_bounds: bool,
+    ) -> Result<(Vec<u8>, i32, i32, bool), String> {
         let mut guard = self
             .cache
             .lock()
@@ -417,7 +467,6 @@ impl SceneStudioSession {
         }
         drop(guard);
 
-        let fast_preview = max_dimension > 0;
         if !preserve_transparency {
             for i in (3..canvas.len()).step_by(4) {
                 canvas[i] = 255;
@@ -427,38 +476,13 @@ impl SceneStudioSession {
         if preserve_transparency && trim_transparent_bounds {
             if let Some((trimmed, tw, th)) = try_trim_transparent_canvas(&canvas, out_w, out_h, 16)
             {
-                write_rgba_to_png_with_mode(
-                    output_png_path,
-                    &trimmed,
-                    tw,
-                    tw,
-                    th,
-                    fast_preview,
-                )
-                .map_err(|e| format!("写入透明 PNG 失败：{e}"))?;
-                return Ok(StudioRenderResult {
-                    width: tw,
-                    height: th,
-                    has_pixels: true,
-                });
+                return Ok((trimmed, tw, th, true));
             }
-            write_rgba_to_png_with_mode(output_png_path, &canvas, out_w, out_w, out_h, fast_preview)
-                .map_err(|e| format!("写入 PNG 失败：{e}"))?;
-            return Ok(StudioRenderResult {
-                width: out_w,
-                height: out_h,
-                has_pixels: false,
-            });
+            return Ok((canvas, out_w, out_h, false));
         }
 
         let has_pixels = drawn_count > 0 && has_any_visible_pixel(&canvas);
-        write_rgba_to_png_with_mode(output_png_path, &canvas, out_w, out_w, out_h, fast_preview)
-            .map_err(|e| format!("写入 PNG 失败：{e}"))?;
-        Ok(StudioRenderResult {
-            width: out_w,
-            height: out_h,
-            has_pixels,
-        })
+        Ok((canvas, out_w, out_h, has_pixels))
     }
 }
 

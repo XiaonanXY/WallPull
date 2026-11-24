@@ -164,7 +164,7 @@ export default function MediaSurface({
             muted
             loop
             playsInline
-            preload="auto"
+            preload={interactive || mayPlay ? 'auto' : 'metadata'}
           />
         ) : (
           <>
@@ -196,7 +196,7 @@ export default function MediaSurface({
               onError={markReady}
               draggable="false"
               loading="eager"
-              decoding={interactive ? 'async' : 'sync'}
+              decoding="async"
             />
           </>
         )}

@@ -167,6 +167,33 @@ pub struct ResolvedMediaAsset {
     pub audio_paths: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedVisualFingerprint {
+    pub d_hash: u64,
+    pub a_hash: u64,
+    pub mean_r: f32,
+    pub mean_g: f32,
+    pub mean_b: f32,
+    pub luma_range: u8,
+    #[serde(default)]
+    pub exact_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolboxProgressPayload {
+    pub task_kind: String,
+    pub message: String,
+    pub current_index: usize,
+    pub total_count: usize,
+    pub file_percent: Option<f64>,
+    pub overall_percent: Option<f64>,
+    pub saved_bytes: Option<i64>,
+    pub eta_seconds: Option<u64>,
+    pub cancellable: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WallpaperItem {
@@ -187,6 +214,10 @@ pub struct WallpaperItem {
     pub preview_video_path: Option<String>,
     pub folder_size: i64,
     pub audio_paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub color_bucket: Option<String>,
+    #[serde(default)]
+    pub visual_fingerprint: Option<CachedVisualFingerprint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,7 +265,7 @@ pub struct WallpaperScanCache {
 }
 
 impl WallpaperScanCache {
-    pub const CURRENT_VERSION: i32 = 5;
+    pub const CURRENT_VERSION: i32 = 6;
     pub fn empty() -> Self {
         Self {
             version: Self::CURRENT_VERSION,
@@ -355,6 +386,7 @@ pub struct WallpaperPayloadItem {
     pub tags: Vec<String>,
     pub customizable_count: usize,
     pub is_archived_offline: bool,
+    pub color_bucket: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

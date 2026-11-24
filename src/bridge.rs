@@ -15,7 +15,8 @@ use crate::models::{
     strip_verbatim_prefix,
 };
 use crate::pkg::extract_scene_assets;
-use crate::scanner::{compute_items_meta, inspect_workshop_extra, scan_wallpapers};
+use crate::process_runner::CANCELLED_ERR;
+use crate::scanner::{compute_items_meta, inspect_workshop_extra, scan_wallpapers, scan_wallpapers_with_progress};
 use crate::scene_studio::{SceneStudioSession, has_inspectable_2d_scene, open_studio_session};
 use crate::settings::{
     cache_root, calculate_cache_size_bytes, clear_media_cache, get_gpu_adapters,
@@ -39,10 +40,11 @@ use webview2_com::Microsoft::Web::WebView2::Win32::*;
 use webview2_com::{
     CoTaskMemPWSTR, CoreWebView2EnvironmentOptions,
     CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
-    WebMessageReceivedEventHandler,
+    WebMessageReceivedEventHandler, WebResourceRequestedEventHandler,
 };
 use windows::Win32::Foundation::{E_POINTER, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
+use windows::Win32::UI::Shell::SHCreateMemStream;
 use windows::Win32::UI::WindowsAndMessaging::{
     IsZoomed, PostMessageW, PostQuitMessage, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, ShowWindow,
     WM_APP, WM_CLOSE,
@@ -133,7 +135,7 @@ pub enum UiCommand {
         wallpaper_id: String,
         title: String,
         session: Arc<SceneStudioSession>,
-        preview_path: String,
+        preview_url: String,
         width: i32,
         height: i32,
         has_pixels: bool,
@@ -142,7 +144,7 @@ pub enum UiCommand {
         request_id: Option<String>,
         studio_gen: u64,
         wallpaper_id: String,
-        preview_path: String,
+        preview_url: String,
         width: i32,
         height: i32,
         has_pixels: bool,
@@ -185,9 +187,11 @@ pub struct AppController {
     pub export_cancel: Arc<AtomicBool>,
     pub export_gen: Arc<AtomicU64>,
     pub toolbox_busy: Arc<AtomicBool>,
+    pub toolbox_cancel: Arc<AtomicBool>,
     pub active_scan_req: Option<String>,
     pub studio_session: Option<(String, Arc<SceneStudioSession>, Option<String>)>,
     pub studio_gen: Arc<AtomicU64>,
+    pub studio_preview_bytes: Arc<Mutex<Option<(u64, Arc<Vec<u8>>)>>>,
     pub exiting_explicitly: bool,
     pub self_test: bool,
 }
@@ -248,9 +252,11 @@ impl AppController {
             export_cancel: Arc::new(AtomicBool::new(false)),
             export_gen: Arc::new(AtomicU64::new(0)),
             toolbox_busy: Arc::new(AtomicBool::new(false)),
+            toolbox_cancel: Arc::new(AtomicBool::new(false)),
             active_scan_req: None,
             studio_session: None,
             studio_gen: Arc::new(AtomicU64::new(0)),
+            studio_preview_bytes: Arc::new(Mutex::new(None)),
             exiting_explicitly: false,
             self_test,
         });
@@ -261,6 +267,7 @@ impl AppController {
     pub fn shutdown_background_tasks(&mut self) {
         self.scan_cancel.store(true, Ordering::SeqCst);
         self.export_cancel.store(true, Ordering::SeqCst);
+        self.toolbox_cancel.store(true, Ordering::SeqCst);
         self.watcher_stop.store(true, Ordering::SeqCst);
         if let Ok(guard) = self.watcher_cancel.lock() {
             if let Some(c) = guard.as_ref() {
@@ -399,7 +406,7 @@ impl AppController {
             .map_err(|e| format!("映射内置前端资源失败：{e}"))?;
         }
 
-        self.environment = Some(env);
+        self.environment = Some(env.clone());
         self.controller = Some(ctrl.clone());
         self.webview = Some(webview.clone());
 
@@ -409,6 +416,53 @@ impl AppController {
             let _ = ctrl.SetIsVisible(true);
         }
         self.map_initial_media_roots();
+
+        let studio_mem = self.studio_preview_bytes.clone();
+        let env_for_mem = env.clone();
+        let mut wrr_token = 0i64;
+        unsafe {
+            let _ = webview.AddWebResourceRequestedFilter(
+                w!("https://studio-mem.wallpapervault/*"),
+                COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+            );
+            let _ = webview.add_WebResourceRequested(
+                &WebResourceRequestedEventHandler::create(Box::new(move |_sender, args| {
+                    let Some(args) = args else {
+                        return Ok(());
+                    };
+                    let Ok(req) = args.Request() else {
+                        return Ok(());
+                    };
+                    let mut uri_pw = PWSTR::null();
+                    if req.Uri(&mut uri_pw).is_err() {
+                        return Ok(());
+                    }
+                    let uri = CoTaskMemPWSTR::from(uri_pw).to_string();
+                    if !uri.starts_with("https://studio-mem.wallpapervault/") {
+                        return Ok(());
+                    }
+                    let bytes_opt = studio_mem
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.as_ref().map(|(_, b)| b.clone()));
+                    let Some(bytes) = bytes_opt else {
+                        return Ok(());
+                    };
+                    if let Some(stream) = SHCreateMemStream(Some(bytes.as_slice())) {
+                        if let Ok(resp) = env_for_mem.CreateWebResourceResponse(
+                            &stream,
+                            200,
+                            w!("OK"),
+                            w!("Content-Type: image/png\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *"),
+                        ) {
+                            let _ = args.SetResponse(Some(&resp));
+                        }
+                    }
+                    Ok(())
+                })),
+                &mut wrr_token,
+            );
+        }
 
         // Listen for WebMessageReceived and route into AppController via WM_UI_COMMAND
         let tx_msg = self.tx.clone();
@@ -894,83 +948,53 @@ impl AppController {
                     wallpaper_id,
                     title,
                     session,
-                    preview_path,
+                    preview_url,
                     width,
                     height,
                     has_pixels,
                 } => {
                     if self.studio_gen.load(Ordering::SeqCst) != studio_gen {
-                        let _ = fs::remove_file(&preview_path);
                         continue;
                     }
-                    self.cleanup_studio_session(Some(Path::new(&preview_path)));
-                    if let Some(url) = self.try_build_media_url(&preview_path) {
-                        self.studio_session =
-                            Some((wallpaper_id.clone(), session.clone(), Some(preview_path.clone())));
-                        self.post_json(
-                            "wallpapers.scene-studio.opened",
-                            json!({
-                                "wallpaperId": wallpaper_id,
-                                "title": title,
-                                "manifest": session.manifest,
-                                "previewUrl": url,
-                                "previewWidth": width,
-                                "previewHeight": height,
-                                "hasPixels": has_pixels,
-                            }),
-                            request_id.as_deref(),
-                        );
-                    } else {
-                        let _ = fs::remove_file(&preview_path);
-                        self.post_json(
-                            "error",
-                            json!({ "message": "无法加载拆解台预览图像。" }),
-                            request_id.as_deref(),
-                        );
-                    }
+                    self.cleanup_studio_session_keep_mem();
+                    self.studio_session = Some((wallpaper_id.clone(), session.clone(), None));
+                    self.post_json(
+                        "wallpapers.scene-studio.opened",
+                        json!({
+                            "wallpaperId": wallpaper_id,
+                            "title": title,
+                            "manifest": session.manifest,
+                            "previewUrl": preview_url,
+                            "previewWidth": width,
+                            "previewHeight": height,
+                            "hasPixels": has_pixels,
+                        }),
+                        request_id.as_deref(),
+                    );
                 }
                 UiCommand::StudioPreviewReady {
                     request_id,
                     studio_gen,
                     wallpaper_id,
-                    preview_path,
+                    preview_url,
                     width,
                     height,
                     has_pixels,
                 } => {
                     if self.studio_gen.load(Ordering::SeqCst) != studio_gen {
-                        let _ = fs::remove_file(&preview_path);
                         continue;
                     }
-                    if let Some((cur_id, _, prev_path)) = &mut self.studio_session {
-                        if cur_id == &wallpaper_id {
-                            if let Some(old) = prev_path.take() {
-                                if !is_same_studio_path(Path::new(&old), Path::new(&preview_path)) {
-                                    let _ = fs::remove_file(old);
-                                }
-                            }
-                            *prev_path = Some(preview_path.clone());
-                        }
-                    }
-                    if let Some(url) = self.try_build_media_url(&preview_path) {
-                        self.post_json(
-                            "wallpapers.scene-studio.preview",
-                            json!({
-                                "wallpaperId": wallpaper_id,
-                                "previewUrl": url,
-                                "previewWidth": width,
-                                "previewHeight": height,
-                                "hasPixels": has_pixels,
-                            }),
-                            request_id.as_deref(),
-                        );
-                    } else {
-                        self.post_json(
-                            "error",
-                            json!({ "message": "无法加载拆解台预览图像。" }),
-                            request_id.as_deref(),
-                        );
-                    }
+                    self.post_json(
+                        "wallpapers.scene-studio.preview",
+                        json!({
+                            "wallpaperId": wallpaper_id,
+                            "previewUrl": preview_url,
+                            "previewWidth": width,
+                            "previewHeight": height,
+                            "hasPixels": has_pixels,
+                        }),
+                        request_id.as_deref(),
+                    );
                 }
                 UiCommand::SelfTestTimeout => {
                     if self.self_test {
@@ -1334,6 +1358,23 @@ impl AppController {
                     Ok(())
                 }
             }
+            "toolbox.task.cancel" => {
+                if self.toolbox_busy.load(Ordering::SeqCst) {
+                    self.toolbox_cancel.store(true, Ordering::SeqCst);
+                    self.post_json(
+                        "toolbox.progress",
+                        json!({
+                            "taskKind": "cancelling",
+                            "message": "正在安全停止当前任务并清理临时文件…",
+                            "currentIndex": 0,
+                            "totalCount": 0,
+                            "cancellable": false,
+                        }),
+                        None,
+                    );
+                }
+                Ok(())
+            }
             "wallpapers.archive-offline.request" => {
                 if self
                     .toolbox_busy
@@ -1342,6 +1383,7 @@ impl AppController {
                 {
                     return Err("已有后台工具箱任务正在运行，请等待当前任务完成。".to_string());
                 }
+                self.toolbox_cancel.store(false, Ordering::SeqCst);
                 let raw_ids = read_ids(payload);
                 let ids = if raw_ids.is_empty() {
                     self.settings.favorite_ids.clone()
@@ -1354,14 +1396,15 @@ impl AppController {
                 let hwnd = self.hwnd.0 as isize;
                 let rq = req_id.clone();
                 let busy = self.toolbox_busy.clone();
+                let cancel = self.toolbox_cancel.clone();
                 std::thread::spawn(move || {
-                    let res = archive_wallpapers_offline(&items, &export_dir, |msg| {
+                    let res = archive_wallpapers_offline(&items, &export_dir, Some(&cancel), |prog| {
                         send_ui(
                             &tx,
                             hwnd,
                             UiCommand::PostJson {
                                 msg_type: "toolbox.progress".into(),
-                                payload: json!({ "message": msg }),
+                                payload: serde_json::to_value(prog).unwrap_or_else(|_| json!({})),
                                 request_id: None,
                             },
                         );
@@ -1377,6 +1420,15 @@ impl AppController {
                                 archived_ids,
                                 dest_dir,
                                 into_we,
+                            },
+                        ),
+                        Err(msg) if msg == CANCELLED_ERR => send_ui(
+                            &tx,
+                            hwnd,
+                            UiCommand::PostJson {
+                                msg_type: "toolbox.cancelled".into(),
+                                payload: json!({ "message": "已安全停止离线典藏任务" }),
+                                request_id: rq,
                             },
                         ),
                         Err(msg) => send_ui(
@@ -1400,6 +1452,7 @@ impl AppController {
                 {
                     return Err("已有后台工具箱任务正在运行，请等待当前任务完成。".to_string());
                 }
+                self.toolbox_cancel.store(false, Ordering::SeqCst);
                 let ids = read_ids(payload);
                 let mut seen_paths = HashSet::new();
                 let mut targets: Vec<WallpaperItem> = Vec::new();
@@ -1422,15 +1475,15 @@ impl AppController {
                 let hwnd = self.hwnd.0 as isize;
                 let rq = req_id.clone();
                 let busy = self.toolbox_busy.clone();
-                let cancel = self.watcher_stop.clone();
+                let cancel = self.toolbox_cancel.clone();
                 std::thread::spawn(move || {
-                    let res = slim_workshop_videos(&targets, Some(&cancel), |msg| {
+                    let res = slim_workshop_videos(&targets, Some(&cancel), |prog| {
                         send_ui(
                             &tx,
                             hwnd,
                             UiCommand::PostJson {
                                 msg_type: "toolbox.progress".into(),
-                                payload: json!({ "message": msg }),
+                                payload: serde_json::to_value(prog).unwrap_or_else(|_| json!({})),
                                 request_id: None,
                             },
                         );
@@ -1465,6 +1518,25 @@ impl AppController {
                                     },
                                 );
                             }
+                        }
+                        Err(msg) if msg == CANCELLED_ERR => {
+                            send_ui(
+                                &tx,
+                                hwnd,
+                                UiCommand::PostJson {
+                                    msg_type: "toolbox.cancelled".into(),
+                                    payload: json!({ "message": "已安全停止视频压缩，临时文件已清理" }),
+                                    request_id: rq,
+                                },
+                            );
+                            send_ui(
+                                &tx,
+                                hwnd,
+                                UiCommand::RefreshScanRequested {
+                                    request_id: None,
+                                    force: false,
+                                },
+                            );
                         }
                         Err(msg) => send_ui(
                             &tx,
@@ -1719,6 +1791,7 @@ impl AppController {
                 {
                     return Err("已有后台工具箱任务正在运行，请等待当前任务完成。".to_string());
                 }
+                self.toolbox_cancel.store(false, Ordering::SeqCst);
                 let target_fmt = payload
                     .and_then(|p| p.get("targetFormat"))
                     .and_then(|v| v.as_str())
@@ -1737,6 +1810,7 @@ impl AppController {
                 let hwnd = self.hwnd.0 as isize;
                 let rq = req_id.clone();
                 let busy = self.toolbox_busy.clone();
+                let cancel = self.toolbox_cancel.clone();
                 std::thread::spawn(move || {
                     let res = convert_toolbox_media(
                         &paths,
@@ -1744,13 +1818,14 @@ impl AppController {
                         strip_meta,
                         trim_alpha,
                         &export_dir,
-                        |msg| {
+                        Some(&cancel),
+                        |prog| {
                             send_ui(
                                 &tx,
                                 hwnd,
                                 UiCommand::PostJson {
                                     msg_type: "toolbox.progress".into(),
-                                    payload: json!({ "message": msg }),
+                                    payload: serde_json::to_value(prog).unwrap_or_else(|_| json!({})),
                                     request_id: None,
                                 },
                             );
@@ -1767,6 +1842,15 @@ impl AppController {
                                     "message": format!("格式转换完成：已输出 {count} 个文件"),
                                     "destination": out_folder,
                                 }),
+                                request_id: rq,
+                            },
+                        ),
+                        Err(msg) if msg == CANCELLED_ERR => send_ui(
+                            &tx,
+                            hwnd,
+                            UiCommand::PostJson {
+                                msg_type: "toolbox.cancelled".into(),
+                                payload: json!({ "message": "已安全停止格式转换，临时文件已清理" }),
                                 request_id: rq,
                             },
                         ),
@@ -1791,19 +1875,21 @@ impl AppController {
                 {
                     return Err("已有后台工具箱任务正在运行，请等待当前任务完成。".to_string());
                 }
+                self.toolbox_cancel.store(false, Ordering::SeqCst);
                 let export_dir = self.settings.export_directory.clone();
                 let tx = self.tx.clone();
                 let hwnd = self.hwnd.0 as isize;
                 let rq = req_id.clone();
                 let busy = self.toolbox_busy.clone();
+                let cancel = self.toolbox_cancel.clone();
                 std::thread::spawn(move || {
-                    let res = unpack_external_packages(&export_dir, |msg| {
+                    let res = unpack_external_packages(&export_dir, Some(&cancel), |prog| {
                         send_ui(
                             &tx,
                             hwnd,
                             UiCommand::PostJson {
                                 msg_type: "toolbox.progress".into(),
-                                payload: json!({ "message": msg }),
+                                payload: serde_json::to_value(prog).unwrap_or_else(|_| json!({})),
                                 request_id: None,
                             },
                         );
@@ -1828,6 +1914,15 @@ impl AppController {
                             UiCommand::PostJson {
                                 msg_type: "toolbox.idle".into(),
                                 payload: json!({}),
+                                request_id: rq,
+                            },
+                        ),
+                        Err(msg) if msg == CANCELLED_ERR => send_ui(
+                            &tx,
+                            hwnd,
+                            UiCommand::PostJson {
+                                msg_type: "toolbox.cancelled".into(),
+                                payload: json!({ "message": "已安全停止外部解包任务" }),
                                 request_id: rq,
                             },
                         ),
@@ -2022,7 +2117,7 @@ impl AppController {
 
             let req_progress = request_id.clone();
             let req_batch = request_id.clone();
-            let res = scan_wallpapers(
+            let res = scan_wallpapers_with_progress(
                 &roots,
                 parse_scenes,
                 force,
@@ -2030,14 +2125,19 @@ impl AppController {
                 use_hw_decode,
                 None,
                 Some(&cancel),
-                |msg| {
+                |info| {
                     if !cancel.load(Ordering::SeqCst) && gen_ref.load(Ordering::SeqCst) == next_gen {
                         send_ui(
                             &tx,
                             hwnd,
                             UiCommand::PostJson {
                                 msg_type: "wallpapers.scan.status".into(),
-                                payload: json!({ "message": msg }),
+                                payload: json!({
+                                    "message": info.message,
+                                    "phase": info.phase,
+                                    "current": info.current,
+                                    "total": info.total,
+                                }),
                                 request_id: req_progress.clone(),
                             },
                         );
@@ -2092,8 +2192,8 @@ impl AppController {
         let tx = self.tx.clone();
         let hwnd = self.hwnd.0 as isize;
         let wp_id = wallpaper.id.clone();
-        let ws_id = wallpaper.workshop_id.clone();
         let title = wallpaper.title.clone();
+        let mem_slot = self.studio_preview_bytes.clone();
 
         std::thread::spawn(move || {
             let Some(session) = open_studio_session(&scene_pkg) else {
@@ -2109,13 +2209,6 @@ impl AppController {
                 return;
             };
 
-            let cache_dir = cache_root().join("layer-studio");
-            let _ = fs::create_dir_all(&cache_dir);
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let preview_path = cache_dir.join(format!("studio-{ws_id}-{stamp}.png"));
             let default_set: HashSet<usize> = session
                 .manifest
                 .layers
@@ -2124,8 +2217,13 @@ impl AppController {
                 .map(|l| l.index)
                 .collect();
 
-            match session.render_subset_to_png(&preview_path, &default_set, 1440, true, false) {
-                Ok(r) => {
+            match session.render_subset_to_png_bytes(&default_set, 1440, true, false) {
+                Ok((png_bytes, r)) => {
+                    if let Ok(mut guard) = mem_slot.lock() {
+                        *guard = Some((studio_gen, Arc::new(png_bytes)));
+                    }
+                    let preview_url =
+                        format!("https://studio-mem.wallpapervault/preview-{studio_gen}.png");
                     send_ui(
                         &tx,
                         hwnd,
@@ -2135,7 +2233,7 @@ impl AppController {
                             wallpaper_id: wp_id,
                             title,
                             session: Arc::new(session),
-                            preview_path: preview_path.to_string_lossy().into_owned(),
+                            preview_url,
                             width: r.width,
                             height: r.height,
                             has_pixels: r.has_pixels,
@@ -2143,7 +2241,6 @@ impl AppController {
                     );
                 }
                 Err(e) => {
-                    let _ = fs::remove_file(&preview_path);
                     send_ui(
                         &tx,
                         hwnd,
@@ -2174,16 +2271,16 @@ impl AppController {
         let wp_id = cur_id.clone();
         let tx = self.tx.clone();
         let hwnd = self.hwnd.0 as isize;
+        let mem_slot = self.studio_preview_bytes.clone();
 
         std::thread::spawn(move || {
-            let cache_dir = cache_root().join("layer-studio");
-            let _ = fs::create_dir_all(&cache_dir);
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let next_path = cache_dir.join(format!("studio-prev-{stamp}.png"));
-            if let Ok(r) = sess.render_subset_to_png(&next_path, &visible_set, 1440, true, false) {
+            if let Ok((png_bytes, r)) = sess.render_subset_to_png_bytes(&visible_set, 1440, true, false)
+            {
+                if let Ok(mut guard) = mem_slot.lock() {
+                    *guard = Some((studio_gen, Arc::new(png_bytes)));
+                }
+                let preview_url =
+                    format!("https://studio-mem.wallpapervault/preview-{studio_gen}.png");
                 send_ui(
                     &tx,
                     hwnd,
@@ -2191,14 +2288,12 @@ impl AppController {
                         request_id,
                         studio_gen,
                         wallpaper_id: wp_id,
-                        preview_path: next_path.to_string_lossy().into_owned(),
+                        preview_url,
                         width: r.width,
                         height: r.height,
                         has_pixels: r.has_pixels,
                     },
                 );
-            } else {
-                let _ = fs::remove_file(&next_path);
             }
         });
     }
@@ -2260,7 +2355,20 @@ impl AppController {
         self.cleanup_studio_session(None);
     }
 
+    fn cleanup_studio_session_keep_mem(&mut self) {
+        if let Some((_, _, last_prev)) = self.studio_session.take() {
+            if let Some(p) = last_prev {
+                let _ = fs::remove_file(p);
+            }
+        }
+        let cache_dir = cache_root().join("layer-studio");
+        cleanup_studio_cache_dir(&cache_dir, None);
+    }
+
     fn cleanup_studio_session(&mut self, keep_path: Option<&Path>) {
+        if let Ok(mut guard) = self.studio_preview_bytes.lock() {
+            *guard = None;
+        }
         if let Some((_, _, last_prev)) = self.studio_session.take() {
             if let Some(p) = last_prev {
                 let keep_it = keep_path.is_some_and(|kp| is_same_studio_path(Path::new(&p), kp));
@@ -2379,6 +2487,7 @@ impl AppController {
             tags: meta.extra.tags,
             customizable_count: meta.extra.properties.len(),
             is_archived_offline: meta.is_archived_offline,
+            color_bucket: item.color_bucket.clone(),
         })
     }
 

@@ -90,23 +90,51 @@ function classifyRgbPixels(data) {
   return bestKey
 }
 
-export function getCachedColorBucket(id) {
-  return colorCache.get(id) ?? null
+export function getCachedColorBucket(itemOrId) {
+  if (itemOrId && typeof itemOrId === 'object') {
+    if (itemOrId.colorBucket) return itemOrId.colorBucket
+    return colorCache.get(itemOrId.id) ?? null
+  }
+  return colorCache.get(itemOrId) ?? null
 }
 
 export function sniffWallpaperColors(items, onUpdated) {
-  if (!Array.isArray(items) || items.length === 0) return
+  if (!Array.isArray(items) || items.length === 0) {
+    onUpdated?.({ indexed: 0, total: 0, running: false })
+    return
+  }
 
-  const queue = items.filter(
-    item => item?.id && !colorCache.has(item.id) && !pending.has(item.id) && (item.previewUrl || item.mediaUrl),
-  )
-  if (queue.length === 0) return
+  let preIndexed = 0
+  const queue = []
+  for (const item of items) {
+    if (!item?.id) continue
+    if (item.colorBucket) {
+      colorCache.set(item.id, item.colorBucket)
+      preIndexed += 1
+      continue
+    }
+    if (colorCache.has(item.id)) {
+      preIndexed += 1
+      continue
+    }
+    if (!pending.has(item.id) && (item.previewUrl || item.mediaUrl)) {
+      queue.push(item)
+    }
+  }
+
+  const total = items.length
+  if (queue.length === 0) {
+    onUpdated?.({ indexed: preIndexed, total, running: false })
+    return
+  }
+
+  let doneCount = preIndexed
+  onUpdated?.({ indexed: doneCount, total, running: true })
 
   let index = 0
   const step = () => {
     const batch = queue.slice(index, index + 6)
     index += 6
-    let resolvedInBatch = 0
 
     for (const item of batch) {
       pending.add(item.id)
@@ -123,15 +151,29 @@ export function sniffWallpaperColors(items, onUpdated) {
             ctx.drawImage(img, 0, 0, 16, 16)
             const pixels = ctx.getImageData(0, 0, 16, 16).data
             colorCache.set(item.id, classifyRgbPixels(pixels))
-            resolvedInBatch += 1
-            if (resolvedInBatch >= 1) scheduleColorUpdate(onUpdated)
           }
         } catch {
           // Cross-origin fallback ignored silently
         }
+        doneCount += 1
+        scheduleColorUpdate(() =>
+          onUpdated?.({
+            indexed: Math.min(total, doneCount),
+            total,
+            running: pending.size > 0 || index < queue.length,
+          }),
+        )
       }
       img.onerror = () => {
         pending.delete(item.id)
+        doneCount += 1
+        scheduleColorUpdate(() =>
+          onUpdated?.({
+            indexed: Math.min(total, doneCount),
+            total,
+            running: pending.size > 0 || index < queue.length,
+          }),
+        )
       }
       img.src = url
     }
