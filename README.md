@@ -2,7 +2,7 @@
 
 # WallPull
 
-**绿色单文件 Wallpaper Engine 创意工坊壁纸解析、图层拆解与本地管理工具**
+**Wallpaper Engine（小红车）壁纸提取、壁纸下载与本地管理、PKG/TEX 壁纸解析解包、视频原图导出、图层拆解与 iPad 互传工具**
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](./LICENSE)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64%20%7C%20iPadOS%2015.4%2B-0078D6)
