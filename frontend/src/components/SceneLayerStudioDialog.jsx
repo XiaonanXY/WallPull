@@ -7,11 +7,13 @@ import {
   CaretRight,
   Copy,
   Desktop,
+  DeviceTablet,
   DownloadSimple,
   Eraser,
   Eye,
   EyeSlash,
   Image as ImageIcon,
+  PaperPlaneTilt,
   Stack,
   X,
 } from '@phosphor-icons/react'
@@ -47,6 +49,7 @@ export default function SceneLayerStudioDialog({
   isNative,
   onPreviewChange,
   onExport,
+  onSendToTablet,
   onClose,
 }) {
   const [visibleSet, setVisibleSet] = useState(() => new Set())
@@ -563,6 +566,39 @@ export default function SceneLayerStudioDialog({
                 一键导出全部角色立绘 ({characterGroups.length})
               </button>
             ) : null}
+            <div className="wv-utility-island" role="group" aria-label="发送拆解图到平板">
+              <button
+                type="button"
+                className="wv-utility-island__btn text-primary"
+                disabled={!isNative || !manifest || visibleSet.size === 0}
+                onClick={() => onSendToTablet?.({
+                  layerIndices: [...visibleSet],
+                  trimBounds,
+                  includeBackground,
+                  targetMode: 'vault',
+                })}
+              >
+                <PaperPlaneTilt size={13} weight="bold" />
+                <span>发到 iPad</span>
+              </button>
+              <span className="wv-utility-island__divider" aria-hidden="true" />
+              <span className="tooltip tooltip-top" data-tip="推至 iPad 剪贴板">
+                <button
+                  type="button"
+                  aria-label="推至 iPad 剪贴板"
+                  className="wv-utility-island__btn w-7 px-0 text-primary"
+                  disabled={!isNative || !manifest || visibleSet.size === 0}
+                  onClick={() => onSendToTablet?.({
+                    layerIndices: [...visibleSet],
+                    trimBounds,
+                    includeBackground,
+                    targetMode: 'clipboard',
+                  })}
+                >
+                  <DeviceTablet size={13} weight="bold" />
+                </button>
+              </span>
+            </div>
             <button
               type="button"
               className="btn btn-primary btn-sm"

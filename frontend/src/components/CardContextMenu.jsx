@@ -6,9 +6,11 @@ import {
   Compass,
   Copy,
   Desktop,
+  DeviceTablet,
   DownloadSimple,
   FolderOpen,
   Heart,
+  PaperPlaneTilt,
   Stack,
   Trash,
 } from '@phosphor-icons/react'
@@ -24,6 +26,8 @@ export default function CardContextMenu({
   onOpenLayerStudio,
   onCopy,
   onSetDesktop,
+  onSendToTablet,
+  onPushClipboardToTablet,
   onExport,
   onToggleFavorite,
   onOpenFolder,
@@ -159,6 +163,34 @@ export default function CardContextMenu({
             <DownloadSimple size={15} className="shrink-0" />
             <span>直接导出原文件</span>
           </button>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={!isNative}
+            className="flex h-8 w-full items-center gap-2.5 rounded-xl px-3 text-left font-medium whitespace-nowrap text-primary hover:bg-primary/10 disabled:opacity-45"
+            onClick={() => {
+              onSendToTablet?.(state.item)
+              onClose?.()
+            }}
+          >
+            <PaperPlaneTilt size={15} weight="bold" className="shrink-0" />
+            <span>发送到 iPad</span>
+          </button>
+          {state?.item?.type === 'image' ? (
+            <button
+              type="button"
+              role="menuitem"
+              disabled={!isNative}
+              className="flex h-8 w-full items-center gap-2.5 rounded-xl px-3 text-left font-medium whitespace-nowrap hover:bg-base-content/7 disabled:opacity-45"
+              onClick={() => {
+                onPushClipboardToTablet?.(state.item)
+                onClose?.()
+              }}
+            >
+              <DeviceTablet size={15} weight="bold" className="shrink-0" />
+              <span>推至 iPad 剪贴板</span>
+            </button>
+          ) : null}
           {state?.item?.hasSceneLayers ? (
             <button
               type="button"

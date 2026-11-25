@@ -1,0 +1,40 @@
+name: WallPullIPad
+options:
+  bundleIdPrefix: com.xiaonan
+  deploymentTarget:
+    iOS: "15.4"
+  xcodeVersion: "16.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.0.2"
+    CURRENT_PROJECT_VERSION: "2"
+    TARGETED_DEVICE_FAMILY: "2"
+    SUPPORTS_MACCATALYST: NO
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+targets:
+  WallPullIPad:
+    type: application
+    platform: iOS
+    deploymentTarget: "15.4"
+    sources:
+      - path: WallPullIPad
+    settings:
+      base:
+        PRODUCT_NAME: WallPull
+        PRODUCT_BUNDLE_IDENTIFIER: com.xiaonan.wallpull.ipad
+        INFOPLIST_FILE: WallPullIPad/Info.plist
+        TARGETED_DEVICE_FAMILY: "2"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        ENABLE_BITCODE: NO
+        GENERATE_INFOPLIST_FILE: NO
+schemes:
+  WallPullIPad:
+    build:
+      targets:
+        WallPullIPad: all
+    archive:
+      config: Release

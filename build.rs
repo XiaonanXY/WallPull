@@ -11,8 +11,8 @@ fn main() {
     res.set("ProductName", "WallPull");
     res.set("CompanyName", "Xiaonan");
     res.set("FileDescription", "WallPull - 开源免费的 Wallpaper Engine 创意工坊壁纸管理工具");
-    res.set("FileVersion", "1.0.1.0");
-    res.set("ProductVersion", "1.0.1.0");
+    res.set("FileVersion", "1.0.2.0");
+    res.set("ProductVersion", "1.0.2.0");
     res.set("LegalCopyright", "Copyright (C) 2026 Xiaonan (GNU GPL-3.0)");
     res.set("Comments", "https://github.com/XiaonanXY/WallPull");
     if let Err(err) = res.compile() {

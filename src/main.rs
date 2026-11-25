@@ -4,6 +4,7 @@ mod actions;
 mod bridge;
 mod clipboard;
 mod duplicates;
+mod localsend;
 mod media;
 mod models;
 mod pkg;

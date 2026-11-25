@@ -5,8 +5,8 @@
 **绿色单文件 Wallpaper Engine 创意工坊壁纸解析、图层拆解与本地管理工具**
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](./LICENSE)
-![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-0078D6)
-![Stack](https://img.shields.io/badge/Stack-Rust%20%2B%20WebView2%20%2B%20React%2019-7C3AED)
+![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64%20%7C%20iPadOS%2015.4%2B-0078D6)
+![Stack](https://img.shields.io/badge/Stack-Rust%20%2B%20React%2019%20%7C%20SwiftUI-7C3AED)
 ![Author](https://img.shields.io/badge/Author-Xiaonan-18181B)
 [![交流反馈](https://img.shields.io/badge/交流反馈-471426180-12B7F5)](https://qm.qq.com/q/aYrBqaDlDi)
 
@@ -23,10 +23,11 @@
 
 ## 核心亮点一眼看懂
 
-- **绿色单文件，双击即用**：Rust 原生桌面底座 + 内嵌前端资源，单文件约 `11 MB`，无需安装 .NET 等繁重运行库，自动全盘识别本机 Steam 创意工坊目录。
+- **绿色单文件，双击即用**：Rust 原生桌面底座 + 内嵌前端资源，Windows 端单文件约 `12 MB`，无需安装 .NET 等繁重运行库，自动全盘识别本机 Steam 创意工坊目录。
 - **纯 Rust 原生硬核解包**：无需借助外部工具，直接解析 `scene.pkg` 与 `.tex` 贴图（含 LZ4 / DXT 解码与精灵图集切分），甚至能在**透视拆解台**里单独开关人物/背景图层、一键去背景导出纯透明立绘 PNG。
 - **零中转复制发图发视频**：卡片右键「复制原图 / 复制原视频」，直接在微信、QQ 等聊天窗口 `Ctrl+V` 粘贴发出原片，不用再打开导出文件夹翻找。
 - **内置超级工具箱（3 套工作台形态）**：集成了收藏一键本地永久典藏（防原作者删库跑路）、重复壁纸安全清理、创意工坊跨盘 `mklink /J` 无感迁移、图片/音视频全格式转换，以及大视频 H.265 瘦身压缩。
+- **WallPull iPad 原生随身端（iPadOS 15.4+）**：同仓内置纯净 SwiftUI + UIKit 原生平板客户端（`ipad/`），通过独立高速局域网频段与 Windows 端互联（与 LocalSend 彻底隔离），支持一键全部收入、无损剪贴板直推送微信、壁纸配乐电台及 2D 透视离线拆图。
 
 ---
 
@@ -224,30 +225,115 @@ WallPull 独有的纯 Rust **2D 透视拆解台**（直接解析 `scene.pkg` 图
 
 ---
 
+## WallPull iPad 随身端实机界面全览（21–33）
+
+> 以下画面全部截取自 **WallPull iPad v1.0.2 实机运行效果**（支持 `iPadOS 15.4+`），覆盖画廊三套画幅布局、独立频段挑图、配乐电台、全屏详情分享与设置中心：
+
+### 21 · iPad 画廊总览（`16:10` 横屏卡片与 `WallPull PC` 实时连接态）
+
+<p align="center">
+  <img src="./docs/showcase/21-ipad-gallery-widescreen.png" alt="WallPull iPad 16:10 横屏画廊主界面总览" width="100%" />
+</p>
+
+### 22 · iPad 画廊（`原图比例` 按同画幅占比自动聚类对齐）
+
+<p align="center">
+  <img src="./docs/showcase/22-ipad-gallery-adaptive-ratio.png" alt="WallPull iPad 原图比例按占比排序聚类" width="100%" />
+</p>
+
+### 23 · iPad 画廊（`1:1` 方形五列高密度网格）
+
+<p align="center">
+  <img src="./docs/showcase/23-ipad-gallery-square-grid.png" alt="WallPull iPad 1:1 方形五列高密度网格" width="100%" />
+</p>
+
+### 24 · 跨端互联「从电脑挑图」（独立高速频段、年龄分级过滤与一键全部收入）
+
+<p align="center">
+  <img src="./docs/showcase/24-ipad-lan-pc-catalog.png" alt="WallPull iPad 跨端互联从电脑挑图与年龄分级筛选" width="100%" />
+</p>
+
+### 25 · 多维筛选与主色调检索浮层
+
+<p align="center">
+  <img src="./docs/showcase/25-ipad-filter-and-sort.png" alt="WallPull iPad 多维规格与主色调筛选浮层" width="100%" />
+</p>
+
+### 26 · 壁纸配乐电台浮动迷你胶囊
+
+<p align="center">
+  <img src="./docs/showcase/26-ipad-bgm-radio-player.png" alt="WallPull iPad 底部毛玻璃配乐电台播放胶囊" width="100%" />
+</p>
+
+### 27 · 静态原画沉浸预览与「复制原图（贴微信）」
+
+<p align="center">
+  <img src="./docs/showcase/27-ipad-detail-image-copy.png" alt="WallPull iPad 静态原画详情与复制原图发微信" width="100%" />
+</p>
+
+### 28 · Scene 壁纸详情：多曲目 BGM 导出与 2D 透视拆图入口
+
+<p align="center">
+  <img src="./docs/showcase/28-ipad-detail-bgm-and-layers.png" alt="WallPull iPad Scene 壁纸详情、BGM 导出与透视拆图" width="100%" />
+</p>
+
+### 29 · 动态视频规格与来源元数据详情卡
+
+<p align="center">
+  <img src="./docs/showcase/29-ipad-detail-video-info.png" alt="WallPull iPad 动态视频壁纸元数据卡片" width="100%" />
+</p>
+
+### 30 · 动态视频全屏播放倍速控制与原生系统分享菜单
+
+<p align="center">
+  <img src="./docs/showcase/30-ipad-detail-video-share.png" alt="WallPull iPad 动态视频全屏倍速控制与原生分享菜单" width="100%" />
+</p>
+
+### 31 · 相似与重复壁纸离线智能体检
+
+<p align="center">
+  <img src="./docs/showcase/31-ipad-duplicate-inspector.png" alt="WallPull iPad 相似与重复壁纸智能体检对比清理" width="100%" />
+</p>
+
+### 32 · 设置中心（上）：外观模式、卡片比例、自定义 `#RRGGBB` 主题色与未连接署名
+
+<p align="center">
+  <img src="./docs/showcase/32-ipad-settings-general.png" alt="WallPull iPad 设置中心外观与未连接顶栏署名配置" width="100%" />
+</p>
+
+### 33 · 设置中心（下）：剪贴板推送、离线存储维护与开源关于卡片
+
+<p align="center">
+  <img src="./docs/showcase/33-ipad-settings-storage-about.png" alt="WallPull iPad 设置中心离线存储与 GPL-3.0 关于卡片" width="100%" />
+</p>
+
+---
+
 ## 下载与使用（普通用户）
 
-1. 前往仓库右侧的 **[Releases](../../releases)** 页面，下载最新版本的 **`WallPull.exe`**（单文件约 `11 MB`，下载后放到任意路径双击即可运行，无需安装）。
+### Windows 桌面端
+1. 前往仓库右侧的 **[Releases](../../releases)** 页面，下载最新版本的 **`WallPull.exe`**（单文件约 `12 MB`，下载后放到任意路径双击即可运行，无需安装）。
 2. **运行环境要求**：
    - Windows 10 / Windows 11（64 位）
    - Microsoft Edge WebView2 Runtime（Windows 11 默认自带，绝大多数 Windows 10 已自动安装）
 3. **可选增强组件（`ffmpeg`）**：
    - 浏览图片/视频壁纸、解包 `.pkg` / `.tex` 贴图、Scene 图层拆解、复制原图原视频、导出 PNG / JPG / WebP / ICO 均**完全内置、开箱即用**。
-   - 仅当你需要使用「视频转 MP4 / WebM / GIF」「H.265 瘦身压缩」或「音频转 MP3 / FLAC / OGG」等音视频转码功能时，才需准备 `ffmpeg.exe` 与 `ffprobe.exe`，放入以下任意位置之一即可自动识别：
+   - 仅当你需要使用「视频转 MP4 / WebM / GIF」「H.265 瘦身压缩」「音频转 MP3 / FLAC / OGG」或跨端 iPad 预览流转码功能时，才需准备 `ffmpeg.exe` 与 `ffprobe.exe`，放入以下任意位置之一即可自动识别：
      - 与 `WallPull.exe` 同级目录，或同级的 `Tools/` 文件夹
      - `%LOCALAPPDATA%\WallpaperVault\Tools\` 目录
      - 系统环境变量 `PATH` 中已配置的任意目录
+
+### iPadOS 随身端
+1. 前往 **[Releases](../../releases)** 页面下载 **`WallPull-iPad.ipa`**（无签名通用包，支持 `iPadOS 15.4+`）。
+2. **安装方式**：通过 **TrollStore（巨魔）** 永久免签安装，或使用 **SideStore / AltStore / Sideloadly / 爱思助手** 等工具侧载到 iPad（也可直接通过 AirDrop 传到平板安装）。
+3. **跨端直连**：确认电脑端 `WallPull.exe` 与 iPad 连在同一个 Wi-Fi 局域网下，顶栏绿点亮起即可浏览电脑壁纸库、一键批量收入平板或推送原图至 iPad 剪贴板。
 
 ---
 
 ## 从源码编译（开发者）
 
-### 环境准备
-
-- [Rust](https://www.rust-lang.org/) stable 工具链（MSVC：`x86_64-pc-windows-msvc`）
-- [Node.js](https://nodejs.org/) 20 及以上版本（推荐 22 LTS）
-- Visual Studio Build Tools（包含 Desktop development with C++ 与 Windows SDK）
-
-### 编译步骤
+### Windows 桌面端编译
+- **环境准备**：[Rust](https://www.rust-lang.org/) stable 工具链（`x86_64-pc-windows-msvc`）、[Node.js](https://nodejs.org/) 20+（推荐 22 LTS）、Visual Studio Build Tools（Desktop development with C++ 与 Windows SDK）。
 
 ```powershell
 # 1. 安装前端依赖并构建打包静态资源（Rust 会通过 include_dir 内嵌 frontend/dist）
@@ -257,14 +343,23 @@ npm run lint
 npm run build
 cd ..
 
-# 2. 运行 Rust 核心单元测试
+# 2. 运行 Rust 核心单元测试并编译单文件 Release 成品（输出位于 target/release/WallPull.exe）
 cargo test
-
-# 3. 编译单文件 Release 成品（输出位于 target/release/WallPull.exe）
 cargo build --release
 ```
 
-> 仓库内已配置 `.github/workflows/release.yml`：推送 `v*` 格式标签（如 `v1.0.1`）后，GitHub Actions 会自动完成前端构建、Rust 测试与 `WallPull.exe` 编译，并附带 `SHA-256` 校验文件自动发布到 GitHub Releases。
+### iPadOS 客户端编译
+- **方式一 · 没有 Mac 的 Windows 用户（推荐）**：Fork 本仓库后，直接在 GitHub 仓库顶部进入 **Actions → Build & Release → Run workflow**，即可免费使用云端 macOS Runner 自动编译产出 `WallPull-iPad.ipa`（也同时会打包 Windows 版 `WallPull.exe`）。
+- **方式二 · macOS 本地编译**（需 Xcode 16+ 与 Homebrew）：
+
+```bash
+cd ipad
+brew install xcodegen
+xcodegen generate
+xcodebuild -project WallPullIPad.xcodeproj -scheme WallPullIPad -configuration Release -sdk iphoneos CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO build
+```
+
+> 仓库内已配置 `.github/workflows/release.yml`：推送 `main` 分支或手动触发 workflow 后，GitHub Actions 会并行构建路径脱敏版 Windows `WallPull.exe` 与 iPadOS `WallPull-iPad.ipa`，并自动产出附带 `SHA-256` 校验文件的构建制品。
 
 ---
 
@@ -275,7 +370,7 @@ WallPull/
 ├── .github/
 │   ├── ISSUE_TEMPLATE/    # Bug 反馈与功能建议模板
 │   └── workflows/
-│       └── release.yml    # GitHub Actions 自动构建与 Release 发布工作流
+│       └── release.yml    # Windows + iPadOS 双端并行构建与 Release 工作流
 ├── Assets/
 │   ├── AppIcon.ico        # 桌面与主窗口应用图标
 │   └── TrayIcon.ico       # 系统托盘常驻图标
@@ -283,10 +378,14 @@ WallPull/
 ├── frontend/              # React 19 + Vite + Tailwind CSS v4 前端界面源码
 │   ├── public/            # 图标与浏览器预览模式演示图
 │   └── src/               # 组件、交互动效、状态管理与样式
-├── src/
+├── ipad/                  # WallPull iPad 原生端（SwiftUI + UIKit, iPadOS 15.4+）
+│   ├── project.yml        # XcodeGen 工程描述配置
+│   └── WallPullIPad/      # 离线壁纸库、跨端直连、配乐电台与 2D 透视拆图源码
+├── src/                   # Windows 端 Rust 原生内核与跨端服务端
 │   ├── main.rs            # 入口与命令行诊断（--self-test / --bench-studio）
 │   ├── window.rs          # 原生 Win32 无边框窗口、暗色标题栏与 DPI 适配
 │   ├── bridge.rs          # WebView2 桥接、自定义虚拟域名媒体流与消息路由
+│   ├── localsend.rs       # 独立 WallPull 局域网频段发现、双向传输与资产/拆图 API
 │   ├── scanner.rs         # Steam/工坊目录探测、project.json 解析与增量索引缓存
 │   ├── pkg.rs             # 纯 Rust Wallpaper Engine .pkg 拆包器
 │   ├── tex.rs             # 纯 Rust .tex 贴图解码器（RGBA/DXT/LZ4/精灵图集）
@@ -311,8 +410,10 @@ WallPull/
 
 ## 技术栈与开源致谢
 
-- **Rust 原生桌面底座**：`windows-rs`、`webview2-com`、`include_dir`、`image`、`rayon`、`serde`、`ureq`、`rfd`
-- **前端与视觉交互**：React 19、Vite、Tailwind CSS v4、DaisyUI 5、Motion、Appica UI、React Bits 交互组件灵感、Phosphor Icons、Hugeicons、MiSans 字体
+- **Windows 桌面内核（Rust）**：`windows-rs`、`webview2-com`、`include_dir`、`image`、`lewton`、`rayon`、`serde`、`rustls`、`ureq`、`rfd`
+- **前端与视觉交互**：React 19、Vite、Tailwind CSS v4、DaisyUI 5、Motion、Appica UI、[React Bits](https://github.com/DavidHDev/react-bits) 交互组件灵感、Phosphor Icons、Hugeicons、MiSans 字体
+- **iPad 原生随身端（Apple）**：Swift 5、SwiftUI、UIKit、AVFoundation、CoreGraphics、ImageIO、CryptoKit、XcodeGen
+- **跨端传输协议致谢**：双端局域网发现与两阶段文件传输模型的设计灵感参考并致敬开源项目 **[LocalSend](https://github.com/localsend/localsend)**（Apache-2.0，[LocalSend Protocol v2](https://github.com/localsend/protocol)），由 Rust 与 Swift 原生独立实现并运行于 WallPull 专属隔离频段，与原版 LocalSend 互不干扰。
 
 ---
 

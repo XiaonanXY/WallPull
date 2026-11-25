@@ -21,3 +21,11 @@ desktop.ini
 .env.*
 .vscode/
 .idea/
+
+# iPad / Xcode / macOS build outputs
+/ipad/*.xcodeproj/
+/ipad/build/
+/ipad/DerivedData/
+/ipad/Payload/
+*.ipa
+.DS_Store

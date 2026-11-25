@@ -12,6 +12,7 @@ import {
   Heart,
   MagnifyingGlass,
   Moon,
+  PaperPlaneTilt,
   Sun,
   Toolbox,
   Trash,
@@ -111,6 +112,8 @@ export default function App() {
   const [studioState, setStudioState] = useState({ open: false, loading: false, rendering: false })
   const [dupState, setDupState] = useState({ open: false, loading: false, result: null })
   const [deleteTargets, setDeleteTargets] = useState([])
+  const [localsendStatus, setLocalsendStatus] = useState({ enabled: true, alias: 'WallPull PC', port: 53417, localIps: [], peers: [] })
+  const [peerPickerState, setPeerPickerState] = useState(null)
   const [scanProgress, setScanProgress] = useState(null)
   const [colorIndexProgress, setColorIndexProgress] = useState({ running: false, indexed: 0, total: 0 })
   const deferredQuery = useDeferredValue(query)
@@ -119,6 +122,7 @@ export default function App() {
   const latestScanRequestId = useRef(null)
   const activeToolboxRequestId = useRef(null)
   const lastSelectedIdRef = useRef(null)
+  const hasHydratedFiltersRef = useRef(false)
   const isNative = Boolean(globalThis.chrome?.webview)
 
   const sendNativeMessage = useCallback((type, payload = {}) => {
@@ -178,6 +182,29 @@ export default function App() {
     setSavedSettings(nextSettings)
     sendNativeMessage('settings.update.request', nextSettings)
   }, [sendNativeMessage])
+
+  const updateFilterPreferences = useCallback(patch => {
+    const nextMedia = patch.mediaFilter !== undefined ? patch.mediaFilter : filter
+    const nextSpec = patch.specFilter !== undefined ? patch.specFilter : specFilter
+    const nextRating = patch.ratingFilter !== undefined ? patch.ratingFilter : ratingFilter
+    const nextSort = patch.sortBy !== undefined ? patch.sortBy : sortBy
+    const nextColor = patch.colorFilter !== undefined ? patch.colorFilter : colorFilter
+
+    if (patch.mediaFilter !== undefined) setFilter(nextMedia)
+    if (patch.specFilter !== undefined) setSpecFilter(nextSpec)
+    if (patch.ratingFilter !== undefined) setRatingFilter(nextRating)
+    if (patch.sortBy !== undefined) setSortBy(nextSort)
+    if (patch.colorFilter !== undefined) setColorFilter(nextColor)
+
+    persistSettings({
+      ...settings,
+      mediaFilter: nextMedia,
+      specFilter: nextSpec,
+      ratingFilter: nextRating,
+      sortBy: nextSort,
+      colorFilter: nextColor,
+    })
+  }, [colorFilter, filter, persistSettings, ratingFilter, settings, sortBy, specFilter])
 
   const showToast = useCallback((message, options = {}) => {
     if (!message) return
@@ -311,12 +338,21 @@ export default function App() {
 
       if (message.type === 'app.state') {
         if (message.payload?.settings) {
+          const incomingSettings = message.payload.settings
           setSettings(previous => {
-            const merged = { ...previous, ...message.payload.settings }
+            const merged = { ...previous, ...incomingSettings }
             setSavedSettings(merged)
             return merged
           })
-          setSparkSizeText(String(message.payload.settings.sparkSizePercent ?? 0))
+          setSparkSizeText(String(incomingSettings.sparkSizePercent ?? 0))
+          if (!hasHydratedFiltersRef.current) {
+            hasHydratedFiltersRef.current = true
+            if (typeof incomingSettings.mediaFilter === 'string') setFilter(incomingSettings.mediaFilter)
+            if (typeof incomingSettings.specFilter === 'string') setSpecFilter(incomingSettings.specFilter)
+            if (typeof incomingSettings.ratingFilter === 'string') setRatingFilter(incomingSettings.ratingFilter)
+            if (typeof incomingSettings.sortBy === 'string') setSortBy(incomingSettings.sortBy)
+            if (incomingSettings.colorFilter !== undefined) setColorFilter(incomingSettings.colorFilter ?? null)
+          }
         }
         if (Array.isArray(message.payload?.detectedWorkshopRoots)) {
           setDetectedWorkshopRoots(message.payload.detectedWorkshopRoots)
@@ -339,6 +375,7 @@ export default function App() {
         if (typeof message.payload?.appVersion === 'string' && message.payload.appVersion.trim()) {
           setAppVersion(message.payload.appVersion.trim())
         }
+        sendNativeMessage('localsend.status.request', {})
       }
       if (message.type === 'window.state') {
         if (typeof message.payload?.maximized === 'boolean') {
@@ -416,6 +453,14 @@ export default function App() {
         } else if (removedCount > 0) {
           showToast(`已同步移除 ${removedCount} 个已退订壁纸`)
         }
+      }
+      if (message.type === 'localsend.status') {
+        if (message.payload) {
+          setLocalsendStatus(message.payload)
+        }
+      }
+      if (message.type === 'localsend.peers.dirty') {
+        sendNativeMessage('localsend.status.request', {})
       }
       if (message.type === 'app.toast') {
         setCheckingUpdate(false)
@@ -1047,6 +1092,26 @@ export default function App() {
     sendNativeMessage('wallpapers.export-as.request', { ids: selectedIds })
   }
 
+  const dispatchLocalSendRequest = useCallback((msgType, payload) => {
+    const peers = localsendStatus?.peers ?? []
+    if (peers.length <= 1) {
+      sendNativeMessage(msgType, {
+        ...payload,
+        peerFingerprint: peers[0]?.fingerprint ?? null,
+      })
+      return
+    }
+    setPeerPickerState({ msgType, payload })
+  }, [localsendStatus, sendNativeMessage])
+
+  const sendSelectedToTablet = () => {
+    if (selectedIds.length === 0) return
+    dispatchLocalSendRequest('localsend.send.request', {
+      ids: selectedIds,
+      targetMode: 'vault',
+    })
+  }
+
   const closeDetails = () => {
     setDetailItem(null)
     setDetailOriginRect(null)
@@ -1354,7 +1419,7 @@ export default function App() {
                         type="button"
                         className="wv-segmented__item"
                         aria-pressed={active}
-                        onClick={() => setFilter(item.value)}
+                        onClick={() => updateFilterPreferences({ mediaFilter: item.value })}
                       >
                         {active ? (
                           <motion.span
@@ -1426,7 +1491,7 @@ export default function App() {
                                 className={`btn btn-xs h-7 px-2.5 ${
                                   sortBy === opt.value ? 'btn-primary' : 'btn-ghost'
                                 }`}
-                                onClick={() => setSortBy(opt.value)}
+                                onClick={() => updateFilterPreferences({ sortBy: opt.value })}
                               >
                                 {opt.label}
                               </button>
@@ -1443,7 +1508,7 @@ export default function App() {
                                 className={`btn btn-xs h-7 px-2.5 ${
                                   specFilter === opt.value ? 'btn-primary' : 'btn-ghost'
                                 }`}
-                                onClick={() => setSpecFilter(opt.value)}
+                                onClick={() => updateFilterPreferences({ specFilter: opt.value })}
                               >
                                 {opt.label}
                               </button>
@@ -1460,7 +1525,7 @@ export default function App() {
                                 className={`btn btn-xs h-7 px-2.5 ${
                                   ratingFilter === opt.value ? 'btn-primary' : 'btn-ghost'
                                 }`}
-                                onClick={() => setRatingFilter(opt.value)}
+                                onClick={() => updateFilterPreferences({ ratingFilter: opt.value })}
                               >
                                 {opt.label}
                               </button>
@@ -1501,7 +1566,7 @@ export default function App() {
                               const hex = String(formatColor(picked, 'hex') || '').toLowerCase()
                               const matched = COLOR_BUCKETS.find(b => b.swatch.toLowerCase() === hex)
                               if (matched) {
-                                setColorFilter(matched.value)
+                                updateFilterPreferences({ colorFilter: matched.value })
                               }
                             }}
                           >
@@ -1516,7 +1581,9 @@ export default function App() {
                                 onMouseLeave={() => setHoveredColorBucket(prev => (prev === bucket.value ? null : prev))}
                                 onClick={event => {
                                   event.preventDefault()
-                                  setColorFilter(prev => (prev === bucket.value ? null : bucket.value))
+                                  updateFilterPreferences({
+                                    colorFilter: colorFilter === bucket.value ? null : bucket.value,
+                                  })
                                 }}
                               />
                             ))}
@@ -1528,10 +1595,12 @@ export default function App() {
                               type="button"
                               className="btn btn-ghost btn-xs"
                               onClick={() => {
-                                setSortBy('default')
-                                setSpecFilter('all')
-                                setRatingFilter('all')
-                                setColorFilter(null)
+                                updateFilterPreferences({
+                                  sortBy: 'default',
+                                  specFilter: 'all',
+                                  ratingFilter: 'all',
+                                  colorFilter: null,
+                                })
                               }}
                             >
                               重置全部筛选
@@ -1763,6 +1832,15 @@ export default function App() {
                     </button>
                     <button
                       type="button"
+                      className="btn btn-sm btn-ghost text-primary hover:bg-primary/10"
+                      disabled={!isNative}
+                      onClick={sendSelectedToTablet}
+                    >
+                      <PaperPlaneTilt size={14} weight="bold" />
+                      发到平板
+                    </button>
+                    <button
+                      type="button"
                       className="btn btn-sm btn-primary"
                       disabled={!isNative}
                       onClick={exportSelected}
@@ -1802,6 +1880,8 @@ export default function App() {
             isNative={isNative}
             appVersion={appVersion}
             checkingUpdate={checkingUpdate}
+            localsendStatus={localsendStatus}
+            onRefreshLocalsend={() => sendNativeMessage('localsend.scan.request', {})}
             onCheckUpdate={checkLatestUpdate}
             onOpenExternalUrl={openExternalUrl}
             sendNativeMessage={sendNativeMessage}
@@ -1828,6 +1908,16 @@ export default function App() {
           onToggleFavorite={toggleFavorite}
           isNative={isNative}
           sendNativeMessage={sendNativeMessage}
+          onSendToTablet={(item, assetIndex) => dispatchLocalSendRequest('localsend.send.request', {
+            ids: [item.id],
+            assetIndex,
+            targetMode: 'vault',
+          })}
+          onPushClipboardToTablet={(item, assetIndex) => dispatchLocalSendRequest('localsend.send.request', {
+            ids: [item.id],
+            assetIndex,
+            targetMode: 'clipboard',
+          })}
           onOpenLayerStudio={item => {
             setDetailItem(null)
             openLayerStudio(item)
@@ -1848,6 +1938,14 @@ export default function App() {
           onOpenLayerStudio={openLayerStudio}
           onCopy={item => sendNativeMessage('wallpapers.copy.request', { id: item.id })}
           onSetDesktop={item => sendNativeMessage('wallpapers.set-desktop.request', { id: item.id })}
+          onSendToTablet={item => dispatchLocalSendRequest('localsend.send.request', {
+            ids: [item.id],
+            targetMode: 'vault',
+          })}
+          onPushClipboardToTablet={item => dispatchLocalSendRequest('localsend.send.request', {
+            ids: [item.id],
+            targetMode: 'clipboard',
+          })}
           onExport={item => sendNativeMessage('wallpapers.export.request', { ids: [item.id] })}
           onOpenFolder={item => sendNativeMessage('wallpapers.open-folder.request', { id: item.id })}
           onOpenWorkshop={item => sendNativeMessage('wallpapers.open-workshop.request', { id: item.id })}
@@ -1866,6 +1964,7 @@ export default function App() {
           isNative={isNative}
           onPreviewChange={handleStudioPreviewChange}
           onExport={handleStudioExport}
+          onSendToTablet={req => dispatchLocalSendRequest('localsend.send-studio.request', req)}
           onClose={closeLayerStudio}
         />
         <DuplicateInspectorDialog
@@ -1973,6 +2072,72 @@ export default function App() {
                         ? () => sendNativeMessage('shell.open-path.request', { path: toastState.destination })
                         : null)}
                 />
+              </motion.div>
+            ) : null}
+          </AnimatePresence>,
+          document.body,
+        )}
+        {createPortal(
+          <AnimatePresence>
+            {peerPickerState ? (
+              <motion.div
+                key="peer-picker-backdrop"
+                className="fixed inset-0 z-70 flex items-center justify-center bg-black/38 p-5 backdrop-blur-[3px]"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.16 }}
+                onMouseDown={e => {
+                  if (e.target === e.currentTarget) setPeerPickerState(null)
+                }}
+              >
+                <motion.div
+                  role="dialog"
+                  aria-modal="true"
+                  aria-label="选择接收设备"
+                  className="w-full max-w-sm rounded-[22px] border border-base-300/85 bg-base-100/92 p-5 shadow-2xl backdrop-blur-2xl"
+                  initial={{ opacity: 0, scale: 0.95, y: 10 }}
+                  animate={{ opacity: 1, scale: 1, y: 0 }}
+                  exit={{ opacity: 0, scale: 0.96, y: 6 }}
+                  transition={{ duration: 0.16, ease: [0.2, 0, 0, 1] }}
+                >
+                  <div className="mb-3.5 flex items-center justify-between">
+                    <h3 className="text-sm font-semibold">选择接收设备</h3>
+                    <button
+                      type="button"
+                      className="btn btn-xs btn-ghost h-7 w-7 min-w-0 rounded-full p-0"
+                      aria-label="关闭选择设备"
+                      onClick={() => setPeerPickerState(null)}
+                    >
+                      <X size={14} weight="bold" />
+                    </button>
+                  </div>
+                  <div className="space-y-2">
+                    {(localsendStatus?.peers ?? []).map(peer => (
+                      <button
+                        key={peer.fingerprint}
+                        type="button"
+                        className="flex w-full items-center justify-between rounded-xl border border-base-300/75 bg-base-200/45 px-3.5 py-2.5 text-left transition hover:border-primary/50 hover:bg-primary/8"
+                        onClick={() => {
+                          const req = peerPickerState
+                          setPeerPickerState(null)
+                          sendNativeMessage(req.msgType, {
+                            ...req.payload,
+                            peerFingerprint: peer.fingerprint,
+                          })
+                        }}
+                      >
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-medium">{peer.alias}</p>
+                          <p className="font-mono text-xs text-base-content/55">{peer.ip}:{peer.port}</p>
+                        </div>
+                        <span className={`badge badge-sm ${peer.isWallpullIpad ? 'badge-primary' : 'badge-ghost'}`}>
+                          {peer.isWallpullIpad ? 'WallPull iPad' : (peer.deviceModel || 'WallPull')}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </motion.div>
               </motion.div>
             ) : null}
           </AnimatePresence>,

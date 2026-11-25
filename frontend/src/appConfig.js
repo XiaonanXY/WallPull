@@ -117,7 +117,7 @@ export const HARDWARE_ACCELERATION_MODES = [
 
 export const APP_INFO = {
   name: 'WallPull',
-  version: '1.0.1',
+  version: '1.0.2',
   author: 'Xiaonan',
   license: 'GNU GPL-3.0',
   repoUrl: 'https://github.com/XiaonanXY/WallPull',
@@ -169,6 +169,13 @@ export const DEFAULT_SETTINGS = {
   closeToTray: false,
   showArchivedBadge: false,
   favoriteIds: [],
+  localsendEnabled: true,
+  localsendAlias: 'WallPull PC',
+  mediaFilter: 'all',
+  specFilter: 'all',
+  ratingFilter: 'all',
+  sortBy: 'default',
+  colorFilter: null,
 }
 
 export const MOCK_WALLPAPERS = Array.from({ length: 18 }, (_, index) => ({

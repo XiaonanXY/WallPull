@@ -8,6 +8,9 @@ use crate::actions::{
 };
 use crate::clipboard::{copy_media_to_clipboard, copy_text_to_clipboard};
 use crate::duplicates::analyze_duplicates;
+use crate::localsend::{
+    LocalSendEvent, LocalSendHub, OutgoingTransferFile, TransferSource, mime_for_path,
+};
 use crate::media::{find_executable, is_recognized_media_path, probe_or_fallback};
 use crate::models::{
     AppSettings, AudioTrackPayload, GpuAdapterInfo, ItemPrecomputedMeta, WallpaperItem,
@@ -192,6 +195,7 @@ pub struct AppController {
     pub studio_session: Option<(String, Arc<SceneStudioSession>, Option<String>)>,
     pub studio_gen: Arc<AtomicU64>,
     pub studio_preview_bytes: Arc<Mutex<Option<(u64, Arc<Vec<u8>>)>>>,
+    pub localsend: Arc<LocalSendHub>,
     pub exiting_explicitly: bool,
     pub self_test: bool,
 }
@@ -214,6 +218,40 @@ impl AppController {
         let scan_gen = Arc::new(AtomicU64::new(0));
         let watcher_cancel = Arc::new(Mutex::new(None));
         let watcher_stop = Arc::new(AtomicBool::new(false));
+        let ls_tx = tx.clone();
+        let ls_hwnd = hwnd.0 as isize;
+        let localsend = LocalSendHub::start(
+            settings.localsend_enabled,
+            &settings.localsend_alias,
+            &settings.export_directory,
+            !self_test,
+            move |ev| match ev {
+                LocalSendEvent::PeersChanged => send_ui(
+                    &ls_tx,
+                    ls_hwnd,
+                    UiCommand::PostJson {
+                        msg_type: "localsend.peers.dirty".into(),
+                        payload: json!({}),
+                        request_id: None,
+                    },
+                ),
+                LocalSendEvent::FileReceived {
+                    message,
+                    destination,
+                } => send_ui(
+                    &ls_tx,
+                    ls_hwnd,
+                    UiCommand::PostJson {
+                        msg_type: "wallpapers.action.result".into(),
+                        payload: json!({
+                            "message": message,
+                            "destination": destination,
+                        }),
+                        request_id: None,
+                    },
+                ),
+            },
+        );
         if !self_test {
             start_watcher_thread(
                 tx.clone(),
@@ -257,6 +295,7 @@ impl AppController {
             studio_session: None,
             studio_gen: Arc::new(AtomicU64::new(0)),
             studio_preview_bytes: Arc::new(Mutex::new(None)),
+            localsend,
             exiting_explicitly: false,
             self_test,
         });
@@ -269,6 +308,7 @@ impl AppController {
         self.export_cancel.store(true, Ordering::SeqCst);
         self.toolbox_cancel.store(true, Ordering::SeqCst);
         self.watcher_stop.store(true, Ordering::SeqCst);
+        self.localsend.stop();
         if let Ok(guard) = self.watcher_cancel.lock() {
             if let Some(c) = guard.as_ref() {
                 c.store(true, Ordering::SeqCst);
@@ -570,6 +610,7 @@ impl AppController {
                     }
                     let disk_bytes = calculate_distinct_workshop_bytes(&items);
                     self.sync_watcher_roots();
+                    self.update_localsend_catalog();
                     self.post_json(
                         "wallpapers.list",
                         json!({
@@ -652,6 +693,7 @@ impl AppController {
                     self.wallpapers = new_map;
                     let disk_bytes = calculate_distinct_workshop_bytes(&items);
                     self.sync_watcher_roots();
+                    self.update_localsend_catalog();
                     self.post_json(
                         "wallpapers.sync",
                         json!({
@@ -805,6 +847,7 @@ impl AppController {
                     };
 
                     let deleted_vec: Vec<String> = deleted_ids.into_iter().collect();
+                    self.update_localsend_catalog();
                     self.post_json(
                         "wallpapers.deleted",
                         json!({
@@ -836,6 +879,11 @@ impl AppController {
                     if let Some(p) = path {
                         self.settings.export_directory = p;
                         let _ = save_settings_to(&settings_file_path(), &self.settings);
+                        self.localsend.update_config(
+                            self.settings.localsend_enabled,
+                            &self.settings.localsend_alias,
+                            &self.settings.export_directory,
+                        );
                         self.post_json("settings.value", &self.settings, request_id.as_deref());
                     }
                 }
@@ -1975,8 +2023,18 @@ impl AppController {
                 self.settings = sanitize_settings(parsed);
                 save_settings_to(&settings_file_path(), &self.settings)?;
                 self.sync_watcher_roots();
+                self.localsend.update_config(
+                    self.settings.localsend_enabled,
+                    &self.settings.localsend_alias,
+                    &self.settings.export_directory,
+                );
                 self.apply_window_theme(self.settings.theme_mode == "dark");
                 self.post_json("settings.value", &self.settings, req_id.as_deref());
+                self.post_json(
+                    "localsend.status",
+                    self.localsend.status_snapshot(),
+                    req_id.as_deref(),
+                );
                 Ok(())
             }
             "settings.pick-workshop.request" => {
@@ -2048,6 +2106,219 @@ impl AppController {
                     json!({ "message": msg }),
                     req_id.as_deref(),
                 );
+                Ok(())
+            }
+            "localsend.status.request" => {
+                self.post_json(
+                    "localsend.status",
+                    self.localsend.status_snapshot(),
+                    req_id.as_deref(),
+                );
+                Ok(())
+            }
+            "localsend.scan.request" => {
+                self.localsend.refresh_discovery();
+                self.post_json(
+                    "localsend.status",
+                    self.localsend.status_snapshot(),
+                    req_id.as_deref(),
+                );
+                Ok(())
+            }
+            "localsend.send.request" => {
+                let ids = read_ids(payload);
+                if ids.is_empty() {
+                    return Err("请先选择要发送到平板的壁纸。".to_string());
+                }
+                let asset_idx = payload
+                    .and_then(|p| p.get("assetIndex"))
+                    .and_then(|v| v.as_u64())
+                    .map(|u| u as usize);
+                let peer_fp = payload
+                    .and_then(|p| p.get("peerFingerprint"))
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+                let target_mode = payload
+                    .and_then(|p| p.get("targetMode"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("vault")
+                    .to_string();
+
+                let Some(peer) = self.localsend.find_peer(peer_fp.as_deref()) else {
+                    self.localsend.refresh_discovery();
+                    return Err("未在局域网发现已打开的 WallPull iPad 设备，请确认设备处于同一 Wi-Fi 后重试。".to_string());
+                };
+                let items = resolve_target_items(&ids, &self.wallpapers);
+                if items.is_empty() {
+                    return Err("未找到对应的有效壁纸文件。".to_string());
+                }
+                let ls = self.localsend.clone();
+                let tx = self.tx.clone();
+                let hwnd = self.hwnd.0 as isize;
+                let rq = req_id.clone();
+                std::thread::spawn(move || {
+                    let mut out_files = Vec::new();
+                    for w in &items {
+                        let resolved = resolve_wallpaper_asset_path(w, if items.len() == 1 { asset_idx } else { None });
+                        let raw_p = PathBuf::from(&resolved);
+                        if !raw_p.is_file() {
+                            continue;
+                        }
+                        if target_mode == "clipboard" && w.item_type != "image" {
+                            continue;
+                        }
+                        let (p, file_name, mime_type) = if w.item_type == "video" {
+                            let converted = crate::localsend::ensure_ios_compatible_mp4(
+                                &w.id,
+                                &raw_p,
+                                w.preview_video_path.as_deref(),
+                            )
+                            .unwrap_or_else(|_| raw_p.clone());
+                            let raw_name = converted
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| format!("{}.mp4", crate::actions::get_safe_file_name(&w.title, &w.workshop_id)));
+                            (converted.clone(), raw_name, mime_for_path(&converted, &w.item_type))
+                        } else {
+                            let raw_name = raw_p
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| format!("{}.png", crate::actions::get_safe_file_name(&w.title, &w.workshop_id)));
+                            (raw_p.clone(), raw_name, mime_for_path(&raw_p, &w.item_type))
+                        };
+                        let content_rating = if !w.workshop_directory.is_empty() {
+                            Some(crate::scanner::inspect_workshop_extra(&w.workshop_directory).content_rating)
+                        } else {
+                            None
+                        };
+                        out_files.push(OutgoingTransferFile {
+                            id: format!("wp-{}", w.id),
+                            file_name,
+                            mime_type,
+                            source: TransferSource::File(p),
+                            wallpull_target: target_mode.clone(),
+                            wallpull_kind: "wallpaper".to_string(),
+                            wallpull_title: w.title.clone(),
+                            wallpull_resolution: w.resolution.clone(),
+                            wallpull_item_id: Some(w.id.clone()),
+                            wallpull_has_scene_layers: w.item_type == "image"
+                                && !w.workshop_directory.is_empty()
+                                && has_inspectable_2d_scene(&w.workshop_directory),
+                            wallpull_content_rating: content_rating,
+                        });
+                    }
+                    let res = if out_files.is_empty() {
+                        Err("所选壁纸不是可推入剪贴板的静态图片或文件不存在。".to_string())
+                    } else {
+                        ls.send_files_to_peer(&peer, &out_files)
+                    };
+                    match res {
+                        Ok(msg) => send_ui(
+                            &tx,
+                            hwnd,
+                            UiCommand::PostJson {
+                                msg_type: "wallpapers.action.result".into(),
+                                payload: json!({ "message": msg }),
+                                request_id: rq,
+                            },
+                        ),
+                        Err(msg) => send_ui(
+                            &tx,
+                            hwnd,
+                            UiCommand::PostJson {
+                                msg_type: "error".into(),
+                                payload: json!({ "message": msg }),
+                                request_id: rq,
+                            },
+                        ),
+                    }
+                });
+                Ok(())
+            }
+            "localsend.send-studio.request" => {
+                let Some((cur_id, session, _)) = &self.studio_session else {
+                    return Err("透视拆解台尚未打开任何壁纸。".to_string());
+                };
+                let wallpaper = self.find_wallpaper(Some(cur_id))?;
+                let visible_set = read_layer_index_set(payload);
+                let trim_bounds = payload
+                    .and_then(|p| p.get("trimBounds"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let include_bg = payload
+                    .and_then(|p| p.get("includeBackground"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let peer_fp = payload
+                    .and_then(|p| p.get("peerFingerprint"))
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+                let target_mode = payload
+                    .and_then(|p| p.get("targetMode"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("vault")
+                    .to_string();
+                let Some(peer) = self.localsend.find_peer(peer_fp.as_deref()) else {
+                    self.localsend.refresh_discovery();
+                    return Err("未在局域网发现已打开的 WallPull iPad 设备。".to_string());
+                };
+
+                let session_arc = session.clone();
+                let ls = self.localsend.clone();
+                let tx = self.tx.clone();
+                let hwnd = self.hwnd.0 as isize;
+                let rq = req_id.clone();
+                std::thread::spawn(move || {
+                    let res = (|| -> Result<String, String> {
+                        let (bytes, r) = session_arc.render_subset_to_png_bytes(
+                            &visible_set,
+                            0,
+                            !include_bg,
+                            !include_bg && trim_bounds,
+                        )?;
+                        if !r.has_pixels {
+                            return Err("当前勾选图层画面为空，请至少保留一个可见图层。".to_string());
+                        }
+                        let safe_title = crate::actions::get_safe_file_name(&wallpaper.title, &wallpaper.workshop_id);
+                        let suffix = if include_bg { "自定义合成" } else { "透明立绘" };
+                        let out = vec![OutgoingTransferFile {
+                            id: format!("studio-{}", wallpaper.id),
+                            file_name: format!("{safe_title} - {suffix}.png"),
+                            mime_type: "image/png".to_string(),
+                            source: TransferSource::Memory(Arc::new(bytes)),
+                            wallpull_target: target_mode,
+                            wallpull_kind: if include_bg { "wallpaper" } else { "cutout" }.to_string(),
+                            wallpull_title: format!("{} · {suffix}", wallpaper.title),
+                            wallpull_resolution: Some(format!("{} × {}", r.width, r.height)),
+                            wallpull_item_id: Some(wallpaper.id.clone()),
+                            wallpull_has_scene_layers: false,
+                            wallpull_content_rating: None,
+                        }];
+                        ls.send_files_to_peer(&peer, &out)
+                    })();
+                    match res {
+                        Ok(msg) => send_ui(
+                            &tx,
+                            hwnd,
+                            UiCommand::PostJson {
+                                msg_type: "wallpapers.action.result".into(),
+                                payload: json!({ "message": msg }),
+                                request_id: rq,
+                            },
+                        ),
+                        Err(msg) => send_ui(
+                            &tx,
+                            hwnd,
+                            UiCommand::PostJson {
+                                msg_type: "error".into(),
+                                payload: json!({ "message": msg }),
+                                request_id: rq,
+                            },
+                        ),
+                    }
+                });
                 Ok(())
             }
             _ => Ok(()),
@@ -2604,6 +2875,11 @@ impl AppController {
         if let Ok(mut guard) = self.watcher_export_dir.lock() {
             *guard = self.settings.export_directory.clone();
         }
+    }
+
+    fn update_localsend_catalog(&self) {
+        let list: Vec<WallpaperItem> = self.wallpapers.values().cloned().collect();
+        self.localsend.update_catalog(&list);
     }
 }
 

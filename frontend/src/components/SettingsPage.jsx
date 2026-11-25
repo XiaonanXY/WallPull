@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { ArrowsClockwise, ChatCircleDots, Cpu, GithubLogo, Info, X } from '@phosphor-icons/react'
+import { ArrowsClockwise, ChatCircleDots, Cpu, DeviceTablet, GithubLogo, Info, X } from '@phosphor-icons/react'
 import { AnimatePresence, motion } from 'motion/react'
 import { formatColor } from '@appica/ui-react'
 import {
@@ -65,6 +65,8 @@ export default function SettingsPage({
   isNative,
   appVersion = APP_INFO.version,
   checkingUpdate = false,
+  localsendStatus = null,
+  onRefreshLocalsend,
   onCheckUpdate,
   onOpenExternalUrl,
   sendNativeMessage,
@@ -404,16 +406,112 @@ export default function SettingsPage({
                   开启后点击右上角 × 会缩进右下角系统托盘待命，右键托盘图标可随时唤出主窗口或彻底退出。
                 </p>
               </div>
-              <input
-                type="checkbox"
-                className="toggle toggle-primary toggle-sm"
+              <button
+                type="button"
+                role="switch"
+                className="wv-switch"
                 aria-label="关闭时最小化到系统托盘"
-                checked={Boolean(settings.closeToTray)}
-                onChange={event => persistSettings({
+                aria-checked={Boolean(settings.closeToTray)}
+                onClick={() => persistSettings({
                   ...settings,
-                  closeToTray: event.target.checked,
+                  closeToTray: !settings.closeToTray,
                 })}
-              />
+              >
+                <span className="wv-switch__thumb" />
+              </button>
+            </div>
+          </section>
+
+          <section className="space-y-6 rounded-2xl border border-base-300/70 bg-base-200/45 p-6">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h2 className="flex items-center gap-1.5 text-xs font-semibold tracking-wider text-base-content/55">
+                <DeviceTablet size={14} weight="bold" />
+                跨端互联
+              </h2>
+              <span className="badge badge-sm border-base-300/80 bg-base-100/75 font-mono font-medium text-base-content/70">
+                {settings.localsendEnabled === false
+                  ? '已关闭'
+                  : (localsendStatus?.localIps?.[0]
+                      ? `${localsendStatus.localIps[0]}:${localsendStatus.port || 53417}`
+                      : `端口 ${localsendStatus?.port || 53417}`)}
+              </span>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <div>
+                <p className="text-sm font-medium">启用局域网跨端传输</p>
+                <p className="mt-0.5 text-xs text-base-content/60">
+                  开启后将使用独立 WallPull 专有频段（端口 53417），不与 LocalSend 等其他传文件软件冲突，与同 Wi-Fi 下的 iPad 无损互传原图、透明立绘及剪贴板画面。
+                </p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                className="wv-switch"
+                aria-label="启用局域网跨端传输"
+                aria-checked={settings.localsendEnabled !== false}
+                onClick={() => persistSettings({
+                  ...settings,
+                  localsendEnabled: settings.localsendEnabled === false,
+                })}
+              >
+                <span className="wv-switch__thumb" />
+              </button>
+            </div>
+
+            <fieldset className="fieldset">
+              <legend className="fieldset-legend">本机显示名称</legend>
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  maxLength={48}
+                  className="input input-sm flex-1"
+                  value={settings.localsendAlias ?? 'WallPull PC'}
+                  onChange={event => setSettings(prev => ({ ...prev, localsendAlias: event.target.value }))}
+                  onBlur={event => {
+                    const nextAlias = event.target.value.trim() || 'WallPull PC'
+                    if (nextAlias !== (settings.localsendAlias || 'WallPull PC')) {
+                      persistSettings({ ...settings, localsendAlias: nextAlias })
+                    }
+                  }}
+                  placeholder="WallPull PC"
+                />
+              </div>
+            </fieldset>
+
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-base-300/60 pt-4">
+              <div className="min-w-0 flex-1">
+                <p className="text-sm font-medium">
+                  在线接收设备{localsendStatus?.peers?.length ? `（${localsendStatus.peers.length}）` : ''}
+                </p>
+                {localsendStatus?.peers?.length ? (
+                  <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                    {localsendStatus.peers.map(peer => (
+                      <span
+                        key={peer.fingerprint}
+                        className="inline-flex items-center gap-1.5 rounded-full border border-base-300/80 bg-base-100/85 px-2.5 py-0.5 text-xs text-base-content/85"
+                      >
+                        <span className={`h-1.5 w-1.5 rounded-full ${peer.isWallpullIpad ? 'bg-primary' : 'bg-success'}`} />
+                        <span className="font-medium">{peer.alias}</span>
+                        <span className="font-mono text-[11px] text-base-content/50">{peer.ip}</span>
+                      </span>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="mt-0.5 text-xs text-base-content/60">
+                    暂未发现其他设备，在 iPad 打开 WallPull 后会自动浮现。
+                  </p>
+                )}
+              </div>
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm shrink-0"
+                disabled={!isNative}
+                onClick={() => onRefreshLocalsend?.()}
+              >
+                <ArrowsClockwise size={14} weight="bold" />
+                刷新设备
+              </button>
             </div>
           </section>
 

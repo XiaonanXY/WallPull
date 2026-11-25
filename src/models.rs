@@ -66,6 +66,15 @@ fn default_nav_style() -> String {
 fn default_toolbox_layout() -> String {
     "bento".to_string()
 }
+fn default_localsend_alias() -> String {
+    "WallPull PC".to_string()
+}
+fn default_all() -> String {
+    "all".to_string()
+}
+fn default_sort_default() -> String {
+    "default".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -104,6 +113,20 @@ pub struct AppSettings {
     pub show_archived_badge: bool,
     #[serde(default)]
     pub favorite_ids: Vec<String>,
+    #[serde(default = "default_true")]
+    pub localsend_enabled: bool,
+    #[serde(default = "default_localsend_alias")]
+    pub localsend_alias: String,
+    #[serde(default = "default_all")]
+    pub media_filter: String,
+    #[serde(default = "default_all")]
+    pub spec_filter: String,
+    #[serde(default = "default_all")]
+    pub rating_filter: String,
+    #[serde(default = "default_sort_default")]
+    pub sort_by: String,
+    #[serde(default)]
+    pub color_filter: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -126,6 +149,13 @@ impl Default for AppSettings {
             close_to_tray: false,
             show_archived_badge: false,
             favorite_ids: Vec::new(),
+            localsend_enabled: true,
+            localsend_alias: default_localsend_alias(),
+            media_filter: default_all(),
+            spec_filter: default_all(),
+            rating_filter: default_all(),
+            sort_by: default_sort_default(),
+            color_filter: None,
         }
     }
 }

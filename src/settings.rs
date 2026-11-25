@@ -140,6 +140,38 @@ pub fn sanitize_settings(updated: AppSettings) -> AppSettings {
         close_to_tray: updated.close_to_tray,
         show_archived_badge: updated.show_archived_badge,
         favorite_ids,
+        localsend_enabled: updated.localsend_enabled,
+        localsend_alias: {
+            let trimmed = updated.localsend_alias.trim();
+            if trimmed.is_empty() {
+                "WallPull PC".to_string()
+            } else {
+                trimmed.chars().take(48).collect()
+            }
+        },
+        media_filter: if matches!(updated.media_filter.as_str(), "all" | "image" | "video" | "favorite") {
+            updated.media_filter
+        } else {
+            "all".to_string()
+        },
+        spec_filter: if matches!(updated.spec_filter.as_str(), "all" | "4k" | "landscape" | "portrait" | "audio" | "layered") {
+            updated.spec_filter
+        } else {
+            "all".to_string()
+        },
+        rating_filter: if matches!(updated.rating_filter.as_str(), "all" | "everyone" | "mature") {
+            updated.rating_filter
+        } else {
+            "all".to_string()
+        },
+        sort_by: if matches!(updated.sort_by.as_str(), "default" | "size" | "resolution" | "title") {
+            updated.sort_by
+        } else {
+            "default".to_string()
+        },
+        color_filter: updated.color_filter.filter(|c| {
+            matches!(c.as_str(), "dark" | "light" | "blue" | "purple" | "green" | "warm")
+        }),
     }
 }
 
@@ -498,5 +530,31 @@ fn add_dir_if_valid(roots: &mut Vec<PathBuf>, seen: &mut HashSet<String>, path: 
         .to_ascii_lowercase();
     if seen.insert(key) {
         roots.push(abs);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persists_filter_preferences_across_restart() {
+        let tmp = std::env::temp_dir().join(format!("wp_settings_persist_{}.json", std::process::id()));
+        let _ = fs::remove_file(&tmp);
+        let mut s = AppSettings::default();
+        s.rating_filter = "everyone".to_string();
+        s.spec_filter = "4k".to_string();
+        s.sort_by = "resolution".to_string();
+        s.media_filter = "image".to_string();
+        s.color_filter = Some("blue".to_string());
+        save_settings_to(&tmp, &s).unwrap();
+
+        let loaded = load_settings_from(&tmp);
+        assert_eq!(loaded.rating_filter, "everyone");
+        assert_eq!(loaded.spec_filter, "4k");
+        assert_eq!(loaded.sort_by, "resolution");
+        assert_eq!(loaded.media_filter, "image");
+        assert_eq!(loaded.color_filter.as_deref(), Some("blue"));
+        let _ = fs::remove_file(&tmp);
     }
 }

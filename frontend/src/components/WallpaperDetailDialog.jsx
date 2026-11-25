@@ -7,8 +7,10 @@ import {
   CaretLeft,
   CaretRight,
   Desktop,
+  DeviceTablet,
   DownloadSimple,
   MusicNotes,
+  PaperPlaneTilt,
   Pause,
   Play,
   SlidersHorizontal,
@@ -52,6 +54,8 @@ export default function WallpaperDetailDialog({
   onPrev,
   onNext,
   onToggleFavorite,
+  onSendToTablet,
+  onPushClipboardToTablet,
   onOpenLayerStudio,
   onDelete,
   suppressHotkeys = false,
@@ -699,6 +703,33 @@ export default function WallpaperDetailDialog({
               </p>
             </div>
             <div className="flex shrink-0 items-center gap-1.5">
+              <div className="wv-utility-island" role="group" aria-label="发送到平板">
+                <button
+                  className="wv-utility-island__btn"
+                  type="button"
+                  disabled={!isNative}
+                  onClick={() => onSendToTablet?.(item, assetIndex)}
+                >
+                  <PaperPlaneTilt size={13} weight="bold" />
+                  <span>发到 iPad</span>
+                </button>
+                {item.type === 'image' ? (
+                  <>
+                    <span className="wv-utility-island__divider" aria-hidden="true" />
+                    <span className="tooltip tooltip-bottom" data-tip="推至 iPad 剪贴板">
+                      <button
+                        className="wv-utility-island__btn w-7 px-0"
+                        type="button"
+                        aria-label="推至 iPad 剪贴板"
+                        disabled={!isNative}
+                        onClick={() => onPushClipboardToTablet?.(item, assetIndex)}
+                      >
+                        <DeviceTablet size={13} weight="bold" />
+                      </button>
+                    </span>
+                  </>
+                ) : null}
+              </div>
               {item.customizableCount > 0 ? (
                 <button
                   type="button"
