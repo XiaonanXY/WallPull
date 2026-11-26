@@ -67,6 +67,9 @@ unsafe fn restore_and_activate_window(hwnd: HWND) {
             let _ = ShowWindow(hwnd, SW_SHOW);
         }
         let _ = SetForegroundWindow(hwnd);
+        if let Some(st) = get_state_mut(hwnd) {
+            st.app.focus_webview();
+        }
     }
 }
 
@@ -220,6 +223,7 @@ pub fn run_app(self_test: bool) -> Result<(), String> {
 
         if let Some(st) = get_state_mut(hwnd) {
             if let Err(err) = st.app.init_webview() {
+                st.tray.remove();
                 let text: Vec<u16> = err.encode_utf16().chain(Some(0)).collect();
                 let _ = MessageBoxW(
                     Some(hwnd),
@@ -385,6 +389,12 @@ unsafe extern "system" fn wnd_proc(
         WM_MOVE => {
             if let Some(st) = unsafe { get_state_mut(hwnd) } {
                 st.app.notify_parent_moved();
+            }
+            LRESULT(0)
+        }
+        WM_SETFOCUS => {
+            if let Some(st) = unsafe { get_state_mut(hwnd) } {
+                st.app.focus_webview();
             }
             LRESULT(0)
         }

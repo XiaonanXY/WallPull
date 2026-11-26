@@ -103,7 +103,7 @@ export default function SuperToolboxDialog({
 
   const selectLayoutScheme = nextId => {
     if (nextId === layoutScheme) return
-    persistSettings?.({ ...settings, toolboxLayout: nextId })
+    persistSettings?.({ toolboxLayout: nextId })
   }
 
   useEffect(() => {
@@ -120,21 +120,29 @@ export default function SuperToolboxDialog({
     return () => globalThis.removeEventListener('keydown', onKeyDown)
   }, [onClose, open])
 
+  const liveIds = useMemo(() => new Set(wallpapers.map(w => w.id)), [wallpapers])
+  const liveFavoriteIds = useMemo(() => favoriteIds.filter(id => liveIds.has(id)), [favoriteIds, liveIds])
   const archivedSet = useMemo(
     () => new Set(wallpapers.filter(w => w.isArchivedOffline).map(w => w.id)),
     [wallpapers],
   )
   const unarchivedFavoriteIds = useMemo(
-    () => favoriteIds.filter(id => !archivedSet.has(id)),
-    [archivedSet, favoriteIds],
+    () => liveFavoriteIds.filter(id => !archivedSet.has(id)),
+    [archivedSet, liveFavoriteIds],
   )
-  const archivedFavoriteCount = favoriteIds.length - unarchivedFavoriteIds.length
+  const archivedFavoriteCount = liveFavoriteIds.length - unarchivedFavoriteIds.length
   const showArchivedBadge = Boolean(settings?.showArchivedBadge)
+  const activeTaskKind = busy ? (taskProgress?.taskKind || null) : null
 
   const largeVideos = useMemo(
     () =>
       wallpapers
-        .filter(w => w.type === 'video' && (w.fileSize || 0) >= 35 * 1024 * 1024)
+        .filter(w => {
+          if (w.type !== 'video' || (w.fileSize || 0) < 35 * 1024 * 1024) return false
+          if (typeof w.isSlimmableMp4 === 'boolean') return w.isSlimmableMp4
+          const cleanUrl = (w.mediaUrl || '').split('?')[0].toLowerCase()
+          return cleanUrl.endsWith('.mp4')
+        })
         .sort((a, b) => (b.fileSize || 0) - (a.fileSize || 0))
         .slice(0, 12),
     [wallpapers],
@@ -160,13 +168,13 @@ export default function SuperToolboxDialog({
     }
   }
 
-  const archiveButtonLabel = busy
+  const archiveButtonLabel = activeTaskKind === 'archive'
     ? '正在典藏…'
-    : favoriteIds.length > 0 && unarchivedFavoriteIds.length === 0
+    : liveFavoriteIds.length > 0 && unarchivedFavoriteIds.length === 0
       ? '已全部典藏'
       : archivedFavoriteCount > 0
         ? `典藏新增收藏 (${unarchivedFavoriteIds.length})`
-        : `典藏全部收藏 (${favoriteIds.length})`
+        : `典藏全部收藏 (${liveFavoriteIds.length})`
 
   const renderArchiveCard = (compact = false) => (
     <div className={`rounded-2xl border border-base-300/75 bg-base-200/45 ${compact ? 'p-4' : 'p-5'}`}>
@@ -176,12 +184,9 @@ export default function SuperToolboxDialog({
             <Vault size={17} weight="fill" className="shrink-0 text-primary" />
             <h3 className="text-sm font-semibold">收藏典藏</h3>
             <span className="rounded-full bg-base-300/60 px-2.5 py-0.5 text-[11px] font-medium text-base-content/75 tabular-nums">
-              已收藏 {favoriteIds.length} 项 · 已典藏 {archivedFavoriteCount} 项
+              已收藏 {liveFavoriteIds.length} 项 · 已典藏 {archivedFavoriteCount} 项
             </span>
           </div>
-          <p className="mt-1 text-xs leading-relaxed text-base-content/65">
-            将收藏的壁纸保存为本地独立工程，取消订阅或原作品下架后仍可正常使用。
-          </p>
         </div>
       </div>
 
@@ -203,7 +208,7 @@ export default function SuperToolboxDialog({
               })
             }
           >
-            {busy ? <span className="loading loading-spinner loading-xs" /> : null}
+            {activeTaskKind === 'archive' ? <span className="loading loading-spinner loading-xs" /> : null}
             {archiveButtonLabel}
           </button>
           <button
@@ -229,7 +234,7 @@ export default function SuperToolboxDialog({
                   className="wv-segmented__item text-xs"
                   aria-pressed={active}
                   onClick={() =>
-                    persistSettings?.({ ...settings, showArchivedBadge: opt.value })
+                    persistSettings?.({ showArchivedBadge: opt.value })
                   }
                 >
                   {active ? (
@@ -257,9 +262,6 @@ export default function SuperToolboxDialog({
             <MagnifyingGlass size={16} weight="bold" className="shrink-0 text-primary" />
             重复壁纸清理
           </h3>
-          <p className="mt-1 text-xs leading-relaxed text-base-content/65">
-            比对画面找出重复订阅或低清版本并移入回收站。
-          </p>
         </div>
         {compact ? (
           <button
@@ -331,8 +333,8 @@ export default function SuperToolboxDialog({
             disabled={!isNative || busy || !migrationStatus?.workshopRoot}
             onClick={() => sendNativeMessage('toolbox.migration.execute', {})}
           >
-            {busy ? <span className="loading loading-spinner loading-xs" /> : null}
-            迁移到其他磁盘
+            {activeTaskKind === 'migration' ? <span className="loading loading-spinner loading-xs" /> : null}
+            {activeTaskKind === 'migration' ? '正在迁移…' : '迁移到其他磁盘'}
           </button>
         </div>
       )}
@@ -348,9 +350,6 @@ export default function SuperToolboxDialog({
       <div className="flex flex-wrap items-center justify-between gap-2.5">
         <div>
           <h3 className="text-sm font-semibold">视频体积压缩</h3>
-          <p className="mt-0.5 text-xs text-base-content/65">
-            超过 35 MB 的视频可重编码为 H.265 节省空间，原文件自动移入回收站。
-          </p>
         </div>
         <div className="flex items-center gap-1.5">
           {largeVideos.length > 0 ? (
@@ -379,8 +378,8 @@ export default function SuperToolboxDialog({
               })
             }
           >
-            {busy ? <span className="loading loading-spinner loading-xs" /> : null}
-            {busy
+            {activeTaskKind === 'slim-videos' ? <span className="loading loading-spinner loading-xs" /> : null}
+            {activeTaskKind === 'slim-videos'
               ? '正在压缩…'
               : activeVideoIds.length > 0
                 ? `压缩已选 (${activeVideoIds.length})`
@@ -550,10 +549,7 @@ export default function SuperToolboxDialog({
             ))}
           </div>
 
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <p className="text-xs text-base-content/55">
-              输出保存至默认导出目录下的「格式工坊」文件夹
-            </p>
+          <div className="flex items-center justify-end gap-2">
             <button
               type="button"
               className="btn btn-primary btn-sm gap-1.5 px-5"
@@ -567,12 +563,12 @@ export default function SuperToolboxDialog({
                 })
               }
             >
-              {busy ? (
+              {activeTaskKind === 'convert' ? (
                 <span className="loading loading-spinner loading-xs" />
               ) : (
                 <Lightning size={15} weight="fill" />
               )}
-              {busy ? '正在转换…' : `开始转换 (${toolboxFiles.length})`}
+              {activeTaskKind === 'convert' ? '正在转换…' : `开始转换 (${toolboxFiles.length})`}
             </button>
           </div>
         </div>
@@ -598,9 +594,6 @@ export default function SuperToolboxDialog({
         </span>
         <div className={inline ? 'min-w-0' : 'mt-4 max-w-lg'}>
           <h3 className="text-sm font-semibold">解包 .pkg / .tex 文件</h3>
-          <p className="mt-0.5 text-xs leading-relaxed text-base-content/65">
-            直接提取外部 .pkg 资源包或 .tex 贴图中的原图与音频文件。
-          </p>
         </div>
       </div>
       <button
@@ -609,12 +602,12 @@ export default function SuperToolboxDialog({
         disabled={!isNative || busy}
         onClick={() => sendNativeMessage('toolbox.packages.unpack', {})}
       >
-        {busy ? (
+        {activeTaskKind === 'unpack' ? (
           <span className="loading loading-spinner loading-xs" />
         ) : (
           <Package size={15} weight="bold" />
         )}
-        {busy ? '正在解包…' : '选择文件解包'}
+        {activeTaskKind === 'unpack' ? '正在解包…' : '选择文件解包'}
       </button>
     </div>
   )
@@ -649,9 +642,6 @@ export default function SuperToolboxDialog({
                 </span>
                 <div>
                   <h2 className="text-base font-semibold tracking-tight">工具箱</h2>
-                  <p className="text-xs text-base-content/60">
-                    收藏典藏、空间清理与外部媒体处理
-                  </p>
                 </div>
               </div>
 
@@ -722,7 +712,7 @@ export default function SuperToolboxDialog({
                     const active = sidebarTab === sec.id
                     const countText =
                       sec.id === 'archive'
-                        ? favoriteIds.length
+                        ? liveFavoriteIds.length
                         : sec.id === 'cleanup'
                           ? largeVideos.length
                           : sec.id === 'format'

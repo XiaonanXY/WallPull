@@ -25,6 +25,10 @@ final class RetinaThumbnailCache: @unchecked Sendable {
         cache.setObject(image, forKey: key as NSString, cost: max(1, px * 4))
     }
 
+    static func cacheKey(url: URL, revision: Int, maxPixelSize: CGFloat = 720) -> String {
+        "\(url.path)#\(revision)#\(Int(maxPixelSize.rounded()))"
+    }
+
     func removeAll() {
         cache.removeAllObjects()
     }
@@ -42,6 +46,25 @@ private final class NonRedirectUpdateDelegate: NSObject, URLSessionTaskDelegate 
     }
 }
 
+private struct LossyVaultItemList: Decodable {
+    let items: [VaultItem]
+
+    private struct SkipElement: Decodable {}
+
+    init(from decoder: Decoder) throws {
+        var container = try decoder.unkeyedContainer()
+        var decoded: [VaultItem] = []
+        while !container.isAtEnd {
+            if let item = try? container.decode(VaultItem.self) {
+                decoded.append(item)
+            } else {
+                _ = try? container.decode(SkipElement.self)
+            }
+        }
+        self.items = decoded
+    }
+}
+
 struct AnalyzedMediaPayload: Sendable {
     let mediaType: VaultMediaType
     let width: Int
@@ -51,12 +74,16 @@ struct AnalyzedMediaPayload: Sendable {
     let isTransparentCutout: Bool
     let thumbFileName: String?
     let colorBucket: String?
+    let hasEmbeddedAudio: Bool
 }
 
 @MainActor
 final class LocalVaultStore: ObservableObject {
     @Published var items: [VaultItem] = [] {
-        didSet { recomputeFilteredItems() }
+        didSet {
+            rebuildRemoteIDSet()
+            recomputeFilteredItems()
+        }
     }
     @Published var categoryFilter: VaultCategoryFilter {
         didSet {
@@ -92,8 +119,12 @@ final class LocalVaultStore: ObservableObject {
         didSet { recomputeFilteredItems() }
     }
     @Published private(set) var cachedFilteredItems: [VaultItem] = []
+    @Published private(set) var cachedWaterfallColumns: [[VaultItem]] = []
     @Published var columnsCount: Int {
-        didSet { UserDefaults.standard.set(columnsCount, forKey: "wp_columns_count") }
+        didSet {
+            UserDefaults.standard.set(columnsCount, forKey: "wp_columns_count")
+            recomputeWaterfallColumns()
+        }
     }
     @Published var toast: ToastBannerState? = nil
     @Published var thumbRevision: Int = 0
@@ -115,7 +146,10 @@ final class LocalVaultStore: ObservableObject {
         }
     }
     @Published var showCardCaptions: Bool {
-        didSet { UserDefaults.standard.set(showCardCaptions, forKey: "wp_show_card_captions") }
+        didSet {
+            UserDefaults.standard.set(showCardCaptions, forKey: "wp_show_card_captions")
+            recomputeWaterfallColumns()
+        }
     }
     @Published var cardAspectModeRaw: String {
         didSet {
@@ -140,7 +174,7 @@ final class LocalVaultStore: ObservableObject {
     var onAliasChanged: ((String) -> Void)? = nil
     var onItemsDeleted: ((Set<String>) -> Void)? = nil
 
-    static let maxDisconnectedBadgeWeight = 70 // 10 ASCII chars (7 each) or 7 non-ASCII/Chinese chars (10 each)
+    nonisolated static let maxDisconnectedBadgeWeight = 70 // 10 ASCII chars (7 each) or 7 non-ASCII/Chinese chars (10 each)
 
     nonisolated static func disconnectedBadgeWeight(_ raw: String) -> (weight: Int, maxWeight: Int) {
         let cleaned = raw.replacingOccurrences(of: "\r", with: "")
@@ -182,9 +216,14 @@ final class LocalVaultStore: ObservableObject {
     let audioDir: URL
     let studioDir: URL
     let catalogURL: URL
+    let catalogBackupURL: URL
 
     private var toastDismissTask: Task<Void, Never>? = nil
     private var debouncedSaveTask: Task<Void, Never>? = nil
+    private var remoteIDSet: Set<String> = []
+    private var legacyCatalogSignatures: Set<String> = []
+    private var catalogLoadFailed: Bool = false
+    private let catalogSaveQueue = DispatchQueue(label: "com.wallpull.ipad.catalog.save", qos: .utility)
 
     var appearanceMode: AppearanceMode {
         get { AppearanceMode(rawValue: appearanceModeRaw) ?? .system }
@@ -253,6 +292,7 @@ final class LocalVaultStore: ObservableObject {
         audioDir = vaultDir.appendingPathComponent("audio", isDirectory: true)
         studioDir = vaultDir.appendingPathComponent("studio", isDirectory: true)
         catalogURL = vaultDir.appendingPathComponent("catalog.json")
+        catalogBackupURL = vaultDir.appendingPathComponent("catalog.bak")
         try? FileManager.default.createDirectory(at: mediaDir, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(at: thumbsDir, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(at: previewsDir, withIntermediateDirectories: true)
@@ -262,6 +302,7 @@ final class LocalVaultStore: ObservableObject {
         recomputeFilteredItems()
         migrateRetinaThumbnailsIfNeeded()
         upgradeLegacyAndMissingVideoPreviewsIfNeeded()
+        probeMissingVideoAudioStreamsIfNeeded()
     }
 
     func mediaURL(for item: VaultItem) -> URL {
@@ -280,11 +321,8 @@ final class LocalVaultStore: ObservableObject {
     }
 
     func galleryPreviewVideoURL(for item: VaultItem) -> URL {
-        if let pName = item.previewVideoFileName {
-            let url = previewsDir.appendingPathComponent(pName)
-            if FileManager.default.fileExists(atPath: url.path) {
-                return url
-            }
+        if let pName = item.previewVideoFileName, !pName.isEmpty {
+            return previewsDir.appendingPathComponent(pName)
         }
         return mediaURL(for: item)
     }
@@ -304,6 +342,7 @@ final class LocalVaultStore: ObservableObject {
     }
 
     func saveOfflineStudioBundle(_ bundle: OfflineStudioBundle, groupImages: [String: Data], for itemId: String) {
+        guard items.contains(where: { $0.id == itemId }) else { return }
         let dir = studioItemDir(for: itemId)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         for (fileName, pngData) in groupImages {
@@ -397,33 +436,37 @@ final class LocalVaultStore: ObservableObject {
             }
         }
 
-        guard cardAspectMode == .adaptive else {
-            cachedFilteredItems = ordered
+        cachedFilteredItems = ordered
+        if cardAspectMode == .adaptive {
+            recomputeWaterfallColumns()
+        } else {
+            cachedWaterfallColumns = []
+        }
+    }
+
+    private func recomputeWaterfallColumns() {
+        let cols = max(2, min(6, columnsCount))
+        guard cardAspectMode == .adaptive, !cachedFilteredItems.isEmpty else {
+            cachedWaterfallColumns = []
             return
         }
-        // Cluster items by 7 exact aspect ratio buckets so cards in each row share matching height
-        func aspectBucket(_ ratio: CGFloat) -> Int {
-            if ratio >= 2.05 { return 0 }      // Ultrawide 21:9+
-            if ratio >= 1.70 { return 1 }      // 16:9 widescreen
-            if ratio >= 1.45 { return 2 }      // 16:10 / 3:2
-            if ratio >= 1.18 { return 3 }      // 4:3
-            if ratio >= 0.90 { return 4 }      // 1:1 square
-            if ratio >= 0.68 { return 5 }      // 3:4 portrait
-            return 6                           // 9:16 tall portrait
-        }
-        var buckets = [[VaultItem]](repeating: [], count: 7)
-        for item in ordered {
-            buckets[aspectBucket(item.aspectRatio)].append(item)
-        }
-        let rankedBuckets = buckets.enumerated()
-            .filter { !$0.element.isEmpty }
-            .sorted { lhs, rhs in
-                if lhs.element.count != rhs.element.count {
-                    return lhs.element.count > rhs.element.count
-                }
-                return lhs.offset < rhs.offset
+        var result = Array(repeating: [VaultItem](), count: cols)
+        var heights = Array(repeating: CGFloat(0), count: cols)
+        let captionH: CGFloat = showCardCaptions ? 0.17 : 0.0
+        let normalizedGap: CGFloat = 0.06
+        for item in cachedFilteredItems {
+            let ratio = max(0.56, min(2.40, item.aspectRatio))
+            let cardH = (1.0 / ratio) + captionH + normalizedGap
+            var bestCol = 0
+            var minH = heights[0]
+            for c in 1..<cols where heights[c] < minH {
+                minH = heights[c]
+                bestCol = c
             }
-        cachedFilteredItems = rankedBuckets.flatMap(\.element)
+            result[bestCol].append(item)
+            heights[bestCol] += cardH
+        }
+        cachedWaterfallColumns = result
     }
 
     func showToast(_ message: String, isError: Bool = false) {
@@ -440,37 +483,90 @@ final class LocalVaultStore: ObservableObject {
         }
     }
 
+    private func rebuildRemoteIDSet() {
+        var ids: Set<String> = []
+        var legacy: Set<String> = []
+        ids.reserveCapacity(items.count)
+        for item in items {
+            if let rid = item.remoteID, !rid.isEmpty {
+                ids.insert(rid)
+            } else {
+                legacy.insert("\(item.title)|\(item.mediaType.rawValue)|\(item.fileSize)")
+            }
+        }
+        remoteIDSet = ids
+        legacyCatalogSignatures = legacy
+    }
+
     func loadCatalog() {
-        guard let data = try? Data(contentsOf: catalogURL),
-              let decoded = try? JSONDecoder().decode([VaultItem].self, from: data) else {
-            items = []
+        catalogLoadFailed = false
+        let rawData = try? Data(contentsOf: catalogURL)
+        let decodedPrimary: [VaultItem]? = rawData.flatMap {
+            try? JSONDecoder().decode(LossyVaultItemList.self, from: $0).items
+        }
+        if let decodedPrimary, (!decodedPrimary.isEmpty || (rawData?.count ?? 0) <= 2) {
+            items = decodedPrimary.filter { FileManager.default.fileExists(atPath: mediaURL(for: $0).path) }
             return
         }
-        items = decoded.filter { FileManager.default.fileExists(atPath: mediaURL(for: $0).path) }
+
+        if let rawData, rawData.count > 2 {
+            let ts = Int(Date().timeIntervalSince1970)
+            let corruptURL = vaultDir.appendingPathComponent("catalog.corrupt.\(ts).json")
+            try? rawData.write(to: corruptURL, options: [.atomic])
+        }
+
+        if let bakData = try? Data(contentsOf: catalogBackupURL),
+           let decodedBak = try? JSONDecoder().decode(LossyVaultItemList.self, from: bakData).items,
+           !decodedBak.isEmpty {
+            items = decodedBak.filter { FileManager.default.fileExists(atPath: mediaURL(for: $0).path) }
+            showToast("目录索引已从备份自动恢复")
+            return
+        }
+
+        if let rawData, rawData.count > 2 {
+            catalogLoadFailed = true
+        }
+        items = []
     }
 
     func saveCatalog() {
-        let enc = JSONEncoder()
-        enc.outputFormatting = [.prettyPrinted]
-        if let data = try? enc.encode(items) {
-            try? data.write(to: catalogURL, options: [.atomic])
+        if catalogLoadFailed && items.isEmpty {
+            return
+        }
+        if !items.isEmpty {
+            catalogLoadFailed = false
+        }
+        let snapshot = items
+        let targetURL = catalogURL
+        let backupURL = catalogBackupURL
+        catalogSaveQueue.async {
+            let enc = JSONEncoder()
+            if let data = try? enc.encode(snapshot) {
+                if FileManager.default.fileExists(atPath: targetURL.path),
+                   let curSize = (try? FileManager.default.attributesOfItem(atPath: targetURL.path)[.size] as? NSNumber)?.int64Value,
+                   curSize > 2 {
+                    let tmpBak = backupURL.appendingPathExtension("tmp")
+                    try? FileManager.default.removeItem(at: tmpBak)
+                    if (try? FileManager.default.copyItem(at: targetURL, to: tmpBak)) != nil {
+                        try? FileManager.default.removeItem(at: backupURL)
+                        try? FileManager.default.moveItem(at: tmpBak, to: backupURL)
+                    }
+                }
+                try? data.write(to: targetURL, options: [.atomic])
+            }
         }
     }
 
     func hasImportedCatalogItem(_ pcItem: PCCatalogItem) -> Bool {
-        if items.contains(where: { $0.remoteID == pcItem.id }) {
+        if remoteIDSet.contains(pcItem.id) {
             return true
         }
-        return items.contains {
-            ($0.remoteID == nil || $0.remoteID?.isEmpty == true)
-                && $0.title == pcItem.title
-                && $0.mediaType.rawValue == pcItem.mediaType
-                && $0.fileSize == pcItem.fileSize
-        }
+        return legacyCatalogSignatures.contains("\(pcItem.title)|\(pcItem.mediaType)|\(pcItem.fileSize)")
     }
 
-    func findDuplicate(sha256: String?, remoteID: String?) -> VaultItem? {
-        if let rid = remoteID,
+    func findDuplicate(sha256: String?, remoteID: String?, isCutoutHint: Bool = false) -> VaultItem? {
+        if !isCutoutHint,
+           let rid = remoteID,
            let existing = items.first(where: { $0.remoteID == rid }),
            FileManager.default.fileExists(atPath: mediaURL(for: existing).path) {
             return existing
@@ -503,9 +599,11 @@ final class LocalVaultStore: ObservableObject {
         newlyLandedIDs.remove(id)
     }
 
-    func insertStreamedItem(_ item: VaultItem) {
+    @discardableResult
+    func insertStreamedItem(_ item: VaultItem) -> Bool {
         if findDuplicate(sha256: item.sha256, remoteID: item.remoteID) != nil {
-            return
+            cleanupOrphanFiles(for: item)
+            return false
         }
         newlyLandedIDs.insert(item.id)
         items.insert(item, at: 0)
@@ -515,6 +613,24 @@ final class LocalVaultStore: ObservableObject {
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             self?.newlyLandedIDs.remove(iid)
         }
+        return true
+    }
+
+    private func cleanupOrphanFiles(for item: VaultItem) {
+        try? FileManager.default.removeItem(at: mediaURL(for: item))
+        for extra in item.additionalFiles ?? [] {
+            try? FileManager.default.removeItem(at: mediaDir.appendingPathComponent(extra))
+        }
+        if let t = thumbURL(for: item) {
+            try? FileManager.default.removeItem(at: t)
+        }
+        if let pv = item.previewVideoFileName {
+            try? FileManager.default.removeItem(at: previewsDir.appendingPathComponent(pv))
+        }
+        for track in item.audioTracks ?? [] {
+            try? FileManager.default.removeItem(at: audioURL(for: track))
+        }
+        try? FileManager.default.removeItem(at: studioItemDir(for: item.id))
     }
 
     func commitBatch(_ newItems: [VaultItem]) {
@@ -538,6 +654,86 @@ final class LocalVaultStore: ObservableObject {
         saveCatalogDebounced()
     }
 
+    nonisolated static func friendlyImportTitle(
+        rawSuggestedName: String,
+        mediaType: VaultMediaType,
+        sourceDevice: String,
+        batchIndex: Int? = nil,
+        batchTotal: Int = 1,
+        now: Date = Date()
+    ) -> String {
+        let stem = URL(fileURLWithPath: rawSuggestedName)
+            .deletingPathExtension()
+            .lastPathComponent
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = stem.lowercased()
+        let isOpaqueName: Bool = {
+            if stem.isEmpty { return true }
+            if stem.allSatisfy(\.isNumber) { return true }
+            let opaquePrefixes = [
+                "img_", "img-", "dsc", "pxl_", "mvimg_", "dji_",
+                "fullsizerender", "renderedimage", "rpreplay", "trim.",
+                "wp_pick_", "mmexport", "wx_camera_", "cimg", "photo_",
+            ]
+            if opaquePrefixes.contains(where: { lower.hasPrefix($0) }) { return true }
+            if stem.range(of: #"^[0-9a-fA-F-]{16,}$"#, options: .regularExpression) != nil {
+                return true
+            }
+            return false
+        }()
+        if !isOpaqueName {
+            return stem
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "MM-dd HH:mm"
+        let stamp = formatter.string(from: now)
+        let prefix: String
+        if sourceDevice == "系统相册" {
+            prefix = (mediaType == .video) ? "相册视频" : "相册壁纸"
+        } else {
+            prefix = (mediaType == .video) ? "导入视频" : "导入壁纸"
+        }
+        if batchTotal > 1 {
+            return String(format: "%@ · %@ %02d", prefix, stamp, (batchIndex ?? 0) + 1)
+        }
+        return "\(prefix) · \(stamp)"
+    }
+
+    func probeMissingVideoAudioStreamsIfNeeded() {
+        let pending = items.compactMap { item -> (String, URL)? in
+            guard item.mediaType == .video, item.hasEmbeddedAudio == nil else { return nil }
+            let url = mediaURL(for: item)
+            guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+            return (item.id, url)
+        }
+        guard !pending.isEmpty else { return }
+        Task.detached(priority: .utility) { [weak self] in
+            var probed: [String: Bool] = [:]
+            probed.reserveCapacity(pending.count)
+            for (id, url) in pending {
+                let asset = AVURLAsset(url: url)
+                let hasAudio = !asset.tracks(withMediaType: .audio).isEmpty
+                probed[id] = hasAudio
+            }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                var updated = self.items
+                var changed = false
+                for idx in updated.indices {
+                    if let flag = probed[updated[idx].id], updated[idx].hasEmbeddedAudio != flag {
+                        updated[idx].hasEmbeddedAudio = flag
+                        changed = true
+                    }
+                }
+                if changed {
+                    self.items = updated
+                    self.saveCatalogDebounced()
+                }
+            }
+        }
+    }
+
     func importFile(
         from tempURL: URL,
         suggestedFileName: String,
@@ -550,9 +746,11 @@ final class LocalVaultStore: ObservableObject {
         contentRating: String? = nil,
         previewVideoFileName: String? = nil,
         additionalFiles: [String]? = nil,
-        audioTracks: [VaultAudioTrack]? = nil
+        audioTracks: [VaultAudioTrack]? = nil,
+        batchIndex: Int? = nil,
+        batchTotal: Int = 1
     ) async -> VaultItem? {
-        if let existing = findDuplicate(sha256: sha256, remoteID: remoteID) {
+        if let existing = findDuplicate(sha256: sha256, remoteID: remoteID, isCutoutHint: isCutoutHint) {
             if hasSceneLayers && existing.hasSceneLayers != true {
                 updateItemMetadata(id: existing.id) { $0.hasSceneLayers = true }
                 flushCatalogSaveNow()
@@ -582,7 +780,13 @@ final class LocalVaultStore: ObservableObject {
         guard let analyzed else { return nil }
 
         let cleanTitle = (titleOverride?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
-            ?? URL(fileURLWithPath: suggestedFileName).deletingPathExtension().lastPathComponent
+            ?? Self.friendlyImportTitle(
+                rawSuggestedName: suggestedFileName,
+                mediaType: analyzed.mediaType,
+                sourceDevice: sourceDevice,
+                batchIndex: batchIndex,
+                batchTotal: batchTotal
+            )
         let item = VaultItem(
             id: id,
             title: cleanTitle,
@@ -606,6 +810,7 @@ final class LocalVaultStore: ObservableObject {
             additionalFiles: additionalFiles,
             hasSceneLayers: hasSceneLayers,
             hasOfflineStudioBundle: false,
+            hasEmbeddedAudio: analyzed.mediaType == .video ? analyzed.hasEmbeddedAudio : nil,
             visualFingerprint: nil
         )
         insertStreamedItem(item)
@@ -651,6 +856,7 @@ final class LocalVaultStore: ObservableObject {
         if isVideo {
             let asset = AVURLAsset(url: destURL)
             let durationSec = CMTimeGetSeconds(asset.duration)
+            let hasEmbeddedAudio = !asset.tracks(withMediaType: .audio).isEmpty
             var w = 0
             var h = 0
             if let track = asset.tracks(withMediaType: .video).first {
@@ -662,10 +868,17 @@ final class LocalVaultStore: ObservableObject {
             var bucket: String? = nil
             let gen = AVAssetImageGenerator(asset: asset)
             gen.appliesPreferredTrackTransform = true
-            gen.requestedTimeToleranceBefore = .zero
-            gen.requestedTimeToleranceAfter = .zero
-            gen.maximumSize = CGSize(width: 2048, height: 2048)
-            if let cg = try? gen.copyCGImage(at: CMTime(seconds: min(0.5, max(0, durationSec * 0.25)), preferredTimescale: 600), actualTime: nil) {
+            gen.requestedTimeToleranceBefore = CMTime(seconds: 0.5, preferredTimescale: 600)
+            gen.requestedTimeToleranceAfter = CMTime(seconds: 0.5, preferredTimescale: 600)
+            gen.maximumSize = CGSize(width: 1600, height: 1600)
+            let thumbTime = CMTime(seconds: min(0.5, max(0, durationSec * 0.25)), preferredTimescale: 600)
+            var cgImage = try? gen.copyCGImage(at: thumbTime, actualTime: nil)
+            if cgImage == nil {
+                gen.requestedTimeToleranceBefore = .zero
+                gen.requestedTimeToleranceAfter = .zero
+                cgImage = try? gen.copyCGImage(at: .zero, actualTime: nil)
+            }
+            if let cg = cgImage {
                 bucket = classifyColorBucket(cgImage: cg)
                 let ui = UIImage(cgImage: cg)
                 if let jpg = ui.jpegData(compressionQuality: 0.95) {
@@ -682,7 +895,8 @@ final class LocalVaultStore: ObservableObject {
                 fileSize: size,
                 isTransparentCutout: false,
                 thumbFileName: thumbName,
-                colorBucket: bucket
+                colorBucket: bucket,
+                hasEmbeddedAudio: hasEmbeddedAudio
             )
         } else {
             var w = 0
@@ -726,7 +940,8 @@ final class LocalVaultStore: ObservableObject {
                 fileSize: size,
                 isTransparentCutout: hasAlpha,
                 thumbFileName: thumbName,
-                colorBucket: bucket
+                colorBucket: bucket,
+                hasEmbeddedAudio: false
             )
         }
     }
@@ -802,25 +1017,26 @@ final class LocalVaultStore: ObservableObject {
         return nil
     }
 
-    private func migrateRetinaThumbnailsIfNeeded() {
+    private func migrateRetinaThumbnailsIfNeeded(announceCompletion: Bool = false) {
         let schemaVer = UserDefaults.standard.integer(forKey: "wp_thumb_schema")
         guard schemaVer < 3 else { return }
         if items.isEmpty {
             UserDefaults.standard.set(3, forKey: "wp_thumb_schema")
+            if announceCompletion {
+                showToast("当前离线库暂无需要重建缩略图的壁纸")
+            }
             return
         }
         let snapshot = items
         let mDir = mediaDir
         let tDir = thumbsDir
-        let pDir = previewsDir
         Task.detached(priority: .utility) { [weak self] in
-            var updatedMap: [String: (String?, String?, String?)] = [:]
+            var updatedMap: [String: (String?, String?)] = [:]
             for item in snapshot {
                 let srcURL = mDir.appendingPathComponent(item.fileName)
                 guard FileManager.default.fileExists(atPath: srcURL.path) else { continue }
                 var thumbOut: String? = nil
                 var bucketOut: String? = nil
-                var prevOut: String? = nil
 
                 if item.mediaType == .video {
                     let asset = AVURLAsset(url: srcURL)
@@ -836,9 +1052,6 @@ final class LocalVaultStore: ObservableObject {
                         try? jpg.write(to: tDir.appendingPathComponent(name), options: [.atomic])
                         thumbOut = name
                         bucketOut = item.colorBucket ?? Self.classifyColorBucket(cgImage: cg)
-                    }
-                    if item.previewVideoFileName == nil {
-                        prevOut = await Self.generateLightweightVideoPreview(srcURL: srcURL, id: item.id, previewsDir: pDir)
                     }
                 } else if let src = CGImageSourceCreateWithURL(srcURL as CFURL, nil) {
                     let opts: [CFString: Any] = [
@@ -860,8 +1073,8 @@ final class LocalVaultStore: ObservableObject {
                         }
                     }
                 }
-                if thumbOut != nil || bucketOut != nil || prevOut != nil {
-                    updatedMap[item.id] = (thumbOut, bucketOut, prevOut)
+                if thumbOut != nil || bucketOut != nil {
+                    updatedMap[item.id] = (thumbOut, bucketOut)
                 }
             }
             let finalUpdatedMap = updatedMap
@@ -873,12 +1086,15 @@ final class LocalVaultStore: ObservableObject {
                     if let upd = finalUpdatedMap[iid] {
                         if let t = upd.0 { self.items[idx].thumbFileName = t }
                         if let b = upd.1 { self.items[idx].colorBucket = b }
-                        if let pv = upd.2 { self.items[idx].previewVideoFileName = pv }
                     }
                 }
                 self.saveCatalog()
                 self.thumbRevision += 1
                 UserDefaults.standard.set(3, forKey: "wp_thumb_schema")
+                if announceCompletion {
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                    self.showToast("已完成 \(finalUpdatedMap.count) 项高清缩略图重建")
+                }
             }
         }
     }
@@ -923,7 +1139,14 @@ final class LocalVaultStore: ObservableObject {
                             let transformed = track.naturalSize.applying(track.preferredTransform)
                             let pw = abs(transformed.width)
                             let ph = abs(transformed.height)
-                            let lowRes = max(item.width, item.height) >= 1200 && max(pw, ph) < 900
+                            let lowRes: Bool
+                            if item.width > 0 && item.height > 0 {
+                                let scale = min(1280.0 / Double(item.width), 720.0 / Double(item.height))
+                                let expLong = scale < 1.0 ? Double(max(item.width, item.height)) * scale : Double(max(item.width, item.height))
+                                lowRes = max(pw, ph) < CGFloat(expLong * 0.78)
+                            } else {
+                                lowRes = false
+                            }
                             let badRatio = (item.width > 0 && item.height > 0 && pw > 1 && ph > 1)
                                 ? abs((pw / ph) - item.aspectRatio) > 0.16
                                 : false
@@ -1078,7 +1301,12 @@ final class LocalVaultStore: ObservableObject {
         showToast("已收到「\(senderAlias)」推送的图片至剪贴板 · 切去微信直接粘贴")
     }
 
-    func importCutoutImage(_ image: UIImage, title: String, isTransparent: Bool) async -> VaultItem? {
+    func importCutoutImage(
+        _ image: UIImage,
+        title: String,
+        isTransparent: Bool,
+        contentRating: String? = nil
+    ) async -> VaultItem? {
         guard let png = image.pngData() else { return nil }
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("wp_studio_\(UUID().uuidString).png")
         defer { try? FileManager.default.removeItem(at: tmp) }
@@ -1088,7 +1316,8 @@ final class LocalVaultStore: ObservableObject {
             suggestedFileName: "\(title).png",
             titleOverride: title,
             sourceDevice: "透视拆解台",
-            isCutoutHint: isTransparent
+            isCutoutHint: isTransparent,
+            contentRating: contentRating
         )
         if created != nil {
             UINotificationFeedbackGenerator().notificationOccurred(.success)
@@ -1107,22 +1336,25 @@ final class LocalVaultStore: ObservableObject {
         var saved = 0
         var lastError: String? = nil
         for item in targets {
-            let fileURL = mediaURL(for: item)
-            guard FileManager.default.fileExists(atPath: fileURL.path) else { continue }
-            do {
-                try await PHPhotoLibrary.shared().performChanges {
-                    let req = PHAssetCreationRequest.forAsset()
-                    let resType: PHAssetResourceType = (item.mediaType == .video) ? .video : .photo
-                    req.addResource(with: resType, fileURL: fileURL, options: nil)
+            let totalVariants = max(1, item.allMediaFileNames.count)
+            for vIdx in 0..<totalVariants {
+                let fileURL = mediaURL(for: item, variantIndex: vIdx)
+                guard FileManager.default.fileExists(atPath: fileURL.path) else { continue }
+                do {
+                    try await PHPhotoLibrary.shared().performChanges {
+                        let req = PHAssetCreationRequest.forAsset()
+                        let resType: PHAssetResourceType = (item.mediaType == .video) ? .video : .photo
+                        req.addResource(with: resType, fileURL: fileURL, options: nil)
+                    }
+                    saved += 1
+                } catch {
+                    lastError = error.localizedDescription
                 }
-                saved += 1
-            } catch {
-                lastError = error.localizedDescription
             }
         }
         if saved > 0 {
             UINotificationFeedbackGenerator().notificationOccurred(.success)
-            showToast(saved == 1 ? "已无损存入系统相册" : "已无损存入 \(saved) 项到系统相册")
+            showToast(saved == 1 ? "已无损存入系统相册" : "已无损存入 \(saved) 份原文件到系统相册")
         } else {
             showToast("存入相册失败：\(lastError ?? "未知错误")", isError: true)
         }
@@ -1152,10 +1384,7 @@ final class LocalVaultStore: ObservableObject {
 
     func clearThumbCache() {
         RetinaThumbnailCache.shared.removeAll()
-        let files = (try? FileManager.default.contentsOfDirectory(at: thumbsDir, includingPropertiesForKeys: nil)) ?? []
-        for f in files {
-            try? FileManager.default.removeItem(at: f)
-        }
+        PCThumbnailCache.shared.clearAll()
         let prevFiles = (try? FileManager.default.contentsOfDirectory(at: previewsDir, includingPropertiesForKeys: nil)) ?? []
         for f in prevFiles {
             try? FileManager.default.removeItem(at: f)
@@ -1166,9 +1395,9 @@ final class LocalVaultStore: ObservableObject {
         saveCatalog()
         UserDefaults.standard.set(0, forKey: "wp_thumb_schema")
         UserDefaults.standard.set(0, forKey: "wp_preview_video_schema")
-        migrateRetinaThumbnailsIfNeeded()
+        showToast("正在后台重新生成高清 Retina 缩略图与视频轻量预览流…")
+        migrateRetinaThumbnailsIfNeeded(announceCompletion: true)
         upgradeLegacyAndMissingVideoPreviewsIfNeeded()
-        showToast("已重建高清 Retina 缩略图与视频轻量预览流")
     }
 
     // MARK: - Duplicate Scanner (1:1 port of src/duplicates.rs)
@@ -1177,157 +1406,8 @@ final class LocalVaultStore: ObservableObject {
         let mDir = mediaDir
         let tDir = thumbsDir
 
-        let (computedFPs, report) = await Task.detached(priority: .userInitiated) { () -> ([String: CachedVisualFingerprint], DuplicateScanReport) in
-            var newFPs: [String: CachedVisualFingerprint] = [:]
-            var entries: [(item: VaultItem, fp: CachedVisualFingerprint)] = []
-            for item in snapshot {
-                if let existing = item.visualFingerprint {
-                    entries.append((item, existing))
-                    continue
-                }
-                let thumbPath = item.thumbFileName.map { tDir.appendingPathComponent($0) }
-                let mediaPath = mDir.appendingPathComponent(item.fileName)
-                let probeImgURL: URL?
-                if let tp = thumbPath, FileManager.default.fileExists(atPath: tp.path) {
-                    probeImgURL = tp
-                } else if item.mediaType == .image, FileManager.default.fileExists(atPath: mediaPath.path) {
-                    probeImgURL = mediaPath
-                } else {
-                    probeImgURL = nil
-                }
-                guard let imgURL = probeImgURL,
-                      let fp = Self.computeVisualFingerprint(imageURL: imgURL, sourceURL: mediaPath) else {
-                    continue
-                }
-                newFPs[item.id] = fp
-                entries.append((item, fp))
-            }
-
-            let n = entries.count
-            guard n >= 2 else {
-                return (newFPs, DuplicateScanReport(groups: [], scannedCount: n, totalRedundantCount: 0, totalReclaimableBytes: 0))
-            }
-
-            var parent = Array(0..<n)
-            func find(_ x: Int) -> Int {
-                var cur = x
-                while parent[cur] != cur {
-                    parent[cur] = parent[parent[cur]]
-                    cur = parent[cur]
-                }
-                return cur
-            }
-            func unite(_ a: Int, _ b: Int) {
-                let ra = find(a)
-                let rb = find(b)
-                if ra != rb { parent[rb] = ra }
-            }
-
-            for i in 0..<n {
-                for j in (i + 1)..<n {
-                    let a = entries[i]
-                    let b = entries[j]
-                    if a.item.fileSize > 0 && a.item.fileSize == b.item.fileSize,
-                       let da = a.fp.prefixDigest, let db = b.fp.prefixDigest, !da.isEmpty, da == db {
-                        unite(i, j)
-                        continue
-                    }
-                    guard a.fp.lumaRange >= 14 && b.fp.lumaRange >= 14 else { continue }
-                    let dDist = (a.fp.dHash ^ b.fp.dHash).nonzeroBitCount
-                    if dDist > 8 { continue }
-                    let aDist = (a.fp.aHash ^ b.fp.aHash).nonzeroBitCount
-                    if aDist > 10 { continue }
-                    let dr = a.fp.meanR - b.fp.meanR
-                    let dg = a.fp.meanG - b.fp.meanG
-                    let db = a.fp.meanB - b.fp.meanB
-                    let rgbDist = sqrt(dr * dr + dg * dg + db * db)
-                    if rgbDist < 42.0 {
-                        unite(i, j)
-                    }
-                }
-            }
-
-            var clusters: [Int: [Int]] = [:]
-            for idx in 0..<n {
-                clusters[find(idx), default: []].append(idx)
-            }
-
-            var groups: [DuplicateGroup] = []
-            var totalRedundant = 0
-            var totalReclaimable: Int64 = 0
-
-            for (_, memberIndices) in clusters where memberIndices.count > 1 {
-                let sortedIndices = memberIndices.sorted { ia, ib in
-                    let a = entries[ia].item
-                    let b = entries[ib].item
-                    if a.pixelCount != b.pixelCount { return a.pixelCount > b.pixelCount }
-                    if a.hasMusic != b.hasMusic { return a.hasMusic }
-                    if a.fileSize != b.fileSize { return a.fileSize > b.fileSize }
-                    return a.addedAt < b.addedAt
-                }
-
-                let anchor = entries[sortedIndices[0]]
-                var candidates: [DuplicateCandidateItem] = []
-                var groupReclaim: Int64 = 0
-
-                for (pos, idx) in sortedIndices.enumerated() {
-                    let cand = entries[idx]
-                    if pos == 0 {
-                        candidates.append(DuplicateCandidateItem(
-                            item: cand.item,
-                            isRecommendedKeep: true,
-                            similarityPercent: 100,
-                            reason: "最高规格 · 推荐保留"
-                        ))
-                        continue
-                    }
-                    let exact = anchor.item.fileSize > 0
-                        && anchor.item.fileSize == cand.item.fileSize
-                        && anchor.fp.prefixDigest != nil
-                        && anchor.fp.prefixDigest == cand.fp.prefixDigest
-
-                    let sim: Int
-                    let reason: String
-                    if exact {
-                        sim = 100
-                        reason = "100% 完全一致（重复文件）"
-                    } else {
-                        let dDist = Double((anchor.fp.dHash ^ cand.fp.dHash).nonzeroBitCount)
-                        let aDist = Double((anchor.fp.aHash ^ cand.fp.aHash).nonzeroBitCount)
-                        let rawSim = Int((1.0 - (dDist * 0.65 + aDist * 0.35) / 64.0) * 100.0)
-                        sim = min(99, max(75, rawSim))
-                        if cand.item.pixelCount > 0 && anchor.item.pixelCount > cand.item.pixelCount {
-                            reason = "疑似低清晰度版本（\(sim)% 相似）"
-                        } else if anchor.item.mediaType != cand.item.mediaType {
-                            reason = "动/静双版本近似（\(sim)% 相似）"
-                        } else {
-                            reason = "画面高度相似（\(sim)%）"
-                        }
-                    }
-                    groupReclaim += max(0, cand.item.fileSize)
-                    totalRedundant += 1
-                    candidates.append(DuplicateCandidateItem(
-                        item: cand.item,
-                        isRecommendedKeep: false,
-                        similarityPercent: sim,
-                        reason: reason
-                    ))
-                }
-                totalReclaimable += groupReclaim
-                groups.append(DuplicateGroup(
-                    id: anchor.item.id,
-                    items: candidates,
-                    reclaimableBytes: groupReclaim
-                ))
-            }
-
-            groups.sort { $0.reclaimableBytes > $1.reclaimableBytes }
-            return (newFPs, DuplicateScanReport(
-                groups: groups,
-                scannedCount: n,
-                totalRedundantCount: totalRedundant,
-                totalReclaimableBytes: totalReclaimable
-            ))
+        let (computedFPs, report) = await Task.detached(priority: .userInitiated) {
+            Self.performDuplicateScan(snapshot: snapshot, mediaDir: mDir, thumbsDir: tDir)
         }.value
 
         if !computedFPs.isEmpty {
@@ -1339,6 +1419,158 @@ final class LocalVaultStore: ObservableObject {
             saveCatalogDebounced()
         }
         return report
+    }
+
+    nonisolated static func streamedFullSHA256(_ url: URL) -> String? {
+        guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? fh.close() }
+        var hasher = SHA256()
+        while true {
+            let chunk = fh.readData(ofLength: 65536)
+            if chunk.isEmpty { break }
+            hasher.update(data: chunk)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    nonisolated private static func performDuplicateScan(
+        snapshot: [VaultItem],
+        mediaDir mDir: URL,
+        thumbsDir tDir: URL
+    ) -> ([String: CachedVisualFingerprint], DuplicateScanReport) {
+        var newFPs: [String: CachedVisualFingerprint] = [:]
+        var entries: [(item: VaultItem, fp: CachedVisualFingerprint)] = []
+        for item in snapshot {
+            if let existing = item.visualFingerprint {
+                entries.append((item, existing))
+                continue
+            }
+            let thumbPath = item.thumbFileName.map { tDir.appendingPathComponent($0) }
+            let mediaPath = mDir.appendingPathComponent(item.fileName)
+            let probeImgURL: URL?
+            if let tp = thumbPath, FileManager.default.fileExists(atPath: tp.path) {
+                probeImgURL = tp
+            } else if item.mediaType == .image, FileManager.default.fileExists(atPath: mediaPath.path) {
+                probeImgURL = mediaPath
+            } else {
+                probeImgURL = nil
+            }
+            guard let imgURL = probeImgURL,
+                  let fp = computeVisualFingerprint(imageURL: imgURL, sourceURL: mediaPath) else {
+                continue
+            }
+            newFPs[item.id] = fp
+            entries.append((item, fp))
+        }
+
+        let n = entries.count
+        guard n >= 2 else {
+            return (newFPs, DuplicateScanReport(groups: [], scannedCount: n, totalRedundantCount: 0, totalReclaimableBytes: 0))
+        }
+
+        let rankedIndices = entries.indices.sorted { ia, ib in
+            let a = entries[ia].item
+            let b = entries[ib].item
+            if a.pixelCount != b.pixelCount { return a.pixelCount > b.pixelCount }
+            if a.hasMusic != b.hasMusic { return a.hasMusic }
+            if a.fileSize != b.fileSize { return a.fileSize > b.fileSize }
+            return a.addedAt < b.addedAt
+        }
+
+        var shaCache: [String: String] = [:]
+        func fullSHA(for item: VaultItem) -> String? {
+            if let cached = shaCache[item.id] { return cached }
+            if let stored = item.sha256, !stored.isEmpty {
+                shaCache[item.id] = stored.lowercased()
+                return stored.lowercased()
+            }
+            if let digest = streamedFullSHA256(mDir.appendingPathComponent(item.fileName)) {
+                shaCache[item.id] = digest
+                return digest
+            }
+            return nil
+        }
+
+        var assigned = [Bool](repeating: false, count: n)
+        var groups: [DuplicateGroup] = []
+        var totalRedundant = 0
+        var totalReclaimable: Int64 = 0
+
+        for anchorIdx in rankedIndices where !assigned[anchorIdx] {
+            let anchor = entries[anchorIdx]
+            var matchedIndices: [(idx: Int, exact: Bool, sim: Int, reason: String)] = []
+
+            for candIdx in rankedIndices where candIdx != anchorIdx && !assigned[candIdx] {
+                let cand = entries[candIdx]
+                guard anchor.item.mediaType == cand.item.mediaType else { continue }
+
+                if anchor.item.fileSize > 0 && anchor.item.fileSize == cand.item.fileSize,
+                   let da = anchor.fp.prefixDigest, let db = cand.fp.prefixDigest, !da.isEmpty, da == db,
+                   let s1 = fullSHA(for: anchor.item), let s2 = fullSHA(for: cand.item), s1 == s2 {
+                    let exactSpecs = anchor.item.width == cand.item.width && anchor.item.height == cand.item.height
+                    matchedIndices.append((candIdx, exactSpecs, 100, "100% 完全一致（重复文件）"))
+                    continue
+                }
+
+                guard anchor.fp.lumaRange >= 14 && cand.fp.lumaRange >= 14 else { continue }
+                let dDist = (anchor.fp.dHash ^ cand.fp.dHash).nonzeroBitCount
+                if dDist > 8 { continue }
+                let aDist = (anchor.fp.aHash ^ cand.fp.aHash).nonzeroBitCount
+                if aDist > 10 { continue }
+                let dr = anchor.fp.meanR - cand.fp.meanR
+                let dg = anchor.fp.meanG - cand.fp.meanG
+                let db = anchor.fp.meanB - cand.fp.meanB
+                let rgbDist = sqrt(dr * dr + dg * dg + db * db)
+                guard rgbDist < 42.0 else { continue }
+
+                let rawSim = Int((1.0 - (Double(dDist) * 0.65 + Double(aDist) * 0.35) / 64.0) * 100.0)
+                let sim = min(99, max(50, rawSim))
+                let reason = (cand.item.pixelCount > 0 && anchor.item.pixelCount > cand.item.pixelCount)
+                    ? "疑似低清晰度版本（\(sim)% 相似）"
+                    : "画面高度相似（\(sim)%）"
+                matchedIndices.append((candIdx, false, sim, reason))
+            }
+
+            guard !matchedIndices.isEmpty else { continue }
+            assigned[anchorIdx] = true
+            var candidates: [DuplicateCandidateItem] = [
+                DuplicateCandidateItem(
+                    item: anchor.item,
+                    isRecommendedKeep: true,
+                    isExactMatch: false,
+                    similarityPercent: 100,
+                    reason: "最高规格 · 推荐保留"
+                ),
+            ]
+            var groupReclaim: Int64 = 0
+            for match in matchedIndices {
+                assigned[match.idx] = true
+                let candItem = entries[match.idx].item
+                groupReclaim += max(0, candItem.fileSize)
+                totalRedundant += 1
+                candidates.append(DuplicateCandidateItem(
+                    item: candItem,
+                    isRecommendedKeep: false,
+                    isExactMatch: match.exact,
+                    similarityPercent: match.sim,
+                    reason: match.reason
+                ))
+            }
+            totalReclaimable += groupReclaim
+            groups.append(DuplicateGroup(
+                id: anchor.item.id,
+                items: candidates,
+                reclaimableBytes: groupReclaim
+            ))
+        }
+
+        groups.sort { $0.reclaimableBytes > $1.reclaimableBytes }
+        return (newFPs, DuplicateScanReport(
+            groups: groups,
+            scannedCount: n,
+            totalRedundantCount: totalRedundant,
+            totalReclaimableBytes: totalReclaimable
+        ))
     }
 
     nonisolated private static func computeVisualFingerprint(imageURL: URL, sourceURL: URL) -> CachedVisualFingerprint? {
@@ -1353,17 +1585,22 @@ final class LocalVaultStore: ObservableObject {
         let w = 9
         let h = 8
         var raw = [UInt8](repeating: 0, count: w * h * 4)
-        guard let ctx = CGContext(
-            data: &raw,
-            width: w,
-            height: h,
-            bitsPerComponent: 8,
-            bytesPerRow: w * 4,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return nil }
-        ctx.interpolationQuality = .medium
-        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        let drew = raw.withUnsafeMutableBytes { buf -> Bool in
+            guard let base = buf.baseAddress,
+                  let ctx = CGContext(
+                    data: base,
+                    width: w,
+                    height: h,
+                    bitsPerComponent: 8,
+                    bytesPerRow: w * 4,
+                    space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                  ) else { return false }
+            ctx.interpolationQuality = .medium
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
+        }
+        guard drew else { return nil }
 
         var luma = [Float](repeating: 0, count: w * h)
         var sumR: Float = 0
@@ -1554,16 +1791,21 @@ final class LocalVaultStore: ObservableObject {
         let h = cg.height
         guard w > 4, h > 4 else { return nil }
         var pixels = [UInt8](repeating: 0, count: w * h * 4)
-        guard let ctx = CGContext(
-            data: &pixels,
-            width: w,
-            height: h,
-            bitsPerComponent: 8,
-            bytesPerRow: w * 4,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return nil }
-        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        let drew = pixels.withUnsafeMutableBytes { buf -> Bool in
+            guard let base = buf.baseAddress,
+                  let ctx = CGContext(
+                    data: base,
+                    width: w,
+                    height: h,
+                    bitsPerComponent: 8,
+                    bytesPerRow: w * 4,
+                    space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                  ) else { return false }
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
+        }
+        guard drew else { return nil }
         var minX = w
         var minY = h
         var maxX = -1
@@ -1596,16 +1838,21 @@ final class LocalVaultStore: ObservableObject {
         let w = 48
         let h = 48
         var pixels = [UInt8](repeating: 255, count: w * h * 4)
-        guard let ctx = CGContext(
-            data: &pixels,
-            width: w,
-            height: h,
-            bitsPerComponent: 8,
-            bytesPerRow: w * 4,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return false }
-        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
+        let drew = pixels.withUnsafeMutableBytes { buf -> Bool in
+            guard let base = buf.baseAddress,
+                  let ctx = CGContext(
+                    data: base,
+                    width: w,
+                    height: h,
+                    bitsPerComponent: 8,
+                    bytesPerRow: w * 4,
+                    space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                  ) else { return false }
+            ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
+        }
+        guard drew else { return false }
         var transparentCount = 0
         for i in stride(from: 3, to: pixels.count, by: 4) {
             if pixels[i] < 220 { transparentCount += 1 }
@@ -1617,23 +1864,31 @@ final class LocalVaultStore: ObservableObject {
         let w = 24
         let h = 24
         var pixels = [UInt8](repeating: 0, count: w * h * 4)
-        guard let ctx = CGContext(
-            data: &pixels,
-            width: w,
-            height: h,
-            bitsPerComponent: 8,
-            bytesPerRow: w * 4,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return "dark" }
-        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
+        let drew = pixels.withUnsafeMutableBytes { buf -> Bool in
+            guard let base = buf.baseAddress,
+                  let ctx = CGContext(
+                    data: base,
+                    width: w,
+                    height: h,
+                    bitsPerComponent: 8,
+                    bytesPerRow: w * 4,
+                    space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                  ) else { return false }
+            ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
+        }
+        guard drew else { return "dark" }
         var rSum = 0.0, gSum = 0.0, bSum = 0.0, weight = 0.0
         for i in stride(from: 0, to: pixels.count, by: 4) {
             let a = Double(pixels[i + 3]) / 255.0
             if a < 0.25 { continue }
-            rSum += Double(pixels[i]) * a
-            gSum += Double(pixels[i + 1]) * a
-            bSum += Double(pixels[i + 2]) * a
+            let rawR = min(255.0, Double(pixels[i]) / a)
+            let rawG = min(255.0, Double(pixels[i + 1]) / a)
+            let rawB = min(255.0, Double(pixels[i + 2]) / a)
+            rSum += rawR * a
+            gSum += rawG * a
+            bSum += rawB * a
             weight += a
         }
         guard weight > 0 else { return "dark" }

@@ -76,6 +76,15 @@ fn default_sort_default() -> String {
     "default".to_string()
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustedLanPeer {
+    pub fingerprint: String,
+    pub alias: String,
+    pub incoming_token: String,
+    pub outgoing_token: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -127,6 +136,12 @@ pub struct AppSettings {
     pub sort_by: String,
     #[serde(default)]
     pub color_filter: Option<String>,
+    #[serde(default)]
+    pub localsend_device_id: String,
+    #[serde(default)]
+    pub localsend_pair_pin: String,
+    #[serde(default)]
+    pub localsend_trusted_peers: Vec<TrustedLanPeer>,
 }
 
 impl Default for AppSettings {
@@ -156,6 +171,9 @@ impl Default for AppSettings {
             rating_filter: default_all(),
             sort_by: default_sort_default(),
             color_filter: None,
+            localsend_device_id: String::new(),
+            localsend_pair_pin: String::new(),
+            localsend_trusted_peers: Vec::new(),
         }
     }
 }
@@ -285,6 +303,12 @@ pub struct WallpaperScanCacheProject {
     pub type_override: Option<String>,
     pub items: Vec<WallpaperItem>,
     pub entry: WallpaperScanEntry,
+    #[serde(default)]
+    pub project_json_sig: Option<(u64, u64)>,
+    #[serde(default)]
+    pub source_sig: Option<(u64, u64)>,
+    #[serde(default)]
+    pub pkg_sig: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -416,6 +440,7 @@ pub struct WallpaperPayloadItem {
     pub tags: Vec<String>,
     pub customizable_count: usize,
     pub is_archived_offline: bool,
+    pub is_slimmable_mp4: bool,
     pub color_bucket: Option<String>,
 }
 

@@ -169,7 +169,10 @@ export default function GlideSelect({
       e.preventDefault();
       pick(cur, true);
     } else if (k === 'Escape' || k === 'Tab') {
-      if (k === 'Escape') e.preventDefault();
+      if (k === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+      }
       close('instant');
     } else if (k.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey) go(typeaheadIndex(items, cur, k));
   };
@@ -179,8 +182,21 @@ export default function GlideSelect({
     const onDown = e => {
       if (rootRef.current && !rootRef.current.contains(e.target)) close('pop');
     };
+    const onEsc = e => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopImmediatePropagation?.();
+        e.stopPropagation();
+        close('instant');
+        triggerRef.current?.focus({ preventScroll: true });
+      }
+    };
     document.addEventListener('pointerdown', onDown, true);
-    return () => document.removeEventListener('pointerdown', onDown, true);
+    globalThis.addEventListener('keydown', onEsc, true);
+    return () => {
+      document.removeEventListener('pointerdown', onDown, true);
+      globalThis.removeEventListener('keydown', onEsc, true);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase]);
   useEffect(() => {

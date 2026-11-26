@@ -6,6 +6,8 @@ import {
   CaretDown,
   CaretLeft,
   CaretRight,
+  Check,
+  Copy,
   Desktop,
   DeviceTablet,
   DownloadSimple,
@@ -18,10 +20,10 @@ import {
   Trash,
   X,
 } from '@phosphor-icons/react'
-import { CopyButton } from '@appica/ui-react/copy-button'
 import GlideSelect from './reactbits/GlideSelect.jsx'
 import PulseHeart from './reactbits/PulseHeart.jsx'
 import ShinyText from './reactbits/ShinyText.jsx'
+import RollingDigits from './ui/RollingDigits.jsx'
 import MediaSurface from './MediaSurface.jsx'
 import {
   IMAGE_EXPORT_FORMATS,
@@ -51,6 +53,10 @@ export default function WallpaperDetailDialog({
   wePropertiesState = { loading: false, properties: [] },
   isNative,
   sendNativeMessage,
+  globalAudio = null,
+  onPlayGlobalAudio,
+  onToggleGlobalAudio,
+  onSeekGlobalAudio,
   onPrev,
   onNext,
   onToggleFavorite,
@@ -62,6 +68,8 @@ export default function WallpaperDetailDialog({
   onClose,
 }) {
   const [closing, setClosing] = useState(false)
+  const closingRef = useRef(false)
+  closingRef.current = closing
   const [settled, setSettled] = useState(false)
   const [viewport, setViewport] = useState(() => ({
     w: globalThis.innerWidth || 1280,
@@ -77,14 +85,19 @@ export default function WallpaperDetailDialog({
   const [pan, setPan] = useState({ x: 0, y: 0 })
   const [propsOpen, setPropsOpen] = useState(false)
   const [propValues, setPropValues] = useState({})
+  const [copiedNotice, setCopiedNotice] = useState(false)
+  const copyTimerRef = useRef(null)
   const panDragRef = useRef(null)
+  const stageRef = useRef(null)
   const audioRef = useRef(null)
+  const detailVideoRef = useRef(null)
   const titleId = useId()
   const panelRef = useRef(null)
   const previousFocusRef = useRef(null)
   const wasOpenRef = useRef(false)
   const flipControlRef = useRef(null)
   const animTokenRef = useRef(0)
+  const itemType = item?.type
 
   useEffect(() => {
     const onResize = () => {
@@ -109,10 +122,11 @@ export default function WallpaperDetailDialog({
     const outerMarginX = viewport.w < 640 ? 24 : 48
     const outerMarginY = viewport.w < 640 ? 24 : 48
     const hasAssets = Array.isArray(item?.assetUrls) && item.assetUrls.length > 1
-    const hasAudio = Array.isArray(item?.audioTracks) && item.audioTracks.length > 0
+    const hasStandaloneAudio = Array.isArray(item?.audioTracks)
+      && item.audioTracks.some(track => track?.url && track.url !== item?.mediaUrl)
     const maxStageWCap = effectiveRatio > 1.95 ? 1080 : 920
     const availW = Math.max(260, Math.min(viewport.w - outerMarginX - panelChromeX, maxStageWCap))
-    const chromeY = panelChromeX + (hasAssets ? 56 : 0) + (hasAudio ? 52 : 0) + 152
+    const chromeY = panelChromeX + (hasAssets ? 56 : 0) + (hasStandaloneAudio ? 52 : 0) + 152
     const availH = Math.max(
       220,
       Math.min(viewport.h - outerMarginY - chromeY, Math.round(viewport.h * 0.68), 720),
@@ -140,7 +154,7 @@ export default function WallpaperDetailDialog({
       chromeY,
       isNarrowStage,
     }
-  }, [intrinsicRatio, item?.assetUrls, item?.audioTracks, item?.resolution, viewport.h, viewport.w])
+  }, [intrinsicRatio, item?.assetUrls, item?.audioTracks, item?.mediaUrl, item?.resolution, viewport.h, viewport.w])
 
   const flipMetrics = useMemo(() => {
     const vw = viewport.w || 1280
@@ -179,8 +193,9 @@ export default function WallpaperDetailDialog({
   )
   const rotorRotateY = useTransform(flipProgress, [0, 1], [0, 180])
 
+  const itemId = item?.id
   useEffect(() => {
-    if (!item) {
+    if (!itemId) {
       wasOpenRef.current = false
       animTokenRef.current += 1
       flipControlRef.current?.stop()
@@ -207,8 +222,14 @@ export default function WallpaperDetailDialog({
           setSettled(true)
         }
       })
+    } else if (closingRef.current) {
+      animTokenRef.current += 1
+      flipControlRef.current?.stop()
+      flipProgress.set(1)
+      setSettled(true)
     }
     setClosing(false)
+    setCopiedNotice(false)
     setExportFormat('original')
     setAssetIndex(0)
     setIntrinsicRatio(null)
@@ -223,11 +244,12 @@ export default function WallpaperDetailDialog({
       panelRef.current?.focus({ preventScroll: true })
     })
     return () => cancelAnimationFrame(frame)
-  }, [flipProgress, item])
+  }, [flipProgress, itemId])
 
   useEffect(() => () => {
     animTokenRef.current += 1
     flipControlRef.current?.stop()
+    if (copyTimerRef.current) globalThis.clearTimeout(copyTimerRef.current)
   }, [])
 
   useEffect(() => {
@@ -265,12 +287,20 @@ export default function WallpaperDetailDialog({
   }, [closing, flipProgress, onClose])
 
   useEffect(() => {
-    if (!item || suppressHotkeys) return undefined
+    if (!item || suppressHotkeys || closing) return undefined
     const onKeyDown = event => {
       const tag = document.activeElement?.tagName
       const typing = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'
+      const interactiveButton = tag === 'BUTTON'
       if (event.key === 'Escape') {
         triggerClose()
+      } else if (!typing && !interactiveButton && event.code === 'Space' && item.type === 'video' && detailVideoRef.current) {
+        event.preventDefault()
+        if (detailVideoRef.current.paused) {
+          detailVideoRef.current.play()?.catch(() => {})
+        } else {
+          detailVideoRef.current.pause()
+        }
       } else if (!typing && event.key === 'Delete' && isNative) {
         event.preventDefault()
         onDelete?.(item)
@@ -284,15 +314,39 @@ export default function WallpaperDetailDialog({
     }
     globalThis.addEventListener('keydown', onKeyDown)
     return () => globalThis.removeEventListener('keydown', onKeyDown)
-  }, [hasNext, hasPrev, isNative, item, onDelete, onNext, onPrev, suppressHotkeys, triggerClose])
+  }, [closing, hasNext, hasPrev, isNative, item, onDelete, onNext, onPrev, suppressHotkeys, triggerClose])
+
+  useEffect(() => {
+    const stageEl = stageRef.current
+    if (!stageEl || !itemType || itemType === 'video') return undefined
+    const onWheel = event => {
+      event.preventDefault()
+      const delta = event.deltaY < 0 ? 0.22 : -0.22
+      setZoom(prev => {
+        const next = Math.max(1, Math.min(5, +(prev + delta).toFixed(2)))
+        if (next === 1) setPan({ x: 0, y: 0 })
+        return next
+      })
+    }
+    stageEl.addEventListener('wheel', onWheel, { passive: false })
+    return () => stageEl.removeEventListener('wheel', onWheel)
+  }, [item?.id, itemType])
 
   if (!item) return null
 
   const formatOptions = item.type === 'video' ? VIDEO_EXPORT_FORMATS : IMAGE_EXPORT_FORMATS
   const assetUrls = Array.isArray(item.assetUrls) && item.assetUrls.length > 1 ? item.assetUrls : null
   const activeImageSrc = assetUrls ? (assetUrls[assetIndex] || item.mediaUrl) : ''
-  const audioTracks = Array.isArray(item.audioTracks) && item.audioTracks.length > 0 ? item.audioTracks : null
-  const activeTrack = audioTracks ? (audioTracks[trackIndex] || audioTracks[0]) : null
+  const rawAudioTracks = Array.isArray(item.audioTracks) && item.audioTracks.length > 0 ? item.audioTracks : null
+  const standaloneList = rawAudioTracks
+    ? rawAudioTracks
+        .map((track, origIndex) => ({ ...track, origIndex }))
+        .filter(track => track?.url && track.url !== item.mediaUrl)
+    : []
+  const standaloneAudioTracks = standaloneList.length > 0 ? standaloneList : null
+  const hasVideoBgm = !standaloneAudioTracks && item.type === 'video' && (Boolean(item.hasAudio) || Boolean(rawAudioTracks?.length))
+  const isLocalImported = String(item.workshopId || '').startsWith('99') && String(item.workshopId || '').length >= 15
+  const audioTracks = standaloneAudioTracks
   const folderExtra = (item.folderSize || 0) > (item.fileSize || 0) * 1.15
     ? ` · 工坊共占 ${formatBytes(item.folderSize)}`
     : ''
@@ -302,6 +356,20 @@ export default function WallpaperDetailDialog({
     assetUrls ? ` · 共 ${assetUrls.length} 张原画` : ''
   }`
 
+  const activeGlobalForItem = Boolean(globalAudio?.item?.id === item.id)
+  const safeTrackIdx = audioTracks ? Math.max(0, Math.min(trackIndex, audioTracks.length - 1)) : 0
+  const globalMatchIdx = activeGlobalForItem && audioTracks
+    ? audioTracks.findIndex(t => t.origIndex === globalAudio.trackIndex)
+    : -1
+  const displayTrackIdx = globalMatchIdx >= 0 ? globalMatchIdx : safeTrackIdx
+  const displayTrack = audioTracks ? (audioTracks[displayTrackIdx] || audioTracks[0]) : null
+  const displayAudioPlaying = onPlayGlobalAudio
+    ? Boolean(activeGlobalForItem && globalAudio?.playing)
+    : audioPlaying
+  const displayAudioTime = activeGlobalForItem
+    ? { current: globalAudio.currentTime || 0, duration: globalAudio.duration || 0 }
+    : (onPlayGlobalAudio ? { current: 0, duration: 0 } : audioTime)
+
   const formatAudioClock = seconds => {
     if (!Number.isFinite(seconds) || seconds <= 0) return '0:00'
     const mins = Math.floor(seconds / 60)
@@ -310,8 +378,16 @@ export default function WallpaperDetailDialog({
   }
 
   const toggleAudioPlay = () => {
+    if (onPlayGlobalAudio) {
+      if (activeGlobalForItem) {
+        onToggleGlobalAudio?.()
+      } else {
+        onPlayGlobalAudio(item, displayTrack?.origIndex ?? 0)
+      }
+      return
+    }
     const audio = audioRef.current
-    if (!audio || !activeTrack?.url) return
+    if (!audio || !displayTrack?.url) return
     if (audio.paused) {
       audio.play()?.then(() => setAudioPlaying(true)).catch(() => {})
     } else {
@@ -320,21 +396,16 @@ export default function WallpaperDetailDialog({
     }
   }
 
-  const handleWheelZoom = event => {
-    if (item.type === 'video') return
-    event.preventDefault()
-    const delta = event.deltaY < 0 ? 0.22 : -0.22
-    setZoom(prev => {
-      const next = Math.max(1, Math.min(5, +(prev + delta).toFixed(2)))
-      if (next === 1) setPan({ x: 0, y: 0 })
-      return next
-    })
-  }
-
   const startPan = event => {
-    if (item.type === 'video' || zoom <= 1) return
+    if (item.type === 'video' || zoom <= 1 || event.button !== 0) return
     event.preventDefault()
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId)
+    } catch {
+      // ignore if pointer capture unavailable
+    }
     panDragRef.current = {
+      pointerId: event.pointerId,
       startX: event.clientX - pan.x,
       startY: event.clientY - pan.y,
     }
@@ -342,14 +413,22 @@ export default function WallpaperDetailDialog({
 
   const movePan = event => {
     const drag = panDragRef.current
-    if (!drag) return
+    if (!drag || drag.pointerId !== event.pointerId) return
     setPan({
       x: event.clientX - drag.startX,
       y: event.clientY - drag.startY,
     })
   }
 
-  const endPan = () => {
+  const endPan = event => {
+    const drag = panDragRef.current
+    if (drag && event?.currentTarget?.hasPointerCapture?.(drag.pointerId)) {
+      try {
+        event.currentTarget.releasePointerCapture(drag.pointerId)
+      } catch {
+        // ignore
+      }
+    }
     panDragRef.current = null
   }
 
@@ -419,7 +498,7 @@ export default function WallpaperDetailDialog({
               transform: 'rotateY(0deg) translateZ(1px)',
             }}
           >
-            {item.previewUrl || item.mediaUrl ? (
+            {item.previewUrl || (item.type !== 'video' ? item.mediaUrl : '') ? (
               <img
                 src={item.previewUrl || item.mediaUrl}
                 alt=""
@@ -455,12 +534,13 @@ export default function WallpaperDetailDialog({
           }
         >
         <div
+          ref={stageRef}
           className="relative flex shrink-0 items-center justify-center overflow-hidden rounded-[14px]"
-          onWheel={handleWheelZoom}
           onPointerDown={startPan}
           onPointerMove={movePan}
           onPointerUp={endPan}
           onPointerCancel={endPan}
+          onLostPointerCapture={endPan}
           onDoubleClick={() => {
             if (item.type !== 'video') {
               if (zoom > 1) resetZoom()
@@ -521,6 +601,8 @@ export default function WallpaperDetailDialog({
               priority={10}
               fit="cover"
               interactive
+              paused={closing}
+              videoElementRef={detailVideoRef}
               overrideImageSrc={activeImageSrc}
               onIntrinsicSize={handleIntrinsicSize}
             />
@@ -578,13 +660,13 @@ export default function WallpaperDetailDialog({
           </div>
         ) : null}
 
-        {audioTracks && activeTrack ? (
+        {audioTracks && displayTrack ? (
           <div className="mt-3 flex shrink-0 flex-wrap items-center gap-3 rounded-xl border border-base-300/80 bg-base-200/55 px-3.5 py-2">
-            {!closing && activeTrack.url ? (
+            {!onPlayGlobalAudio && !closing && displayTrack.url ? (
               <audio
-                key={`${item.id}:${activeTrack.url}`}
+                key={`${item.id}:${displayTrack.url}`}
                 ref={audioRef}
-                src={activeTrack.url}
+                src={displayTrack.url}
                 preload="metadata"
                 onLoadedMetadata={event => {
                   const dur = event.currentTarget.duration
@@ -604,47 +686,56 @@ export default function WallpaperDetailDialog({
             <button
               type="button"
               className="btn btn-primary btn-sm h-8 w-8 min-w-0 shrink-0 rounded-full px-0"
-              aria-label={audioPlaying ? '暂停配乐' : '试听配乐'}
-              disabled={!activeTrack.url}
+              aria-label={displayAudioPlaying ? '暂停配乐' : '试听配乐'}
+              disabled={!displayTrack.url}
               onClick={toggleAudioPlay}
             >
-              {audioPlaying ? <Pause size={14} weight="fill" /> : <Play size={14} weight="fill" />}
+              {displayAudioPlaying ? <Pause size={14} weight="fill" /> : <Play size={14} weight="fill" />}
             </button>
             <div className="flex min-w-0 flex-1 items-center gap-2.5">
               <MusicNotes size={15} weight="fill" className="shrink-0 text-primary" />
               <span className="max-w-44 truncate text-xs font-semibold">
-                {activeTrack.name}
+                {displayTrack.name}
               </span>
               {audioTracks.length > 1 ? (
                 <button
                   type="button"
                   className="btn btn-ghost btn-xs h-6 min-h-0 rounded-full px-2 text-[11px]"
                   onClick={() => {
-                    setTrackIndex(prev => (prev + 1) % audioTracks.length)
-                    setAudioPlaying(false)
-                    setAudioTime({ current: 0, duration: 0 })
+                    const nextIdx = (displayTrackIdx + 1) % audioTracks.length
+                    setTrackIndex(nextIdx)
+                    if (onPlayGlobalAudio) {
+                      onPlayGlobalAudio(item, audioTracks[nextIdx]?.origIndex ?? nextIdx)
+                    } else {
+                      setAudioPlaying(false)
+                      setAudioTime({ current: 0, duration: 0 })
+                    }
                   }}
                 >
-                  曲目 {trackIndex + 1}/{audioTracks.length}
+                  曲目 {displayTrackIdx + 1}/{audioTracks.length}
                 </button>
               ) : null}
               <input
                 type="range"
                 aria-label="音频播放进度"
                 min={0}
-                max={audioTime.duration || 100}
+                max={displayAudioTime.duration || 100}
                 step={0.1}
-                value={Math.min(audioTime.current, audioTime.duration || 100)}
-                disabled={!activeTrack.url || audioTime.duration <= 0}
+                value={Math.min(displayAudioTime.current, displayAudioTime.duration || 100)}
+                disabled={!displayTrack.url || displayAudioTime.duration <= 0}
                 onChange={event => {
                   const next = Number(event.target.value)
-                  if (audioRef.current) audioRef.current.currentTime = next
-                  setAudioTime(prev => ({ ...prev, current: next }))
+                  if (onPlayGlobalAudio && activeGlobalForItem) {
+                    onSeekGlobalAudio?.(next)
+                  } else {
+                    if (audioRef.current) audioRef.current.currentTime = next
+                    setAudioTime(prev => ({ ...prev, current: next }))
+                  }
                 }}
                 className="range range-primary range-xs min-w-20 flex-1"
               />
               <span className="shrink-0 tabular-nums text-[11px] text-base-content/60">
-                {formatAudioClock(audioTime.current)} / {formatAudioClock(audioTime.duration)}
+                <RollingDigits value={`${formatAudioClock(displayAudioTime.current)} / ${formatAudioClock(displayAudioTime.duration)}`} />
               </span>
             </div>
             <div className="flex shrink-0 items-center gap-1">
@@ -654,7 +745,7 @@ export default function WallpaperDetailDialog({
                 disabled={!isNative}
                 onClick={() => sendNativeMessage('wallpapers.export-audio.request', {
                   id: item.id,
-                  trackIndex,
+                  trackIndex: displayTrack?.origIndex ?? 0,
                 })}
               >
                 <DownloadSimple size={13} weight="bold" />
@@ -779,9 +870,6 @@ export default function WallpaperDetailDialog({
                 <div className="flex flex-wrap items-center justify-between gap-2 pb-2">
                   <div>
                     <p className="text-xs font-semibold">作者隐藏开关与换装差分面板</p>
-                    <p className="text-[11px] text-base-content/60">
-                      修改后点击「同步到 Wallpaper Engine」即可实时切换壁纸内文字、音效或差分样式。
-                    </p>
                   </div>
                   <button
                     type="button"
@@ -883,6 +971,17 @@ export default function WallpaperDetailDialog({
                 <Desktop size={15} weight="bold" />
                 设为桌面
               </button>
+              {hasVideoBgm ? (
+                <button
+                  className="btn btn-ghost btn-sm gap-1"
+                  type="button"
+                  disabled={!isNative}
+                  onClick={() => sendNativeMessage('wallpapers.export-audio.request', { id: item.id })}
+                >
+                  <MusicNotes size={14} weight="bold" />
+                  提取 BGM
+                </button>
+              ) : null}
               {item.hasSceneLayers ? (
                 <button
                   className="btn btn-outline btn-primary btn-sm"
@@ -894,18 +993,20 @@ export default function WallpaperDetailDialog({
                   透视拆解台
                 </button>
               ) : null}
-              <button
-                className="btn btn-ghost btn-sm"
-                type="button"
-                disabled={!isNative}
-                onClick={() => sendNativeMessage(
-                  'wallpapers.open-workshop.request',
-                  { id: item.id },
-                )}
-              >
-                <ArrowSquareOut size={15} weight="bold" />
-                Steam 创意工坊
-              </button>
+              {!isLocalImported && item.workshopId ? (
+                <button
+                  className="btn btn-ghost btn-sm"
+                  type="button"
+                  disabled={!isNative}
+                  onClick={() => sendNativeMessage(
+                    'wallpapers.open-workshop.request',
+                    { id: item.id },
+                  )}
+                >
+                  <ArrowSquareOut size={15} weight="bold" />
+                  Steam 创意工坊
+                </button>
+              ) : null}
               <button
                 className="btn btn-ghost btn-sm text-error hover:bg-error/10"
                 type="button"
@@ -926,28 +1027,27 @@ export default function WallpaperDetailDialog({
               >
                 原文件位置
               </button>
-              <CopyButton
-                value={() => item.title}
-                onCopy={() => {
-                  if (isNative) {
-                    sendNativeMessage('wallpapers.copy.request', { id: item.id, assetIndex })
-                  }
-                }}
-                copiedLabel="已复制"
+              <button
+                className="btn btn-ghost btn-sm gap-1.5"
+                type="button"
                 disabled={!isNative}
-                variant="ghost"
-                size="sm"
-                className="wv-copy-btn"
+                onClick={() => {
+                  sendNativeMessage('wallpapers.copy.request', { id: item.id, assetIndex })
+                  setCopiedNotice(true)
+                  if (copyTimerRef.current) globalThis.clearTimeout(copyTimerRef.current)
+                  copyTimerRef.current = globalThis.setTimeout(() => setCopiedNotice(false), 1600)
+                }}
               >
-                {item.type === 'video' ? '复制视频' : '复制原图'}
-              </CopyButton>
+                {copiedNotice ? <Check size={14} weight="bold" className="text-success" /> : <Copy size={14} weight="bold" />}
+                <span>{copiedNotice ? '已复制' : (item.type === 'video' ? '复制视频' : '复制原图')}</span>
+              </button>
               <button
                 className="btn btn-ghost btn-sm"
                 type="button"
                 disabled={!isNative}
                 onClick={() => sendNativeMessage(
                   'wallpapers.export-as.request',
-                  { ids: [item.id], format: exportFormat },
+                  { ids: [item.id], format: exportFormat, assetIndex },
                 )}
               >
                 另存到…
@@ -958,7 +1058,7 @@ export default function WallpaperDetailDialog({
                 disabled={!isNative}
                 onClick={() => sendNativeMessage(
                   'wallpapers.export.request',
-                  { ids: [item.id], format: exportFormat },
+                  { ids: [item.id], format: exportFormat, assetIndex },
                 )}
               >
                 导出

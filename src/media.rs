@@ -11,10 +11,11 @@ use std::fs::{self, File};
 use std::io::BufWriter;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 const THUMB_SIZE: u32 = 720;
+static TMP_MEDIA_SEQ: AtomicU64 = AtomicU64::new(1);
 
 pub fn find_executable(exe_name: &str) -> Option<PathBuf> {
     if let Ok(cur_exe) = std::env::current_exe() {
@@ -52,6 +53,20 @@ pub fn detect_media_type(path: &Path) -> Option<&'static str> {
     if !path.is_file() {
         return None;
     }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if matches!(
+        ext.as_str(),
+        "mp3" | "wav" | "ogg" | "flac" | "m4a" | "m4b" | "aac" | "opus" | "wma"
+    ) {
+        return None;
+    }
+    if matches!(ext.as_str(), "heic" | "heif" | "avif") {
+        return Some("image");
+    }
     let mut header = [0u8; 16];
     let read = {
         let mut f = File::open(path).ok()?;
@@ -77,7 +92,8 @@ fn detect_by_extension(path: &Path) -> Option<&'static str> {
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())?;
     match ext.as_str() {
-        "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" | "tif" | "tiff" => Some("image"),
+        "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" | "tif" | "tiff" | "heic" | "heif"
+        | "avif" => Some("image"),
         "mp4" | "m4v" | "mov" | "webm" | "mkv" | "avi" | "wmv" | "flv" | "mpeg" | "mpg" => {
             Some("video")
         }
@@ -98,11 +114,29 @@ fn is_image_signature(b: &[u8]) -> bool {
     if b.len() >= 12 && &b[..4] == b"RIFF" && &b[8..12] == b"WEBP" {
         return true;
     }
+    if b.len() >= 12 && &b[4..8] == b"ftyp" {
+        let brand = &b[8..12];
+        if matches!(
+            brand,
+            b"avif" | b"avis" | b"heic" | b"heix" | b"hevc" | b"hevx" | b"heim" | b"heis"
+                | b"mif1" | b"msf1"
+        ) {
+            return true;
+        }
+    }
     b.len() >= 2 && b[0] == b'B' && b[1] == b'M'
 }
 
 fn is_video_signature(b: &[u8]) -> bool {
     if b.len() >= 12 && &b[4..8] == b"ftyp" {
+        let brand = &b[8..12];
+        if matches!(
+            brand,
+            b"M4A " | b"M4B " | b"M4P " | b"f4a " | b"avif" | b"avis" | b"heic" | b"heix"
+                | b"hevc" | b"hevx" | b"heim" | b"heis" | b"mif1" | b"msf1"
+        ) {
+            return false;
+        }
         return true;
     }
     if b.len() >= 4 && b[..4] == [0x1A, 0x45, 0xDF, 0xA3] {
@@ -240,7 +274,10 @@ fn parse_mp4_boxes(
     let mut height = 0i32;
     let mut duration: Option<f64> = None;
 
-    while pos + 8 <= end {
+    const MAX_BOXES: usize = 8192;
+    let mut box_count = 0usize;
+    while pos + 8 <= end && box_count < MAX_BOXES {
+        box_count += 1;
         file.seek(SeekFrom::Start(pos)).ok()?;
         let mut hdr = [0u8; 8];
         if file.read_exact(&mut hdr).is_err() {
@@ -260,11 +297,13 @@ fn parse_mp4_boxes(
         } else {
             (size32 as u64, 8u64)
         };
-        if box_size < header_len || pos + box_size > end {
+        let Some(body_end) = pos.checked_add(box_size) else {
+            break;
+        };
+        if box_size < header_len || body_end <= pos || body_end > end {
             break;
         }
         let body_start = pos + header_len;
-        let body_end = pos + box_size;
 
         if box_type == b"moov" {
             let res = parse_mp4_boxes(file, body_start, body_end, depth + 1);
@@ -328,7 +367,7 @@ fn parse_mp4_boxes(
             }
         }
 
-        pos += box_size;
+        pos = body_end;
     }
 
     if width > 0 || duration.is_some() {
@@ -336,6 +375,141 @@ fn parse_mp4_boxes(
     } else {
         None
     }
+}
+
+fn scan_mp4_audio_handlers(
+    file: &mut File,
+    start: u64,
+    end: u64,
+    depth: u32,
+    saw_video: &mut bool,
+    saw_audio: &mut bool,
+) -> Option<()> {
+    use std::io::{Seek, SeekFrom};
+    if depth > 5 || start >= end || *saw_audio {
+        return Some(());
+    }
+    let mut pos = start;
+    const MAX_BOXES: usize = 8192;
+    let mut box_count = 0usize;
+    while pos + 8 <= end && box_count < MAX_BOXES && !*saw_audio {
+        box_count += 1;
+        file.seek(SeekFrom::Start(pos)).ok()?;
+        let mut hdr = [0u8; 8];
+        if file.read_exact(&mut hdr).is_err() {
+            break;
+        }
+        let size32 = u32::from_be_bytes(hdr[0..4].try_into().ok()?);
+        let box_type = &hdr[4..8];
+        let (box_size, header_len) = if size32 == 1 {
+            if pos + 16 > end {
+                break;
+            }
+            let mut ext = [0u8; 8];
+            file.read_exact(&mut ext).ok()?;
+            (u64::from_be_bytes(ext), 16u64)
+        } else if size32 == 0 {
+            (end - pos, 8u64)
+        } else {
+            (size32 as u64, 8u64)
+        };
+        let Some(body_end) = pos.checked_add(box_size) else {
+            break;
+        };
+        if box_size < header_len || body_end <= pos || body_end > end {
+            break;
+        }
+        let body_start = pos + header_len;
+        if matches!(box_type, b"moov" | b"trak" | b"mdia") {
+            let _ = scan_mp4_audio_handlers(
+                file,
+                body_start,
+                body_end,
+                depth + 1,
+                saw_video,
+                saw_audio,
+            );
+        } else if box_type == b"hdlr" && (body_end - body_start) >= 12 {
+            let mut hdlr = [0u8; 12];
+            file.seek(SeekFrom::Start(body_start)).ok()?;
+            if file.read_exact(&mut hdlr).is_ok() {
+                let handler_type = &hdlr[8..12];
+                if handler_type == b"soun" {
+                    *saw_audio = true;
+                    return Some(());
+                } else if handler_type == b"vide" {
+                    *saw_video = true;
+                }
+            }
+        }
+        pos = body_end;
+    }
+    Some(())
+}
+
+fn probe_mp4_audio_box(path: &Path) -> Option<bool> {
+    let mut file = File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    let mut saw_video = false;
+    let mut saw_audio = false;
+    scan_mp4_audio_handlers(&mut file, 0, file_len, 0, &mut saw_video, &mut saw_audio)?;
+    if saw_audio {
+        Some(true)
+    } else if saw_video {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+pub fn video_has_audio_stream_cancellable(
+    path: &Path,
+    ffprobe_path: Option<&Path>,
+    cancel: Option<&AtomicBool>,
+) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    if matches!(ext.as_str(), "mp4" | "m4v" | "mov") {
+        if let Some(has_audio) = probe_mp4_audio_box(path) {
+            return has_audio;
+        }
+    }
+    if cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {
+        return false;
+    }
+    let owned_probe = ffprobe_path
+        .map(PathBuf::from)
+        .or_else(|| find_executable("ffprobe.exe"));
+    let Some(ffprobe) = owned_probe else {
+        return false;
+    };
+    let mut args = os_args([
+        "-v",
+        "quiet",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=codec_type",
+        "-of",
+        "csv=p=0",
+    ]);
+    args.push(path.as_os_str().to_os_string());
+    let Ok(out) = run_output(&ffprobe, &args, None, Duration::from_secs(6), cancel) else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case("audio"))
+}
+
+pub fn video_has_audio_stream(path: &Path, ffprobe_path: Option<&Path>) -> bool {
+    video_has_audio_stream_cancellable(path, ffprobe_path, None)
 }
 
 pub fn sanitize_cache_key(key: &str) -> String {
@@ -351,13 +525,15 @@ pub fn sanitize_cache_key(key: &str) -> String {
 }
 
 fn make_unique_temp_path(dir: &Path, ext: &str) -> PathBuf {
+    let seq = TMP_MEDIA_SEQ.fetch_add(1, Ordering::Relaxed);
     dir.join(format!(
-        ".tmp-{}-{}.{}",
+        ".tmp-{}-{}-{}.{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0),
+        seq,
         ext
     ))
 }
@@ -384,19 +560,24 @@ fn finalize_temp_cache_file(
         let _ = fs::remove_file(tmp);
         return None;
     }
-    let _ = fs::rename(tmp, dest).or_else(|_| {
-        let _ = fs::remove_file(dest);
-        fs::rename(tmp, dest)
-    });
-    if let Some(mt) = src_mtime {
-        if let Ok(sf) = File::open(dest) {
-            let _ = sf.set_modified(mt);
+    let renamed = fs::rename(tmp, dest)
+        .or_else(|_| {
+            let _ = fs::remove_file(dest);
+            fs::rename(tmp, dest)
+        })
+        .is_ok();
+    if renamed {
+        if let Some(mt) = src_mtime {
+            if let Ok(sf) = File::open(dest) {
+                let _ = sf.set_modified(mt);
+            }
         }
+    } else {
+        let _ = fs::remove_file(tmp);
     }
     if dest.is_file() {
         Some(clean_path_str(dest))
     } else {
-        let _ = fs::remove_file(tmp);
         None
     }
 }
@@ -546,12 +727,15 @@ pub fn try_create_video_preview_cancellable(
     fs::create_dir_all(&preview_dir).ok()?;
     let tmp = make_unique_temp_path(&preview_dir, "jpg");
     let ok = ["0", "1"].iter().any(|seek| {
-        if cancel.map(|c| c.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(false) {
+        if cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {
             return false;
         }
         if use_hw_decode && run_ffmpeg_preview_frame(ffmpeg, source_path, seek, true, &tmp, cancel)
         {
             return true;
+        }
+        if cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {
+            return false;
         }
         run_ffmpeg_preview_frame(ffmpeg, source_path, seek, false, &tmp, cancel)
     });
@@ -622,7 +806,8 @@ pub fn try_create_video_preview_clip_cancellable(
     let tmp = make_unique_temp_path(&clip_dir, "mp4");
     let ok = (use_hw_decode
         && run_ffmpeg_preview_clip(ffmpeg, source_path, true, &tmp, cancel))
-        || run_ffmpeg_preview_clip(ffmpeg, source_path, false, &tmp, cancel);
+        || (!cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false)
+            && run_ffmpeg_preview_clip(ffmpeg, source_path, false, &tmp, cancel));
     if ok {
         finalize_temp_cache_file(&tmp, &dest, src_meta.modified().ok())
     } else {
@@ -679,6 +864,90 @@ mod tests {
         pack_multi_size_ico_pure_rust(&src, &dst).unwrap();
         let ico_bytes = fs::read(&dst).unwrap();
         assert_eq!(&ico_bytes[0..6], &[0, 0, 1, 0, 6, 0]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_mp4_boxes_handles_wrapping_64bit_largesize_without_looping() {
+        let dir = std::env::temp_dir().join(format!("wallpull_mp4_wrap_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let bad_mp4 = dir.join("bad.mp4");
+        let mut buf = Vec::new();
+        // padding 100 bytes
+        buf.resize(100, 0u8);
+        // Box at offset 100: size32=1, type='free', largesize = u64::MAX - 99 -> wraps pos + box_size to 1
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(b"free");
+        buf.extend_from_slice(&(u64::MAX - 99).to_be_bytes());
+        fs::write(&bad_mp4, &buf).unwrap();
+
+        let mut f = File::open(&bad_mp4).unwrap();
+        let len = f.metadata().unwrap().len();
+        assert!(parse_mp4_boxes(&mut f, 100, len, 0).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mp4_hdlr_soun_box_detects_embedded_audio_stream() {
+        fn wrap_box(tag: &[u8; 4], body: &[u8]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(8 + body.len());
+            out.extend_from_slice(&((8 + body.len()) as u32).to_be_bytes());
+            out.extend_from_slice(tag);
+            out.extend_from_slice(body);
+            out
+        }
+        let dir = std::env::temp_dir().join(format!("wallpull_mp4_soun_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+
+        let mut hdlr_vid = vec![0u8; 12];
+        hdlr_vid[8..12].copy_from_slice(b"vide");
+        let mdia_vid = wrap_box(b"mdia", &wrap_box(b"hdlr", &hdlr_vid));
+        let trak_vid = wrap_box(b"trak", &mdia_vid);
+
+        let mut hdlr_aud = vec![0u8; 12];
+        hdlr_aud[8..12].copy_from_slice(b"soun");
+        let mdia_aud = wrap_box(b"mdia", &wrap_box(b"hdlr", &hdlr_aud));
+        let trak_aud = wrap_box(b"trak", &mdia_aud);
+
+        let moov_silent = wrap_box(b"moov", &trak_vid);
+        let silent_mp4 = dir.join("silent.mp4");
+        fs::write(&silent_mp4, &moov_silent).unwrap();
+        assert!(!video_has_audio_stream(&silent_mp4, None));
+
+        let mut moov_body = Vec::new();
+        moov_body.extend_from_slice(&trak_vid);
+        moov_body.extend_from_slice(&trak_aud);
+        let moov_bgm = wrap_box(b"moov", &moov_body);
+        let bgm_mp4 = dir.join("with_bgm.mp4");
+        fs::write(&bgm_mp4, &moov_bgm).unwrap();
+        assert!(video_has_audio_stream(&bgm_mp4, None));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ftyp_audio_and_heic_brands_are_not_classified_as_video() {
+        let dir = std::env::temp_dir().join(format!("wallpull_ftyp_sniff_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+
+        let m4a_path = dir.join("bgm.m4a");
+        let mut m4a_hdr = vec![0u8; 20];
+        m4a_hdr[4..8].copy_from_slice(b"ftyp");
+        m4a_hdr[8..12].copy_from_slice(b"M4A ");
+        fs::write(&m4a_path, &m4a_hdr).unwrap();
+        assert_eq!(detect_media_type(&m4a_path), None);
+
+        let heic_path = dir.join("photo.heic");
+        let mut heic_hdr = vec![0u8; 20];
+        heic_hdr[4..8].copy_from_slice(b"ftyp");
+        heic_hdr[8..12].copy_from_slice(b"heic");
+        fs::write(&heic_path, &heic_hdr).unwrap();
+        assert_eq!(detect_media_type(&heic_path), Some("image"));
+
+        let heic_part = dir.join("upload.part");
+        fs::write(&heic_part, &heic_hdr).unwrap();
+        assert_eq!(detect_media_type(&heic_part), Some("image"));
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

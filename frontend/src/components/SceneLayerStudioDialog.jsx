@@ -5,6 +5,7 @@ import {
   ArrowCounterClockwise,
   CaretDown,
   CaretRight,
+  Columns,
   Copy,
   Desktop,
   DeviceTablet,
@@ -17,6 +18,9 @@ import {
   Stack,
   X,
 } from '@phosphor-icons/react'
+import AnimatedPillGroup from './ui/AnimatedPillGroup.jsx'
+import ImageCompareSlider from './ui/ImageCompareSlider.jsx'
+import RulerSlider from './ui/RulerSlider.jsx'
 
 const ROLE_LABELS = {
   background: { label: '背景', badgeClass: 'bg-sky-500/15 text-sky-600 dark:text-sky-300' },
@@ -47,6 +51,7 @@ export default function SceneLayerStudioDialog({
   open,
   state,
   isNative,
+  suppressHotkeys = false,
   onPreviewChange,
   onExport,
   onSendToTablet,
@@ -58,7 +63,9 @@ export default function SceneLayerStudioDialog({
   const [trimBounds, setTrimBounds] = useState(true)
   const [zoom, setZoom] = useState(1)
   const [pan, setPan] = useState({ x: 0, y: 0 })
+  const [compareMode, setCompareMode] = useState(false)
   const panRef = useRef(null)
+  const stageRef = useRef(null)
   const previewTimerRef = useRef(null)
   const initializedForRef = useRef(null)
 
@@ -84,6 +91,7 @@ export default function SceneLayerStudioDialog({
     setVisibleSet(defaults)
     setZoom(1)
     setPan({ x: 0, y: 0 })
+    setCompareMode(false)
     setTrimBounds(true)
     if (groups.length <= 3) {
       setExpandedGroups(new Set(groups.map(g => g.key)))
@@ -93,7 +101,7 @@ export default function SceneLayerStudioDialog({
   }, [groups, layers, manifest, open, state?.wallpaperId])
 
   useEffect(() => {
-    if (!open) return undefined
+    if (!open || suppressHotkeys) return undefined
     const onKeyDown = event => {
       if (event.key === 'Escape') {
         event.preventDefault()
@@ -107,7 +115,23 @@ export default function SceneLayerStudioDialog({
         globalThis.clearTimeout(previewTimerRef.current)
       }
     }
-  }, [onClose, open])
+  }, [onClose, open, suppressHotkeys])
+
+  useEffect(() => {
+    const stageEl = stageRef.current
+    if (!open || !stageEl) return undefined
+    const onWheel = event => {
+      event.preventDefault()
+      setZoom(prev => {
+        const factor = event.deltaY < 0 ? 1.15 : 0.87
+        const next = Math.max(1, Math.min(4.5, Number((prev * factor).toFixed(2))))
+        if (next <= 1) setPan({ x: 0, y: 0 })
+        return next
+      })
+    }
+    stageEl.addEventListener('wheel', onWheel, { passive: false })
+    return () => stageEl.removeEventListener('wheel', onWheel)
+  }, [open])
 
   const commitVisibleSet = useCallback(nextSet => {
     setVisibleSet(nextSet)
@@ -187,6 +211,12 @@ export default function SceneLayerStudioDialog({
     return map
   }, [layers])
 
+  const baselineUrl = state?.baselinePreviewUrl || ''
+  const canvasRatio =
+    manifest?.canvasWidth > 0 && manifest?.canvasHeight > 0
+      ? manifest.canvasWidth / manifest.canvasHeight
+      : 16 / 9
+
   if (!open) return null
 
   const stageStyle = backdrop === 'checker'
@@ -229,20 +259,22 @@ export default function SceneLayerStudioDialog({
           </div>
 
           <div className="flex items-center gap-2">
-            <div className="join rounded-full border border-base-300 p-0.5" role="group" aria-label="画布底色">
-              {BACKDROP_MODES.map(opt => (
-                <button
-                  key={opt.value}
-                  type="button"
-                  onClick={() => setBackdrop(opt.value)}
-                  className={`btn btn-xs h-7 rounded-full border-0 px-3 ${
-                    backdrop === opt.value ? 'btn-primary' : 'btn-ghost'
-                  }`}
-                >
-                  {opt.label}
-                </button>
-              ))}
-            </div>
+            {baselineUrl && state?.previewUrl ? (
+              <button
+                type="button"
+                className={`btn btn-xs h-8 rounded-full px-3 ${compareMode ? 'btn-primary' : 'btn-ghost border border-base-300'}`}
+                onClick={() => setCompareMode(prev => !prev)}
+              >
+                <Columns size={13} weight="bold" />
+                <span>{compareMode ? '退出对比' : '原图对比'}</span>
+              </button>
+            ) : null}
+            <AnimatedPillGroup
+              options={BACKDROP_MODES}
+              value={backdrop}
+              onChange={setBackdrop}
+              ariaLabel="画布底色"
+            />
             <button
               type="button"
               className="btn btn-ghost btn-sm h-8 w-8 min-w-0 px-0"
@@ -256,31 +288,39 @@ export default function SceneLayerStudioDialog({
 
         <div className="flex min-h-0 flex-1 overflow-hidden">
           <div
+            ref={stageRef}
             className="relative flex min-w-0 flex-1 items-center justify-center overflow-hidden border-r border-base-300/70"
             style={{ ...stageStyle, cursor: zoom > 1 ? 'grab' : 'default' }}
-            onWheel={event => {
-              event.preventDefault()
-              setZoom(prev => {
-                const factor = event.deltaY < 0 ? 1.15 : 0.87
-                const next = Math.max(1, Math.min(4.5, Number((prev * factor).toFixed(2))))
-                if (next <= 1) setPan({ x: 0, y: 0 })
-                return next
-              })
-            }}
             onPointerDown={event => {
               if (event.button !== 0 || zoom <= 1) return
-              panRef.current = { x: event.clientX, y: event.clientY, startX: pan.x, startY: pan.y }
+              try {
+                event.currentTarget.setPointerCapture(event.pointerId)
+              } catch {
+                // ignore
+              }
+              panRef.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, startX: pan.x, startY: pan.y }
             }}
             onPointerMove={event => {
               const drag = panRef.current
-              if (!drag) return
+              if (!drag || drag.pointerId !== event.pointerId) return
               setPan({
                 x: drag.startX + (event.clientX - drag.x),
                 y: drag.startY + (event.clientY - drag.y),
               })
             }}
-            onPointerUp={() => { panRef.current = null }}
+            onPointerUp={event => {
+              const drag = panRef.current
+              if (drag && event.currentTarget.hasPointerCapture?.(drag.pointerId)) {
+                try {
+                  event.currentTarget.releasePointerCapture(drag.pointerId)
+                } catch {
+                  // ignore
+                }
+              }
+              panRef.current = null
+            }}
             onPointerCancel={() => { panRef.current = null }}
+            onLostPointerCapture={() => { panRef.current = null }}
             onDoubleClick={() => {
               if (zoom > 1) {
                 setZoom(1)
@@ -290,7 +330,19 @@ export default function SceneLayerStudioDialog({
               }
             }}
           >
-            {state?.previewUrl ? (
+            {visibleSet.size === 0 && state?.manifest ? null : compareMode && baselineUrl && state?.previewUrl ? (
+              <div className="h-full w-full p-5">
+                <ImageCompareSlider
+                  beforeSrc={baselineUrl}
+                  afterSrc={state.previewUrl}
+                  beforeLabel="原图"
+                  afterLabel="当前拆解"
+                  fitContainer
+                  canvasRatio={canvasRatio}
+                  surfaceClassName="border-base-content/18 bg-transparent shadow-2xl"
+                />
+              </div>
+            ) : state?.previewUrl ? (
               <img
                 src={state.previewUrl}
                 alt={state.title || '图层预览'}
@@ -325,17 +377,36 @@ export default function SceneLayerStudioDialog({
               </div>
             ) : null}
 
-            {zoom > 1 ? (
-              <button
-                type="button"
-                className="btn btn-xs absolute right-3 bottom-3 rounded-full bg-black/60 text-white backdrop-blur-md hover:bg-black/75"
-                onClick={() => {
-                  setZoom(1)
-                  setPan({ x: 0, y: 0 })
-                }}
-              >
-                {Math.round(zoom * 100)}% · 重置视图
-              </button>
+            {!compareMode && visibleSet.size > 0 && state?.previewUrl ? (
+              <div className="absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-2">
+                <RulerSlider
+                  label="画布缩放"
+                  min={100}
+                  max={400}
+                  step={5}
+                  majorEvery={10}
+                  spacing={7}
+                  unit="%"
+                  value={Math.round(zoom * 100)}
+                  onChange={pct => {
+                    const nextZoom = Math.max(1, Math.min(4, pct / 100))
+                    setZoom(nextZoom)
+                    if (nextZoom <= 1) setPan({ x: 0, y: 0 })
+                  }}
+                />
+                {zoom > 1 ? (
+                  <button
+                    type="button"
+                    className="btn btn-xs rounded-full border border-base-300/80 bg-base-100/88 px-2.5 shadow-lg backdrop-blur-xl"
+                    onClick={() => {
+                      setZoom(1)
+                      setPan({ x: 0, y: 0 })
+                    }}
+                  >
+                    1:1
+                  </button>
+                ) : null}
+              </div>
             ) : null}
           </div>
 

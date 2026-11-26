@@ -1,9 +1,8 @@
-use crate::actions::is_archived_offline;
 use crate::duplicates::compute_visual_profile;
 use crate::media::{
     create_image_thumbnail_cancellable, detect_media_type, find_executable,
     is_recognized_media_path, probe_or_fallback_cancellable, try_create_video_preview_cancellable,
-    try_create_video_preview_clip_cancellable,
+    try_create_video_preview_clip_cancellable, video_has_audio_stream_cancellable,
 };
 use crate::models::{
     ItemPrecomputedMeta, ResolvedMediaAsset, WallpaperItem, WallpaperScanCache,
@@ -353,24 +352,30 @@ pub fn compute_items_meta(
     items: &[WallpaperItem],
     export_dir: &str,
 ) -> HashMap<String, ItemPrecomputedMeta> {
-    let mut unique_dirs: Vec<(String, WallpaperItem)> = Vec::new();
+    let mut unique_dirs: Vec<(String, String)> = Vec::new();
     let mut seen = HashSet::new();
+    let mut hint_ws_dir: Option<&str> = None;
     for item in items {
+        if hint_ws_dir.is_none() && !item.workshop_directory.trim().is_empty() {
+            hint_ws_dir = Some(item.workshop_directory.as_str());
+        }
         let key = item.workshop_directory.to_ascii_lowercase();
         if !key.is_empty() && seen.insert(key) {
-            unique_dirs.push((item.workshop_directory.clone(), item.clone()));
+            unique_dirs.push((item.workshop_directory.clone(), item.workshop_id.clone()));
         }
     }
 
+    let archived_ids = crate::actions::collect_archived_workshop_ids(hint_ws_dir, export_dir);
+
     unique_dirs
         .into_par_iter()
-        .map(|(dir, sample)| {
+        .map(|(dir, ws_id)| {
             let has_scene_layers = items
                 .iter()
                 .any(|i| i.workshop_directory.eq_ignore_ascii_case(&dir) && i.item_type == "image")
                 && has_inspectable_2d_scene(&dir);
             let extra = inspect_workshop_extra(&dir);
-            let archived = is_archived_offline(&sample, export_dir);
+            let archived = archived_ids.contains(&ws_id);
             (
                 dir.to_ascii_lowercase(),
                 ItemPrecomputedMeta {
@@ -525,15 +530,30 @@ where
 
             if !force_rescan {
                 if let Some(cached) = cached_map.get(&key) {
-                    if can_reuse_cached(cached, &ws_id, has_ffmpeg) {
+                    if can_reuse_cached(cached, &ws_id, has_ffmpeg, &p_str) {
                         if !cached.items.is_empty() && !is_cancelled(cancel) {
                             for it in &cached.items {
+                                let mut it = it.clone();
+                                if it.item_type == "video"
+                                    && it.audio_paths.is_none()
+                                    && Path::new(&it.source_path).is_file()
+                                {
+                                    if video_has_audio_stream_cancellable(
+                                        Path::new(&it.source_path),
+                                        ffprobe_path.as_deref(),
+                                        cancel,
+                                    ) {
+                                        it.audio_paths = Some(vec![it.source_path.clone()]);
+                                    } else if !is_cancelled(cancel) {
+                                        it.audio_paths = Some(Vec::new());
+                                    }
+                                }
                                 let idx = items.len();
                                 if it.color_bucket.is_none() || it.visual_fingerprint.is_none() {
                                     backfill_indices.push(idx);
                                 }
                                 items.push(it.clone());
-                                reused_batch_buf.push(it.clone());
+                                reused_batch_buf.push(it);
                             }
                             if reused_batch_buf.len() >= 200 {
                                 on_batch(&reused_batch_buf);
@@ -795,6 +815,27 @@ where
     WallpaperScanResult { items, report }
 }
 
+pub fn scan_single_imported_dir(project_dir: &Path, use_hw_decode: bool) -> Vec<WallpaperItem> {
+    let Some(ws_id) = project_dir.file_name().and_then(|n| n.to_str()) else {
+        return Vec::new();
+    };
+    let ffmpeg = find_executable("ffmpeg.exe");
+    let ffprobe = find_executable("ffprobe.exe");
+    let (mut parsed_items, _entry) = try_read_project(
+        ws_id,
+        project_dir,
+        true,
+        ffmpeg.as_deref(),
+        ffprobe.as_deref(),
+        use_hw_decode,
+        None,
+    );
+    for item in &mut parsed_items {
+        enrich_item_visual_profile(item);
+    }
+    parsed_items
+}
+
 fn try_read_project(
     workshop_id: &str,
     project_dir: &Path,
@@ -975,7 +1016,18 @@ fn try_read_project(
                 );
             }
 
-            let merged_audio = merge_audio_paths(asset.audio_paths.take(), &loose_audio);
+            let mut merged_audio = merge_audio_paths(asset.audio_paths.take(), &loose_audio);
+            if merged_audio.is_none() && verified_type == "video" {
+                if video_has_audio_stream_cancellable(
+                    Path::new(&asset.source_path),
+                    ffprobe,
+                    cancel,
+                ) {
+                    merged_audio = Some(vec![strip_verbatim_prefix(&asset.source_path)]);
+                } else if !is_cancelled(cancel) {
+                    merged_audio = Some(Vec::new());
+                }
+            }
             resolved_items.push(to_wallpaper_item(
                 workshop_id,
                 &title,
@@ -1068,6 +1120,15 @@ fn try_read_project(
         None
     };
 
+    let mut audio_paths = merge_audio_paths(None, &loose_audio);
+    if audio_paths.is_none() && effective_type == "video" {
+        if video_has_audio_stream_cancellable(&source_path, ffprobe, cancel) {
+            audio_paths = Some(vec![strip_verbatim_prefix(&src_str)]);
+        } else if !is_cancelled(cancel) {
+            audio_paths = Some(Vec::new());
+        }
+    }
+
     let item = to_wallpaper_item(
         workshop_id,
         &title,
@@ -1086,7 +1147,7 @@ fn try_read_project(
         0,
         has_preview,
         folder_size,
-        merge_audio_paths(None, &loose_audio),
+        audio_paths,
     );
 
     let mut notes = Vec::new();
@@ -1341,16 +1402,44 @@ fn is_image_preview(p: &Path) -> bool {
     p.is_file() && detect_media_type(p) == Some("image")
 }
 
+fn file_sig(path: &Path) -> Option<(u64, u64)> {
+    let meta = fs::metadata(path).ok()?;
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    Some((meta.len(), mtime_ms))
+}
+
 fn can_reuse_cached(
     cached: &WallpaperScanCacheProject,
     workshop_id: &str,
     has_ffmpeg: bool,
+    project_dir: &str,
 ) -> bool {
     if cached.workshop_id != workshop_id
         || cached.type_override.is_some()
         || cached.items.is_empty()
     {
         return false;
+    }
+    let proj_path = Path::new(project_dir);
+    if let Some(expected_pj) = cached.project_json_sig {
+        if file_sig(&proj_path.join("project.json")) != Some(expected_pj) {
+            return false;
+        }
+    }
+    if let Some(expected_src) = cached.source_sig {
+        if file_sig(Path::new(&cached.items[0].source_path)) != Some(expected_src) {
+            return false;
+        }
+    }
+    if let Some(expected_pkg) = cached.pkg_sig {
+        if file_sig(&proj_path.join("scene.pkg")) != Some(expected_pkg) {
+            return false;
+        }
     }
     cached.items.iter().all(|item| {
         item.workshop_id == workshop_id
@@ -1422,6 +1511,10 @@ fn try_save_catalog(
         let Some(mut entry) = entry_by_ws.get(ws_id).cloned() else {
             continue;
         };
+        let proj_path = Path::new(orig_dir);
+        let project_json_sig = file_sig(&proj_path.join("project.json"));
+        let source_sig = proj_items.first().and_then(|it| file_sig(Path::new(&it.source_path)));
+        let pkg_sig = file_sig(&proj_path.join("scene.pkg"));
         entry.item_count = proj_items.len();
         projects.push(WallpaperScanCacheProject {
             workshop_id: ws_id.clone(),
@@ -1429,6 +1522,9 @@ fn try_save_catalog(
             type_override: None,
             items: proj_items,
             entry,
+            project_json_sig,
+            source_sig,
+            pkg_sig,
         });
     }
 
@@ -1500,6 +1596,26 @@ mod tests {
         assert!(!res.items[0].source_path.starts_with(r"\\?\"));
         assert!(!res.items[0].preview_path.starts_with(r"\\?\"));
         assert!(res.report.failed_projects >= 2);
+        // Modifying project.json must invalidate scan cache reuse
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(
+            p_good.join("project.json"),
+            r#"{"title":"Updated Title","type":"image","file":"wall.png"}"#,
+        )
+        .unwrap();
+        let res2 = scan_wallpapers(
+            &[ws.to_string_lossy().into_owned()],
+            true,
+            true,
+            false,
+            false,
+            Some(&catalog),
+            None,
+            |_| {},
+            |_| {},
+        );
+        assert_eq!(res2.items.len(), 1);
+        assert_eq!(res2.items[0].title, "Updated Title");
         let _ = fs::remove_dir_all(&base);
     }
 

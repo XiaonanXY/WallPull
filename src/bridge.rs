@@ -9,22 +9,26 @@ use crate::actions::{
 use crate::clipboard::{copy_media_to_clipboard, copy_text_to_clipboard};
 use crate::duplicates::analyze_duplicates;
 use crate::localsend::{
-    LocalSendEvent, LocalSendHub, OutgoingTransferFile, TransferSource, mime_for_path,
+    LocalSendEvent, LocalSendHub, OutgoingTransferFile, SendProgressInfo, SendTransferError,
+    TransferSource, mime_for_path,
 };
 use crate::media::{find_executable, is_recognized_media_path, probe_or_fallback};
 use crate::models::{
-    AppSettings, AudioTrackPayload, GpuAdapterInfo, ItemPrecomputedMeta, WallpaperItem,
-    WallpaperPayloadItem, WallpaperScanReport, WorkshopExtraMetadata, clean_path_str,
-    strip_verbatim_prefix,
+    AppSettings, AudioTrackPayload, GpuAdapterInfo, ItemPrecomputedMeta, TrustedLanPeer,
+    WallpaperItem, WallpaperPayloadItem, WallpaperScanReport, WorkshopExtraMetadata,
+    clean_path_str, strip_verbatim_prefix,
 };
 use crate::pkg::extract_scene_assets;
 use crate::process_runner::CANCELLED_ERR;
-use crate::scanner::{compute_items_meta, inspect_workshop_extra, scan_wallpapers, scan_wallpapers_with_progress};
+use crate::scanner::{
+    compute_items_meta, inspect_workshop_extra, scan_single_imported_dir, scan_wallpapers,
+    scan_wallpapers_with_progress,
+};
 use crate::scene_studio::{SceneStudioSession, has_inspectable_2d_scene, open_studio_session};
 use crate::settings::{
-    cache_root, calculate_cache_size_bytes, clear_media_cache, get_gpu_adapters,
-    load_settings_from, locate_workshop_roots, resolve_configured_workshop_roots,
-    sanitize_settings, save_settings_to, settings_file_path,
+    append_managed_roots, cache_root, calculate_cache_size_bytes, clear_media_cache,
+    get_gpu_adapters, imported_wallpapers_root, load_settings_from, locate_workshop_roots,
+    resolve_configured_workshop_roots, sanitize_settings, save_settings_to, settings_file_path,
 };
 use crate::we_bridge::{
     apply_custom_image, apply_wallpaper_item, apply_wallpaper_properties,
@@ -43,14 +47,14 @@ use webview2_com::Microsoft::Web::WebView2::Win32::*;
 use webview2_com::{
     CoTaskMemPWSTR, CoreWebView2EnvironmentOptions,
     CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
+    NavigationStartingEventHandler, NewWindowRequestedEventHandler,
     WebMessageReceivedEventHandler, WebResourceRequestedEventHandler,
 };
 use windows::Win32::Foundation::{E_POINTER, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows::Win32::UI::Shell::SHCreateMemStream;
 use windows::Win32::UI::WindowsAndMessaging::{
-    IsZoomed, PostMessageW, PostQuitMessage, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, ShowWindow,
-    WM_APP, WM_CLOSE,
+    IsZoomed, PostMessageW, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, ShowWindow, WM_APP, WM_CLOSE,
 };
 use windows::core::{BOOL, HSTRING, Interface, PCWSTR, PWSTR, w};
 
@@ -120,12 +124,14 @@ pub enum UiCommand {
         request_id: Option<String>,
         ids: Vec<String>,
         format: Option<String>,
+        asset_index: Option<usize>,
     },
     StartPickedExport {
         request_id: Option<String>,
         ids: Vec<String>,
         dest: PathBuf,
         format: Option<String>,
+        asset_index: Option<usize>,
     },
     ExecuteJunctionMigration {
         request_id: Option<String>,
@@ -139,6 +145,7 @@ pub enum UiCommand {
         title: String,
         session: Arc<SceneStudioSession>,
         preview_url: String,
+        baseline_url: String,
         width: i32,
         height: i32,
         has_pixels: bool,
@@ -151,6 +158,28 @@ pub enum UiCommand {
         width: i32,
         height: i32,
         has_pixels: bool,
+    },
+    ApplyCacheSize(i64),
+    ClearCacheCompleted {
+        request_id: Option<String>,
+        freed_mb: f64,
+        after_bytes: i64,
+    },
+    DetectWorkshopCompleted {
+        request_id: Option<String>,
+        detected: Vec<String>,
+    },
+    SetDesktopCompleted {
+        request_id: Option<String>,
+        title: String,
+        result: Result<bool, String>,
+    },
+    LanTrustUpdated(Vec<TrustedLanPeer>),
+    WallpaperImported {
+        items: Vec<WallpaperItem>,
+        metas: HashMap<String, ItemPrecomputedMeta>,
+        title: String,
+        sender_alias: String,
     },
     SelfTestTimeout,
     ExitExplicit,
@@ -189,12 +218,14 @@ pub struct AppController {
     pub watcher_stop: Arc<AtomicBool>,
     pub export_cancel: Arc<AtomicBool>,
     pub export_gen: Arc<AtomicU64>,
+    pub export_busy: Arc<AtomicBool>,
     pub toolbox_busy: Arc<AtomicBool>,
     pub toolbox_cancel: Arc<AtomicBool>,
     pub active_scan_req: Option<String>,
     pub studio_session: Option<(String, Arc<SceneStudioSession>, Option<String>)>,
     pub studio_gen: Arc<AtomicU64>,
     pub studio_preview_bytes: Arc<Mutex<Option<(u64, Arc<Vec<u8>>)>>>,
+    pub studio_baseline_bytes: Arc<Mutex<Option<(u64, Arc<Vec<u8>>)>>>,
     pub localsend: Arc<LocalSendHub>,
     pub exiting_explicitly: bool,
     pub self_test: bool,
@@ -220,10 +251,15 @@ impl AppController {
         let watcher_stop = Arc::new(AtomicBool::new(false));
         let ls_tx = tx.clone();
         let ls_hwnd = hwnd.0 as isize;
-        let localsend = LocalSendHub::start(
+        let ls_use_hw = active_hw_accel == "gpu";
+        let ls_export_dir = settings.export_directory.clone();
+        let localsend = LocalSendHub::start_with_identity(
             settings.localsend_enabled,
             &settings.localsend_alias,
             &settings.export_directory,
+            &settings.localsend_device_id,
+            &settings.localsend_pair_pin,
+            &settings.localsend_trusted_peers,
             !self_test,
             move |ev| match ev {
                 LocalSendEvent::PeersChanged => send_ui(
@@ -234,6 +270,11 @@ impl AppController {
                         payload: json!({}),
                         request_id: None,
                     },
+                ),
+                LocalSendEvent::TrustUpdated(trusted) => send_ui(
+                    &ls_tx,
+                    ls_hwnd,
+                    UiCommand::LanTrustUpdated(trusted),
                 ),
                 LocalSendEvent::FileReceived {
                     message,
@@ -250,8 +291,31 @@ impl AppController {
                         request_id: None,
                     },
                 ),
+                LocalSendEvent::WallpaperImported {
+                    project_dir,
+                    title,
+                    sender_alias,
+                } => {
+                    let tx_inner = ls_tx.clone();
+                    let export_inner = ls_export_dir.clone();
+                    std::thread::spawn(move || {
+                        let items = scan_single_imported_dir(Path::new(&project_dir), ls_use_hw);
+                        let metas = compute_items_meta(&items, &export_inner);
+                        send_ui(
+                            &tx_inner,
+                            ls_hwnd,
+                            UiCommand::WallpaperImported {
+                                items,
+                                metas,
+                                title,
+                                sender_alias,
+                            },
+                        );
+                    });
+                }
             },
         );
+        localsend.set_favorite_ids(&settings.favorite_ids);
         if !self_test {
             start_watcher_thread(
                 tx.clone(),
@@ -289,12 +353,14 @@ impl AppController {
             watcher_stop,
             export_cancel: Arc::new(AtomicBool::new(false)),
             export_gen: Arc::new(AtomicU64::new(0)),
+            export_busy: Arc::new(AtomicBool::new(false)),
             toolbox_busy: Arc::new(AtomicBool::new(false)),
             toolbox_cancel: Arc::new(AtomicBool::new(false)),
             active_scan_req: None,
             studio_session: None,
             studio_gen: Arc::new(AtomicU64::new(0)),
             studio_preview_bytes: Arc::new(Mutex::new(None)),
+            studio_baseline_bytes: Arc::new(Mutex::new(None)),
             localsend,
             exiting_explicitly: false,
             self_test,
@@ -423,6 +489,9 @@ impl AppController {
         let webview = unsafe { ctrl.CoreWebView2() }.map_err(|e| format!("获取 CoreWebView2 失败：{e}"))?;
 
         unsafe {
+            if let Ok(c4) = ctrl.cast::<ICoreWebView2Controller4>() {
+                let _ = c4.SetAllowExternalDrop(false);
+            }
             if let Ok(settings) = webview.Settings() {
                 let _ = settings.SetAreDefaultContextMenusEnabled(false);
                 let _ = settings.SetAreDevToolsEnabled(cfg!(debug_assertions));
@@ -455,9 +524,13 @@ impl AppController {
         unsafe {
             let _ = ctrl.SetIsVisible(true);
         }
+        if !self.self_test {
+            self.focus_webview();
+        }
         self.map_initial_media_roots();
 
         let studio_mem = self.studio_preview_bytes.clone();
+        let studio_base = self.studio_baseline_bytes.clone();
         let env_for_mem = env.clone();
         let mut wrr_token = 0i64;
         unsafe {
@@ -481,7 +554,12 @@ impl AppController {
                     if !uri.starts_with("https://studio-mem.wallpapervault/") {
                         return Ok(());
                     }
-                    let bytes_opt = studio_mem
+                    let slot = if uri.contains("/baseline-") {
+                        &studio_base
+                    } else {
+                        &studio_mem
+                    };
+                    let bytes_opt = slot
                         .lock()
                         .ok()
                         .and_then(|g| g.as_ref().map(|(_, b)| b.clone()));
@@ -504,17 +582,54 @@ impl AppController {
             );
         }
 
-        // Listen for WebMessageReceived and route into AppController via WM_UI_COMMAND
+        // Restrict navigation & popups to internal virtual host only, and validate WebMessage origin
+        let mut nav_token = 0i64;
+        let mut new_win_token = 0i64;
         let tx_msg = self.tx.clone();
         let hwnd_msg = self.hwnd;
         let mut msg_token = 0i64;
         unsafe {
+            let _ = webview.add_NavigationStarting(
+                &NavigationStartingEventHandler::create(Box::new(move |_sender, args| {
+                    let Some(args) = args else {
+                        return Ok(());
+                    };
+                    let mut uri_pw = PWSTR::null();
+                    if args.Uri(&mut uri_pw).is_ok() {
+                        let uri = CoTaskMemPWSTR::from(uri_pw).to_string();
+                        let lower = uri.to_ascii_lowercase();
+                        if !lower.starts_with("https://app.wallpapervault/") && lower != "about:blank" {
+                            let _ = args.SetCancel(true);
+                        }
+                    }
+                    Ok(())
+                })),
+                &mut nav_token,
+            );
+            let _ = webview.add_NewWindowRequested(
+                &NewWindowRequestedEventHandler::create(Box::new(move |_sender, args| {
+                    if let Some(args) = args {
+                        let _ = args.SetHandled(true);
+                    }
+                    Ok(())
+                })),
+                &mut new_win_token,
+            );
             webview
                 .add_WebMessageReceived(
                     &WebMessageReceivedEventHandler::create(Box::new(move |_sender, args| {
                         let Some(args) = args else {
                             return Ok(());
                         };
+                        let mut src_pw = PWSTR::null();
+                        if args.Source(&mut src_pw).is_ok() {
+                            let src = CoTaskMemPWSTR::from(src_pw).to_string();
+                            if !src.to_ascii_lowercase().starts_with("https://app.wallpapervault/") {
+                                return Ok(());
+                            }
+                        } else {
+                            return Ok(());
+                        }
                         let mut msg_pw = PWSTR::null();
                         if args.WebMessageAsJson(&mut msg_pw).is_ok() {
                             let raw_json = CoTaskMemPWSTR::from(msg_pw).to_string();
@@ -618,10 +733,10 @@ impl AppController {
                             "status": format!("解析完成 · {img_cnt} 张图片，{vid_cnt} 个视频 · 共占 {}", format_byte_size(disk_bytes)),
                             "report": report,
                             "detectedWorkshopRoots": self.detected_roots,
-                            "cacheSizeBytes": calculate_cache_size_bytes(),
                         }),
                         request_id.as_deref(),
                     );
+                    self.spawn_cache_size_refresh();
                 }
                 UiCommand::WatcherSyncCompleted {
                     scan_gen,
@@ -701,7 +816,6 @@ impl AppController {
                             "status": format!("解析完成 · {img_cnt} 张图片，{vid_cnt} 个视频 · 共占 {}", format_byte_size(disk_bytes)),
                             "report": report,
                             "detectedWorkshopRoots": self.detected_roots,
-                            "cacheSizeBytes": calculate_cache_size_bytes(),
                             "addedCount": added.len(),
                             "removedCount": removed_cnt,
                             "updatedCount": updated_cnt,
@@ -709,6 +823,7 @@ impl AppController {
                         }),
                         None,
                     );
+                    self.spawn_cache_size_refresh();
                 }
                 UiCommand::ArchiveOfflineCompleted {
                     request_id,
@@ -727,7 +842,13 @@ impl AppController {
                             }
                         }
                     }
-                    let all_items: Vec<WallpaperItem> = self.wallpapers.values().cloned().collect();
+                    let mut all_items: Vec<WallpaperItem> = self.wallpapers.values().cloned().collect();
+                    all_items.sort_by(|a, b| {
+                        a.title
+                            .to_lowercase()
+                            .cmp(&b.title.to_lowercase())
+                            .then_with(|| a.id.cmp(&b.id))
+                    });
                     let updated: Vec<WallpaperPayloadItem> = all_items
                         .iter()
                         .filter_map(|w| self.build_payload_item(w))
@@ -767,6 +888,39 @@ impl AppController {
                 },
                 UiCommand::RefreshScanRequested { request_id, force } => {
                     self.start_scan(request_id, force);
+                }
+                UiCommand::WallpaperImported {
+                    items,
+                    metas,
+                    title,
+                    sender_alias,
+                } => {
+                    let imported_root = clean_path_str(&imported_wallpapers_root());
+                    self.map_media_root("imported-vault.wallpapervault", &imported_root);
+                    self.precomputed_meta.extend(metas);
+                    let mut payloads = Vec::with_capacity(items.len());
+                    for item in &items {
+                        if let Some(p) = self.build_payload_item(item) {
+                            self.wallpapers.insert(item.id.clone(), item.clone());
+                            payloads.push(p);
+                        }
+                    }
+                    if !payloads.is_empty() {
+                        self.sync_watcher_roots();
+                        self.update_localsend_catalog();
+                        self.post_json(
+                            "wallpapers.item",
+                            json!({ "items": payloads, "prepend": true }),
+                            None,
+                        );
+                    }
+                    self.post_json(
+                        "wallpapers.action.result",
+                        json!({
+                            "message": format!("已接收来自「{sender_alias}」的壁纸：{title}，已收入本机壁纸库"),
+                        }),
+                        None,
+                    );
                 }
                 UiCommand::DeleteCompleted {
                     request_id,
@@ -855,11 +1009,11 @@ impl AppController {
                             "items": payloads,
                             "status": format!("解析完成 · {img_cnt} 张图片，{vid_cnt} 个视频 · 共占 {}", format_byte_size(disk_bytes)),
                             "detectedWorkshopRoots": self.detected_roots,
-                            "cacheSizeBytes": calculate_cache_size_bytes(),
                             "settings": self.settings,
                         }),
                         request_id.as_deref(),
                     );
+                    self.spawn_cache_size_refresh();
                     self.post_json(
                         "wallpapers.action.result",
                         json!({ "message": summary, "recycled": recycled_count }),
@@ -891,6 +1045,7 @@ impl AppController {
                     request_id,
                     ids,
                     format,
+                    asset_index,
                 } => {
                     let tx = self.tx.clone();
                     let hwnd = self.hwnd.0 as isize;
@@ -915,6 +1070,7 @@ impl AppController {
                                 ids,
                                 dest,
                                 format,
+                                asset_index,
                             },
                         );
                     });
@@ -924,8 +1080,11 @@ impl AppController {
                     ids,
                     dest,
                     format,
+                    asset_index,
                 } => {
-                    self.start_export_job(ids, dest, format, request_id);
+                    if let Err(err) = self.start_export_job(ids, dest, format, asset_index, request_id.clone()) {
+                        self.post_json("error", json!({ "message": err }), request_id.as_deref());
+                    }
                 }
                 UiCommand::ExecuteJunctionMigration {
                     request_id,
@@ -943,14 +1102,18 @@ impl AppController {
                                 hwnd,
                                 UiCommand::PostJson {
                                     msg_type: "toolbox.progress".into(),
-                                    payload: json!({ "message": msg }),
+                                    payload: json!({
+                                        "taskKind": "migration",
+                                        "message": msg,
+                                        "cancellable": false,
+                                    }),
                                     request_id: None,
                                 },
                             );
                         });
                         busy.store(false, Ordering::SeqCst);
                         match res {
-                            Ok((target_ws, bytes)) => {
+                            Ok((target_ws, bytes, recycled_backup, kept_backup_path)) => {
                                 send_ui(
                                     &tx,
                                     hwnd,
@@ -965,13 +1128,19 @@ impl AppController {
                                         request_id: req.clone(),
                                     },
                                 );
+                                let done_msg = if recycled_backup {
+                                    format!("跨盘搬家成功！已将 {} 无感迁移至 {target_ws}（原备份已在回收站）", format_byte_size(bytes as i64))
+                                } else {
+                                    let bak = kept_backup_path.unwrap_or_default();
+                                    format!("跨盘搬家成功！已将 {} 迁移至 {target_ws}（原备份未进回收站，暂保留于 {bak}）", format_byte_size(bytes as i64))
+                                };
                                 send_ui(
                                     &tx,
                                     hwnd,
                                     UiCommand::PostJson {
                                         msg_type: "wallpapers.action.result".into(),
                                         payload: json!({
-                                            "message": format!("跨盘搬家成功！已将 {} 无感迁移至 {target_ws}（原备份已在回收站）", format_byte_size(bytes as i64)),
+                                            "message": done_msg,
                                             "destination": target_ws,
                                         }),
                                         request_id: req,
@@ -997,6 +1166,7 @@ impl AppController {
                     title,
                     session,
                     preview_url,
+                    baseline_url,
                     width,
                     height,
                     has_pixels,
@@ -1013,6 +1183,7 @@ impl AppController {
                             "title": title,
                             "manifest": session.manifest,
                             "previewUrl": preview_url,
+                            "baselinePreviewUrl": baseline_url,
                             "previewWidth": width,
                             "previewHeight": height,
                             "hasPixels": has_pixels,
@@ -1044,6 +1215,106 @@ impl AppController {
                         request_id.as_deref(),
                     );
                 }
+                UiCommand::ApplyCacheSize(bytes) => {
+                    self.post_json(
+                        "app.state",
+                        json!({
+                            "native": true,
+                            "cacheSizeBytes": bytes,
+                        }),
+                        None,
+                    );
+                }
+                UiCommand::ClearCacheCompleted {
+                    request_id,
+                    freed_mb,
+                    after_bytes,
+                } => {
+                    self.precomputed_meta.clear();
+                    self.post_json(
+                        "app.state",
+                        json!({
+                            "native": true,
+                            "customCaptionButtons": true,
+                            "settings": self.settings,
+                            "detectedWorkshopRoots": self.detected_roots,
+                            "gpuAdapters": self.gpu_adapters,
+                            "activeHardwareAccelerationMode": self.active_hw_accel,
+                            "cacheSizeBytes": after_bytes,
+                        }),
+                        request_id.as_deref(),
+                    );
+                    self.post_json(
+                        "wallpapers.action.result",
+                        json!({ "message": format!("已清理壁纸引擎缓存（释放 {freed_mb:.1} MB 空间），正在重新构建缩略图…") }),
+                        request_id.as_deref(),
+                    );
+                    self.start_scan(request_id, false);
+                }
+                UiCommand::DetectWorkshopCompleted {
+                    request_id,
+                    detected,
+                } => {
+                    self.detected_roots = detected.clone();
+                    for (i, root_path) in detected.iter().enumerate() {
+                        self.map_media_root(&format!("workshop-{i}.wallpapervault"), root_path);
+                    }
+                    if let Some(first) = detected.first() {
+                        self.settings.workshop_root = Some(first.clone());
+                        let _ = save_settings_to(&settings_file_path(), &self.settings);
+                        self.sync_watcher_roots();
+                        self.post_json("settings.value", &self.settings, request_id.as_deref());
+                    }
+                    self.post_json(
+                        "app.state",
+                        json!({
+                            "native": true,
+                            "settings": self.settings,
+                            "detectedWorkshopRoots": self.detected_roots,
+                        }),
+                        request_id.as_deref(),
+                    );
+                    let msg = if let Some(first) = detected.first() {
+                        format!("已自动检测到创意工坊目录：{first}")
+                    } else {
+                        "未在本机磁盘检测到 Wallpaper Engine 创意工坊目录，请手动选择".to_string()
+                    };
+                    self.post_json(
+                        "wallpapers.action.result",
+                        json!({ "message": msg }),
+                        request_id.as_deref(),
+                    );
+                }
+                UiCommand::SetDesktopCompleted {
+                    request_id,
+                    title,
+                    result,
+                } => match result {
+                    Ok(synced) => {
+                        let msg = if synced {
+                            format!("已联动 Wallpaper Engine 切换壁纸：{title}")
+                        } else {
+                            format!("已将「{title}」设为桌面壁纸")
+                        };
+                        self.post_json(
+                            "wallpapers.action.result",
+                            json!({ "message": msg }),
+                            request_id.as_deref(),
+                        );
+                    }
+                    Err(err_msg) => {
+                        self.post_json(
+                            "error",
+                            json!({ "message": err_msg }),
+                            request_id.as_deref(),
+                        );
+                    }
+                },
+                UiCommand::LanTrustUpdated(trusted) => {
+                    self.settings.localsend_trusted_peers = trusted;
+                    let _ = save_settings_to(&settings_file_path(), &self.settings);
+                    self.post_json("localsend.status", self.localsend.status_snapshot(), None);
+                }
                 UiCommand::SelfTestTimeout => {
                     if self.self_test {
                         if let Ok(out_path) = std::env::var("WALLPULL_SELFTEST_OUT") {
@@ -1055,7 +1326,7 @@ impl AppController {
                 UiCommand::ExitExplicit => {
                     self.exiting_explicitly = true;
                     unsafe {
-                        PostQuitMessage(0);
+                        let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
                     }
                 }
             }
@@ -1114,12 +1385,14 @@ impl AppController {
                         "detectedWorkshopRoots": self.detected_roots,
                         "gpuAdapters": self.gpu_adapters,
                         "activeHardwareAccelerationMode": self.active_hw_accel,
-                        "cacheSizeBytes": calculate_cache_size_bytes(),
+                        "cacheSizeBytes": 0,
                         "maximized": maximized,
                         "appVersion": env!("CARGO_PKG_VERSION"),
                     }),
                     req_id.as_deref(),
                 );
+                self.spawn_cache_size_refresh();
+                self.focus_webview();
                 Ok(())
             }
             "window.minimize" => {
@@ -1153,7 +1426,7 @@ impl AppController {
                 }
                 self.exiting_explicitly = true;
                 unsafe {
-                    PostQuitMessage(0);
+                    let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
                 }
                 Ok(())
             }
@@ -1238,20 +1511,24 @@ impl AppController {
                     .and_then(|p| p.get("assetIndex"))
                     .and_then(|v| v.as_u64())
                     .map(|u| u as usize);
-                self.find_wallpaper(id.as_deref()).and_then(|w| {
-                    let synced = apply_wallpaper_item(&w, idx)?;
-                    let msg = if synced {
-                        format!("已联动 Wallpaper Engine 切换壁纸：{}", w.title)
-                    } else {
-                        format!("已将「{}」设为桌面壁纸", w.title)
-                    };
-                    self.post_json(
-                        "wallpapers.action.result",
-                        json!({ "message": msg }),
-                        req_id.as_deref(),
+                let w = self.find_wallpaper(id.as_deref())?;
+                let title = w.title.clone();
+                let tx = self.tx.clone();
+                let hwnd = self.hwnd.0 as isize;
+                let rq = req_id.clone();
+                std::thread::spawn(move || {
+                    let result = apply_wallpaper_item(&w, idx);
+                    send_ui(
+                        &tx,
+                        hwnd,
+                        UiCommand::SetDesktopCompleted {
+                            request_id: rq,
+                            title,
+                            result,
+                        },
                     );
-                    Ok(())
-                })
+                });
+                Ok(())
             }
             "wallpapers.export.request" => {
                 let ids = read_ids(payload);
@@ -1259,8 +1536,12 @@ impl AppController {
                     .and_then(|p| p.get("format"))
                     .and_then(|f| f.as_str())
                     .map(ToString::to_string);
+                let asset_idx = payload
+                    .and_then(|p| p.get("assetIndex"))
+                    .and_then(|v| v.as_u64())
+                    .map(|u| u as usize);
                 let dest = PathBuf::from(&self.settings.export_directory);
-                self.start_export_job(ids, dest, fmt, req_id);
+                self.start_export_job(ids, dest, fmt, asset_idx, req_id)?;
                 Ok(())
             }
             "wallpapers.export-as.request" => {
@@ -1269,10 +1550,15 @@ impl AppController {
                     .and_then(|p| p.get("format"))
                     .and_then(|f| f.as_str())
                     .map(ToString::to_string);
+                let asset_idx = payload
+                    .and_then(|p| p.get("assetIndex"))
+                    .and_then(|v| v.as_u64())
+                    .map(|u| u as usize);
                 self.notify_ui(UiCommand::ExportWithPicker {
                     request_id: req_id.clone(),
                     ids,
                     format: fmt,
+                    asset_index: asset_idx,
                 });
                 Ok(())
             }
@@ -1287,6 +1573,10 @@ impl AppController {
                 let tx = self.tx.clone();
                 let hwnd = self.hwnd.0 as isize;
                 let rq = req_id.clone();
+                let audio_dest = Path::new(&export_dir)
+                    .join("音频")
+                    .to_string_lossy()
+                    .into_owned();
                 std::thread::spawn(move || match export_wallpaper_audio(&w, track_idx, &export_dir) {
                     Ok((count, last_name)) => {
                         let msg = if count == 1 {
@@ -1299,7 +1589,7 @@ impl AppController {
                             hwnd,
                             UiCommand::PostJson {
                                 msg_type: "wallpapers.action.result".into(),
-                                payload: json!({ "message": msg }),
+                                payload: json!({ "message": msg, "destination": audio_dest }),
                                 request_id: rq,
                             },
                         );
@@ -1358,27 +1648,32 @@ impl AppController {
                 if ids.is_empty() {
                     Err("请先选择要清理的冗余壁纸。".to_string())
                 } else {
-                    let allowed: Vec<String> = self
-                        .detected_roots
-                        .iter()
-                        .chain(
-                            resolve_configured_workshop_roots(
-                                self.settings.workshop_root.as_deref(),
+                    let allowed: Vec<String> = append_managed_roots(
+                        self.detected_roots
+                            .iter()
+                            .chain(
+                                resolve_configured_workshop_roots(
+                                    self.settings.workshop_root.as_deref(),
+                                )
+                                .iter(),
                             )
-                            .iter(),
-                        )
-                        .cloned()
-                        .collect();
+                            .cloned()
+                            .collect(),
+                    );
                     let targets: Vec<WallpaperItem> = ids
                         .iter()
                         .filter_map(|id| self.wallpapers.get(id).cloned())
                         .collect();
+                    let also_delete_vault = payload
+                        .and_then(|p| p.get("alsoDeleteVault"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     let export_dir = self.settings.export_directory.clone();
                     let tx = self.tx.clone();
                     let hwnd = self.hwnd.0 as isize;
                     let rq = req_id.clone();
                     std::thread::spawn(move || {
-                        match recycle_workshop_wallpapers(&targets, &allowed, &export_dir) {
+                        match recycle_workshop_wallpapers(&targets, &allowed, &export_dir, also_delete_vault) {
                             Ok((deleted_dirs, recycled_count, total_targets, freed_bytes)) => {
                                 send_ui(
                                     &tx,
@@ -1509,7 +1804,7 @@ impl AppController {
                         || w.item_type != "video"
                         || !w.source_path.to_ascii_lowercase().ends_with(".mp4")
                         || (!ids.is_empty() && w.file_size < 0)
-                        || (ids.is_empty() && w.file_size < 50 * 1024 * 1024)
+                        || (ids.is_empty() && w.file_size < 35 * 1024 * 1024)
                         || !Path::new(&w.source_path).is_file()
                     {
                         continue;
@@ -1989,27 +2284,21 @@ impl AppController {
             }
             "settings.clear-cache.request" => {
                 self.clear_dynamic_media_hosts();
-                let (freed_mb, after_bytes) = clear_media_cache();
-                self.precomputed_meta.clear();
-                self.post_json(
-                    "app.state",
-                    json!({
-                        "native": true,
-                        "customCaptionButtons": true,
-                        "settings": self.settings,
-                        "detectedWorkshopRoots": self.detected_roots,
-                        "gpuAdapters": self.gpu_adapters,
-                        "activeHardwareAccelerationMode": self.active_hw_accel,
-                        "cacheSizeBytes": after_bytes,
-                    }),
-                    req_id.as_deref(),
-                );
-                self.post_json(
-                    "wallpapers.action.result",
-                    json!({ "message": format!("已清理壁纸引擎缓存（释放 {freed_mb:.1} MB 空间），正在重新构建缩略图…") }),
-                    req_id.as_deref(),
-                );
-                self.start_scan(req_id, false);
+                let tx = self.tx.clone();
+                let hwnd = self.hwnd.0 as isize;
+                let rq = req_id.clone();
+                std::thread::spawn(move || {
+                    let (freed_mb, after_bytes) = clear_media_cache();
+                    send_ui(
+                        &tx,
+                        hwnd,
+                        UiCommand::ClearCacheCompleted {
+                            request_id: rq,
+                            freed_mb,
+                            after_bytes,
+                        },
+                    );
+                });
                 Ok(())
             }
             "settings.get.request" => {
@@ -2020,7 +2309,11 @@ impl AppController {
                 let p = payload.ok_or_else(|| "设置内容为空。".to_string())?;
                 let parsed: AppSettings = serde_json::from_value(p.clone())
                     .map_err(|_| "设置内容无效。".to_string())?;
-                self.settings = sanitize_settings(parsed);
+                let mut next = sanitize_settings(parsed);
+                next.localsend_device_id = self.settings.localsend_device_id.clone();
+                next.localsend_pair_pin = self.settings.localsend_pair_pin.clone();
+                next.localsend_trusted_peers = self.settings.localsend_trusted_peers.clone();
+                self.settings = next;
                 save_settings_to(&settings_file_path(), &self.settings)?;
                 self.sync_watcher_roots();
                 self.localsend.update_config(
@@ -2028,6 +2321,7 @@ impl AppController {
                     &self.settings.localsend_alias,
                     &self.settings.export_directory,
                 );
+                self.localsend.set_favorite_ids(&self.settings.favorite_ids);
                 self.apply_window_theme(self.settings.theme_mode == "dark");
                 self.post_json("settings.value", &self.settings, req_id.as_deref());
                 self.post_json(
@@ -2076,36 +2370,20 @@ impl AppController {
                 Ok(())
             }
             "settings.detect-workshop.request" => {
-                let detected = locate_workshop_roots(None);
-                self.detected_roots = detected.clone();
-                for (i, root_path) in detected.iter().enumerate() {
-                    self.map_media_root(&format!("workshop-{i}.wallpapervault"), root_path);
-                }
-                if let Some(first) = detected.first() {
-                    self.settings.workshop_root = Some(first.clone());
-                    let _ = save_settings_to(&settings_file_path(), &self.settings);
-                    self.sync_watcher_roots();
-                    self.post_json("settings.value", &self.settings, req_id.as_deref());
-                }
-                self.post_json(
-                    "app.state",
-                    json!({
-                        "native": true,
-                        "settings": self.settings,
-                        "detectedWorkshopRoots": self.detected_roots,
-                    }),
-                    req_id.as_deref(),
-                );
-                let msg = if let Some(first) = detected.first() {
-                    format!("已自动检测到创意工坊目录：{first}")
-                } else {
-                    "未在本机磁盘检测到 Wallpaper Engine 创意工坊目录，请手动选择".to_string()
-                };
-                self.post_json(
-                    "wallpapers.action.result",
-                    json!({ "message": msg }),
-                    req_id.as_deref(),
-                );
+                let tx = self.tx.clone();
+                let hwnd = self.hwnd.0 as isize;
+                let rq = req_id.clone();
+                std::thread::spawn(move || {
+                    let detected = locate_workshop_roots(None);
+                    send_ui(
+                        &tx,
+                        hwnd,
+                        UiCommand::DetectWorkshopCompleted {
+                            request_id: rq,
+                            detected,
+                        },
+                    );
+                });
                 Ok(())
             }
             "localsend.status.request" => {
@@ -2123,6 +2401,85 @@ impl AppController {
                     self.localsend.status_snapshot(),
                     req_id.as_deref(),
                 );
+                Ok(())
+            }
+            "localsend.rotate-pin.request" => {
+                let new_pin = self.localsend.rotate_pair_pin();
+                self.settings.localsend_pair_pin = new_pin.clone();
+                let _ = save_settings_to(&settings_file_path(), &self.settings);
+                self.post_json(
+                    "localsend.status",
+                    self.localsend.status_snapshot(),
+                    req_id.as_deref(),
+                );
+                self.post_json(
+                    "wallpapers.action.result",
+                    json!({ "message": format!("已刷新配对码：{new_pin}") }),
+                    req_id.as_deref(),
+                );
+                Ok(())
+            }
+            "localsend.unpair-all.request" => {
+                let cleared = self.localsend.clear_trusted_peers();
+                self.settings.localsend_trusted_peers = cleared;
+                let _ = save_settings_to(&settings_file_path(), &self.settings);
+                self.post_json(
+                    "localsend.status",
+                    self.localsend.status_snapshot(),
+                    req_id.as_deref(),
+                );
+                self.post_json(
+                    "wallpapers.action.result",
+                    json!({ "message": "已解除所有局域网设备配对，下次连接需重新输入配对码" }),
+                    req_id.as_deref(),
+                );
+                Ok(())
+            }
+            "localsend.pair.request" => {
+                let peer_fp = payload
+                    .and_then(|p| p.get("peerFingerprint"))
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+                let pin = payload
+                    .and_then(|p| p.get("pin"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let Some(peer) = self.localsend.find_peer(peer_fp.as_deref()) else {
+                    return Err("未找到要配对的目标设备，请刷新局域网扫描后重试。".to_string());
+                };
+                let ls = self.localsend.clone();
+                let tx = self.tx.clone();
+                let hwnd = self.hwnd.0 as isize;
+                let rq = req_id.clone();
+                let fp_ret = peer.fingerprint.clone();
+                std::thread::spawn(move || {
+                    match ls.pair_with_peer(&peer, &pin) {
+                        Ok(msg) => {
+                            send_ui(
+                                &tx,
+                                hwnd,
+                                UiCommand::PostJson {
+                                    msg_type: "localsend.pair.result".into(),
+                                    payload: json!({ "ok": true, "peerFingerprint": fp_ret, "message": msg }),
+                                    request_id: rq,
+                                },
+                            );
+                        }
+                        Err(err) => {
+                            send_ui(
+                                &tx,
+                                hwnd,
+                                UiCommand::PostJson {
+                                    msg_type: "localsend.pair.result".into(),
+                                    payload: json!({ "ok": false, "peerFingerprint": fp_ret, "message": err }),
+                                    request_id: rq,
+                                },
+                            );
+                        }
+                    }
+                });
                 Ok(())
             }
             "localsend.send.request" => {
@@ -2148,32 +2505,100 @@ impl AppController {
                     self.localsend.refresh_discovery();
                     return Err("未在局域网发现已打开的 WallPull iPad 设备，请确认设备处于同一 Wi-Fi 后重试。".to_string());
                 };
-                let items = resolve_target_items(&ids, &self.wallpapers);
-                if items.is_empty() {
+                let raw_items = resolve_target_items(&ids, &self.wallpapers);
+                if raw_items.is_empty() {
                     return Err("未找到对应的有效壁纸文件。".to_string());
                 }
+                let raw_count = raw_items.len();
+                let mut items: Vec<WallpaperItem> = raw_items
+                    .into_iter()
+                    .filter(|w| {
+                        if target_mode == "clipboard" && w.item_type != "image" {
+                            return false;
+                        }
+                        let resolved = resolve_wallpaper_asset_path(
+                            w,
+                            if raw_count == 1 { asset_idx } else { None },
+                        );
+                        Path::new(&resolved).is_file()
+                    })
+                    .collect();
+                if items.is_empty() {
+                    return Err(if target_mode == "clipboard" {
+                        "所选壁纸不是可推入剪贴板的静态图片或文件不存在。".to_string()
+                    } else {
+                        "未找到对应的有效壁纸文件。".to_string()
+                    });
+                }
+                // Small-to-large scheduling: send light images before heavy videos to keep transfers responsive
+                items.sort_by(|a, b| {
+                    let a_vid = u8::from(a.item_type == "video");
+                    let b_vid = u8::from(b.item_type == "video");
+                    a_vid
+                        .cmp(&b_vid)
+                        .then_with(|| a.file_size.cmp(&b.file_size))
+                });
+                let est_total_bytes: u64 = items.iter().map(|w| w.file_size.max(0) as u64).sum();
                 let ls = self.localsend.clone();
                 let tx = self.tx.clone();
                 let hwnd = self.hwnd.0 as isize;
                 let rq = req_id.clone();
+                let ids_for_retry = ids;
                 std::thread::spawn(move || {
+                    let total_items = items.len();
                     let mut out_files = Vec::new();
-                    for w in &items {
-                        let resolved = resolve_wallpaper_asset_path(w, if items.len() == 1 { asset_idx } else { None });
+                    for (idx, w) in items.iter().enumerate() {
+                        let resolved = resolve_wallpaper_asset_path(w, if raw_count == 1 { asset_idx } else { None });
                         let raw_p = PathBuf::from(&resolved);
                         if !raw_p.is_file() {
                             continue;
                         }
-                        if target_mode == "clipboard" && w.item_type != "image" {
-                            continue;
-                        }
                         let (p, file_name, mime_type) = if w.item_type == "video" {
-                            let converted = crate::localsend::ensure_ios_compatible_mp4(
+                            send_ui(
+                                &tx,
+                                hwnd,
+                                UiCommand::PostJson {
+                                    msg_type: "localsend.progress".into(),
+                                    payload: json!(SendProgressInfo {
+                                        title: w.title.clone(),
+                                        stage: "preparing".into(),
+                                        current: idx + 1,
+                                        total: total_items,
+                                        bytes_sent: 0,
+                                        total_bytes: est_total_bytes,
+                                        bytes_per_second: 0,
+                                    }),
+                                    request_id: None,
+                                },
+                            );
+                            let converted = match crate::localsend::ensure_ios_compatible_mp4(
                                 &w.id,
                                 &raw_p,
-                                w.preview_video_path.as_deref(),
-                            )
-                            .unwrap_or_else(|_| raw_p.clone());
+                                None,
+                            ) {
+                                Ok(p) => p,
+                                Err(err) => {
+                                    send_ui(
+                                        &tx,
+                                        hwnd,
+                                        UiCommand::PostJson {
+                                            msg_type: "localsend.progress".into(),
+                                            payload: Value::Null,
+                                            request_id: None,
+                                        },
+                                    );
+                                    send_ui(
+                                        &tx,
+                                        hwnd,
+                                        UiCommand::PostJson {
+                                            msg_type: "error".into(),
+                                            payload: json!({ "message": err }),
+                                            request_id: rq,
+                                        },
+                                    );
+                                    return;
+                                }
+                            };
                             let raw_name = converted
                                 .file_name()
                                 .and_then(|n| n.to_str())
@@ -2210,10 +2635,31 @@ impl AppController {
                         });
                     }
                     let res = if out_files.is_empty() {
-                        Err("所选壁纸不是可推入剪贴板的静态图片或文件不存在。".to_string())
+                        Err(SendTransferError::Message(
+                            "所选壁纸不是可推入剪贴板的静态图片或文件不存在。".to_string(),
+                        ))
                     } else {
-                        ls.send_files_to_peer(&peer, &out_files)
+                        ls.send_files_to_peer_with_progress(&peer, &out_files, |prog| {
+                            send_ui(
+                                &tx,
+                                hwnd,
+                                UiCommand::PostJson {
+                                    msg_type: "localsend.progress".into(),
+                                    payload: json!(prog),
+                                    request_id: None,
+                                },
+                            );
+                        })
                     };
+                    send_ui(
+                        &tx,
+                        hwnd,
+                        UiCommand::PostJson {
+                            msg_type: "localsend.progress".into(),
+                            payload: Value::Null,
+                            request_id: None,
+                        },
+                    );
                     match res {
                         Ok(msg) => send_ui(
                             &tx,
@@ -2224,7 +2670,23 @@ impl AppController {
                                 request_id: rq,
                             },
                         ),
-                        Err(msg) => send_ui(
+                        Err(SendTransferError::PairingRequired) => send_ui(
+                            &tx,
+                            hwnd,
+                            UiCommand::PostJson {
+                                msg_type: "localsend.pairing.required".into(),
+                                payload: json!({
+                                    "peerFingerprint": peer.fingerprint,
+                                    "peerAlias": peer.alias,
+                                    "ids": ids_for_retry,
+                                    "assetIndex": asset_idx,
+                                    "targetMode": target_mode,
+                                    "isStudio": false,
+                                }),
+                                request_id: rq,
+                            },
+                        ),
+                        Err(SendTransferError::Message(msg)) => send_ui(
                             &tx,
                             hwnd,
                             UiCommand::PostJson {
@@ -2243,6 +2705,7 @@ impl AppController {
                 };
                 let wallpaper = self.find_wallpaper(Some(cur_id))?;
                 let visible_set = read_layer_index_set(payload);
+                let visible_for_retry: Vec<usize> = visible_set.iter().copied().collect();
                 let trim_bounds = payload
                     .and_then(|p| p.get("trimBounds"))
                     .and_then(|v| v.as_bool())
@@ -2271,33 +2734,61 @@ impl AppController {
                 let hwnd = self.hwnd.0 as isize;
                 let rq = req_id.clone();
                 std::thread::spawn(move || {
-                    let res = (|| -> Result<String, String> {
-                        let (bytes, r) = session_arc.render_subset_to_png_bytes(
-                            &visible_set,
-                            0,
-                            !include_bg,
-                            !include_bg && trim_bounds,
-                        )?;
+                    let res = (|| -> Result<String, SendTransferError> {
+                        let (bytes, r) = session_arc
+                            .render_subset_to_png_bytes(
+                                &visible_set,
+                                0,
+                                !include_bg,
+                                !include_bg && trim_bounds,
+                            )
+                            .map_err(SendTransferError::Message)?;
                         if !r.has_pixels {
-                            return Err("当前勾选图层画面为空，请至少保留一个可见图层。".to_string());
+                            return Err(SendTransferError::Message(
+                                "当前勾选图层画面为空，请至少保留一个可见图层。".to_string(),
+                            ));
                         }
                         let safe_title = crate::actions::get_safe_file_name(&wallpaper.title, &wallpaper.workshop_id);
                         let suffix = if include_bg { "自定义合成" } else { "透明立绘" };
+                        let content_rating = if !wallpaper.workshop_directory.is_empty() {
+                            Some(crate::scanner::inspect_workshop_extra(&wallpaper.workshop_directory).content_rating)
+                        } else {
+                            None
+                        };
                         let out = vec![OutgoingTransferFile {
                             id: format!("studio-{}", wallpaper.id),
                             file_name: format!("{safe_title} - {suffix}.png"),
                             mime_type: "image/png".to_string(),
                             source: TransferSource::Memory(Arc::new(bytes)),
-                            wallpull_target: target_mode,
+                            wallpull_target: target_mode.clone(),
                             wallpull_kind: if include_bg { "wallpaper" } else { "cutout" }.to_string(),
                             wallpull_title: format!("{} · {suffix}", wallpaper.title),
                             wallpull_resolution: Some(format!("{} × {}", r.width, r.height)),
                             wallpull_item_id: Some(wallpaper.id.clone()),
                             wallpull_has_scene_layers: false,
-                            wallpull_content_rating: None,
+                            wallpull_content_rating: content_rating,
                         }];
-                        ls.send_files_to_peer(&peer, &out)
+                        ls.send_files_to_peer_with_progress(&peer, &out, |prog| {
+                            send_ui(
+                                &tx,
+                                hwnd,
+                                UiCommand::PostJson {
+                                    msg_type: "localsend.progress".into(),
+                                    payload: json!(prog),
+                                    request_id: None,
+                                },
+                            );
+                        })
                     })();
+                    send_ui(
+                        &tx,
+                        hwnd,
+                        UiCommand::PostJson {
+                            msg_type: "localsend.progress".into(),
+                            payload: Value::Null,
+                            request_id: None,
+                        },
+                    );
                     match res {
                         Ok(msg) => send_ui(
                             &tx,
@@ -2308,7 +2799,24 @@ impl AppController {
                                 request_id: rq,
                             },
                         ),
-                        Err(msg) => send_ui(
+                        Err(SendTransferError::PairingRequired) => send_ui(
+                            &tx,
+                            hwnd,
+                            UiCommand::PostJson {
+                                msg_type: "localsend.pairing.required".into(),
+                                payload: json!({
+                                    "peerFingerprint": peer.fingerprint,
+                                    "peerAlias": peer.alias,
+                                    "isStudio": true,
+                                    "visibleLayerIndices": visible_for_retry,
+                                    "trimBounds": trim_bounds,
+                                    "includeBackground": include_bg,
+                                    "targetMode": target_mode,
+                                }),
+                                request_id: rq,
+                            },
+                        ),
+                        Err(SendTransferError::Message(msg)) => send_ui(
                             &tx,
                             hwnd,
                             UiCommand::PostJson {
@@ -2325,24 +2833,56 @@ impl AppController {
         }
     }
 
+    fn spawn_cache_size_refresh(&self) {
+        let tx = self.tx.clone();
+        let hwnd = self.hwnd.0 as isize;
+        std::thread::spawn(move || {
+            let bytes = calculate_cache_size_bytes();
+            send_ui(&tx, hwnd, UiCommand::ApplyCacheSize(bytes));
+        });
+    }
+
     fn start_export_job(
         &mut self,
         ids: Vec<String>,
         dest: PathBuf,
         fmt: Option<String>,
+        asset_index: Option<usize>,
         req_id: Option<String>,
-    ) {
-        self.export_cancel.store(true, Ordering::SeqCst);
+    ) -> Result<(), String> {
+        if self
+            .export_busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("已有导出任务正在进行，请稍候。".to_string());
+        }
         let cancel = Arc::new(AtomicBool::new(false));
         self.export_cancel = cancel.clone();
         let next_gen = self.export_gen.fetch_add(1, Ordering::SeqCst) + 1;
-        let targets = resolve_target_items(&ids, &self.wallpapers);
+        let mut targets = resolve_target_items(&ids, &self.wallpapers);
+        if targets.len() == 1 {
+            if let Some(idx) = asset_index {
+                let has_multi = targets[0].asset_paths.as_ref().map(|a| a.len() > 1).unwrap_or(false);
+                if has_multi {
+                    let chosen = resolve_wallpaper_asset_path(&targets[0], Some(idx));
+                    targets[0].source_path = chosen.clone();
+                    targets[0].asset_paths = Some(vec![chosen]);
+                    if idx > 0 {
+                        targets[0].title = format!("{} ({})", targets[0].title, idx + 1);
+                    }
+                }
+            }
+        }
         let tx = self.tx.clone();
         let hwnd = self.hwnd.0 as isize;
         let gen_ref = self.export_gen.clone();
+        let busy_ref = self.export_busy.clone();
         std::thread::spawn(move || {
-            run_export_thread(&tx, hwnd, targets, dest, fmt, req_id, cancel, gen_ref, next_gen)
+            run_export_thread(&tx, hwnd, targets, dest, fmt, req_id, cancel, gen_ref, next_gen);
+            busy_ref.store(false, Ordering::SeqCst);
         });
+        Ok(())
     }
 
     fn start_scan(&mut self, request_id: Option<String>, force: bool) {
@@ -2380,14 +2920,16 @@ impl AppController {
 
         std::thread::spawn(move || {
             let detected = locate_workshop_roots(None);
-            let roots = if custom_roots.is_empty() {
+            let roots = append_managed_roots(if custom_roots.is_empty() {
                 detected.clone()
             } else {
                 custom_roots
-            };
+            });
 
             let req_progress = request_id.clone();
             let req_batch = request_id.clone();
+            let batched_metas = Arc::new(std::sync::Mutex::new(HashMap::<String, ItemPrecomputedMeta>::new()));
+            let batched_ref = batched_metas.clone();
             let res = scan_wallpapers_with_progress(
                 &roots,
                 parse_scenes,
@@ -2420,6 +2962,9 @@ impl AppController {
                         && !batch.is_empty()
                     {
                         let metas = compute_items_meta(batch, &export_dir);
+                        if let Ok(mut guard) = batched_ref.lock() {
+                            guard.extend(metas.clone());
+                        }
                         send_ui(
                             &tx,
                             hwnd,
@@ -2435,7 +2980,22 @@ impl AppController {
             );
 
             if !cancel.load(Ordering::SeqCst) && gen_ref.load(Ordering::SeqCst) == next_gen {
-                let metas = compute_items_meta(&res.items, &export_dir);
+                let mut metas = batched_metas
+                    .lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                let missing: Vec<WallpaperItem> = res
+                    .items
+                    .iter()
+                    .filter(|w| {
+                        !w.workshop_directory.trim().is_empty()
+                            && !metas.contains_key(&w.workshop_directory.to_ascii_lowercase())
+                    })
+                    .cloned()
+                    .collect();
+                if !missing.is_empty() {
+                    metas.extend(compute_items_meta(&missing, &export_dir));
+                }
                 send_ui(
                     &tx,
                     hwnd,
@@ -2460,25 +3020,35 @@ impl AppController {
         }
         self.cleanup_studio_session(None);
         let studio_gen = self.studio_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let gen_ref = self.studio_gen.clone();
         let tx = self.tx.clone();
         let hwnd = self.hwnd.0 as isize;
         let wp_id = wallpaper.id.clone();
         let title = wallpaper.title.clone();
         let mem_slot = self.studio_preview_bytes.clone();
+        let base_slot = self.studio_baseline_bytes.clone();
 
         std::thread::spawn(move || {
+            if gen_ref.load(Ordering::SeqCst) != studio_gen {
+                return;
+            }
             let Some(session) = open_studio_session(&scene_pkg) else {
-                send_ui(
-                    &tx,
-                    hwnd,
-                    UiCommand::PostJson {
-                        msg_type: "error".into(),
-                        payload: json!({ "message": "未能从该壁纸包解析出可编辑的 2D 图层。" }),
-                        request_id,
-                    },
-                );
+                if gen_ref.load(Ordering::SeqCst) == studio_gen {
+                    send_ui(
+                        &tx,
+                        hwnd,
+                        UiCommand::PostJson {
+                            msg_type: "error".into(),
+                            payload: json!({ "message": "未能从该壁纸包解析出可编辑的 2D 图层。" }),
+                            request_id,
+                        },
+                    );
+                }
                 return;
             };
+            if gen_ref.load(Ordering::SeqCst) != studio_gen {
+                return;
+            }
 
             let default_set: HashSet<usize> = session
                 .manifest
@@ -2490,11 +3060,27 @@ impl AppController {
 
             match session.render_subset_to_png_bytes(&default_set, 1440, true, false) {
                 Ok((png_bytes, r)) => {
+                    if gen_ref.load(Ordering::SeqCst) != studio_gen {
+                        return;
+                    }
+                    let shared_png = Arc::new(png_bytes);
+                    if let Ok(mut guard) = base_slot.lock() {
+                        if gen_ref.load(Ordering::SeqCst) == studio_gen {
+                            *guard = Some((studio_gen, shared_png.clone()));
+                        }
+                    }
                     if let Ok(mut guard) = mem_slot.lock() {
-                        *guard = Some((studio_gen, Arc::new(png_bytes)));
+                        if gen_ref.load(Ordering::SeqCst) == studio_gen {
+                            *guard = Some((studio_gen, shared_png));
+                        }
+                    }
+                    if gen_ref.load(Ordering::SeqCst) != studio_gen {
+                        return;
                     }
                     let preview_url =
                         format!("https://studio-mem.wallpapervault/preview-{studio_gen}.png");
+                    let baseline_url =
+                        format!("https://studio-mem.wallpapervault/baseline-{studio_gen}.png");
                     send_ui(
                         &tx,
                         hwnd,
@@ -2505,6 +3091,7 @@ impl AppController {
                             title,
                             session: Arc::new(session),
                             preview_url,
+                            baseline_url,
                             width: r.width,
                             height: r.height,
                             has_pixels: r.has_pixels,
@@ -2512,15 +3099,17 @@ impl AppController {
                     );
                 }
                 Err(e) => {
-                    send_ui(
-                        &tx,
-                        hwnd,
-                        UiCommand::PostJson {
-                            msg_type: "error".into(),
-                            payload: json!({ "message": e }),
-                            request_id,
-                        },
-                    );
+                    if gen_ref.load(Ordering::SeqCst) == studio_gen {
+                        send_ui(
+                            &tx,
+                            hwnd,
+                            UiCommand::PostJson {
+                                msg_type: "error".into(),
+                                payload: json!({ "message": e }),
+                                request_id,
+                            },
+                        );
+                    }
                 }
             }
         });
@@ -2529,10 +3118,24 @@ impl AppController {
 
     fn start_studio_preview(&mut self, payload: Option<&Value>, request_id: Option<String>) {
         let Some((cur_id, session, _)) = &self.studio_session else {
+            self.post_json(
+                "error",
+                json!({ "message": "透视拆解台尚未打开或已关闭。" }),
+                request_id.as_deref(),
+            );
             return;
         };
         if let Some(req_wp) = payload.and_then(|p| p.get("id")).and_then(|v| v.as_str()) {
             if !req_wp.is_empty() && req_wp != cur_id {
+                self.post_json(
+                    "wallpapers.scene-studio.preview",
+                    json!({
+                        "wallpaperId": req_wp,
+                        "stale": true,
+                        "hasPixels": false,
+                    }),
+                    request_id.as_deref(),
+                );
                 return;
             }
         }
@@ -2543,28 +3146,47 @@ impl AppController {
         let tx = self.tx.clone();
         let hwnd = self.hwnd.0 as isize;
         let mem_slot = self.studio_preview_bytes.clone();
+        let gen_ref = self.studio_gen.clone();
 
         std::thread::spawn(move || {
-            if let Ok((png_bytes, r)) = sess.render_subset_to_png_bytes(&visible_set, 1440, true, false)
-            {
-                if let Ok(mut guard) = mem_slot.lock() {
-                    *guard = Some((studio_gen, Arc::new(png_bytes)));
+            match sess.render_subset_to_png_bytes(&visible_set, 1440, true, false) {
+                Ok((png_bytes, r)) => {
+                    if gen_ref.load(Ordering::SeqCst) != studio_gen {
+                        return;
+                    }
+                    if let Ok(mut guard) = mem_slot.lock() {
+                        *guard = Some((studio_gen, Arc::new(png_bytes)));
+                    }
+                    let preview_url =
+                        format!("https://studio-mem.wallpapervault/preview-{studio_gen}.png");
+                    send_ui(
+                        &tx,
+                        hwnd,
+                        UiCommand::StudioPreviewReady {
+                            request_id,
+                            studio_gen,
+                            wallpaper_id: wp_id,
+                            preview_url,
+                            width: r.width,
+                            height: r.height,
+                            has_pixels: r.has_pixels,
+                        },
+                    );
                 }
-                let preview_url =
-                    format!("https://studio-mem.wallpapervault/preview-{studio_gen}.png");
-                send_ui(
-                    &tx,
-                    hwnd,
-                    UiCommand::StudioPreviewReady {
-                        request_id,
-                        studio_gen,
-                        wallpaper_id: wp_id,
-                        preview_url,
-                        width: r.width,
-                        height: r.height,
-                        has_pixels: r.has_pixels,
-                    },
-                );
+                Err(msg) => {
+                    send_ui(
+                        &tx,
+                        hwnd,
+                        UiCommand::PostJson {
+                            msg_type: "wallpapers.scene-studio.preview".into(),
+                            payload: json!({
+                                "wallpaperId": wp_id,
+                                "error": msg,
+                            }),
+                            request_id,
+                        },
+                    );
+                }
             }
         });
     }
@@ -2637,7 +3259,11 @@ impl AppController {
     }
 
     fn cleanup_studio_session(&mut self, keep_path: Option<&Path>) {
+        self.studio_gen.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut guard) = self.studio_preview_bytes.lock() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = self.studio_baseline_bytes.lock() {
             *guard = None;
         }
         if let Some((_, _, last_prev)) = self.studio_session.take() {
@@ -2705,8 +3331,13 @@ impl AppController {
                 }
                 if let Some(url) = self.try_build_media_url(p) {
                     let size = fs::metadata(path).map(|m| m.len() as i64).unwrap_or(0);
+                    let is_video_src = crate::media::detect_media_type(path) == Some("video");
                     audio_tracks.push(AudioTrackPayload {
-                        name: clean_track_title(p),
+                        name: if is_video_src {
+                            format!("{} (视频原声)", item.title)
+                        } else {
+                            clean_track_title(p)
+                        },
                         url,
                         size,
                     });
@@ -2758,6 +3389,8 @@ impl AppController {
             tags: meta.extra.tags,
             customizable_count: meta.extra.properties.len(),
             is_archived_offline: meta.is_archived_offline,
+            is_slimmable_mp4: item.item_type == "video"
+                && item.source_path.to_ascii_lowercase().ends_with(".mp4"),
             color_bucket: item.color_bucket.clone(),
         })
     }
@@ -2770,6 +3403,9 @@ impl AppController {
         for (idx, root_dir) in roots.iter().enumerate() {
             self.map_media_root(&format!("workshop-{idx}.wallpapervault"), root_dir);
         }
+        let imported_dir = imported_wallpapers_root();
+        let _ = fs::create_dir_all(&imported_dir);
+        self.map_media_root("imported-vault.wallpapervault", &clean_path_str(&imported_dir));
 
         let cache = cache_root();
         for (sub, host) in [
@@ -2808,6 +3444,14 @@ impl AppController {
                 if res.is_ok() {
                     self.mapped_hosts.insert(host.to_string(), norm);
                 }
+            }
+        }
+    }
+
+    pub fn focus_webview(&self) {
+        if let Some(ctrl) = &self.controller {
+            unsafe {
+                let _ = ctrl.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
             }
         }
     }
@@ -2864,11 +3508,11 @@ impl AppController {
 
     fn sync_watcher_roots(&self) {
         let configured = resolve_configured_workshop_roots(self.settings.workshop_root.as_deref());
-        let target = if configured.is_empty() {
+        let target = append_managed_roots(if configured.is_empty() {
             self.detected_roots.clone()
         } else {
             configured
-        };
+        });
         if let Ok(mut guard) = self.watcher_roots.lock() {
             *guard = target;
         }
@@ -2880,6 +3524,30 @@ impl AppController {
     fn update_localsend_catalog(&self) {
         let list: Vec<WallpaperItem> = self.wallpapers.values().cloned().collect();
         self.localsend.update_catalog(&list);
+    }
+}
+
+fn default_group_indices(
+    session: &SceneStudioSession,
+    group: &crate::models::SceneLayerGroup,
+) -> HashSet<usize> {
+    let default_set: HashSet<usize> = session
+        .manifest
+        .layers
+        .iter()
+        .filter(|l| l.default_visible)
+        .map(|l| l.index)
+        .collect();
+    let filtered: HashSet<usize> = group
+        .layer_indices
+        .iter()
+        .copied()
+        .filter(|i| default_set.contains(i))
+        .collect();
+    if filtered.is_empty() {
+        group.layer_indices.iter().copied().collect()
+    } else {
+        filtered
     }
 }
 
@@ -2923,7 +3591,7 @@ fn execute_studio_export_task(
                     .filter(|i| visible_set.contains(i))
                     .collect();
                 if indices.is_empty() {
-                    indices = group.layer_indices.iter().copied().collect();
+                    indices = default_group_indices(session, group);
                 }
                 let r = session.render_subset_to_png(&dest, &indices, 0, true, trim_bounds)?;
                 if !r.has_pixels {
@@ -2955,7 +3623,7 @@ fn execute_studio_export_task(
                 .filter(|i| visible_set.contains(i))
                 .collect();
             if indices.is_empty() {
-                indices = group.layer_indices.iter().copied().collect();
+                indices = default_group_indices(session, group);
             }
             let r = session.render_subset_to_png(&dest, &indices, 0, true, trim_bounds)?;
             if !r.has_pixels {
@@ -2968,13 +3636,25 @@ fn execute_studio_export_task(
             ))
         }
         "set-desktop" => {
-            let cache_dir = cache_root().join("layer-studio");
-            let _ = fs::create_dir_all(&cache_dir);
+            let desk_dir = crate::settings::local_app_data_root().join("AppliedDesktop");
+            let _ = fs::create_dir_all(&desk_dir);
+            if let Ok(entries) = fs::read_dir(&desk_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with("desktop-"))
+                        .unwrap_or(false)
+                    {
+                        let _ = fs::remove_file(&p);
+                    }
+                }
+            }
             let stamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
-            let desk_path = cache_dir.join(format!("desktop-{}-{stamp}.png", wallpaper.workshop_id));
+            let desk_path = desk_dir.join(format!("desktop-{}-{stamp}.png", wallpaper.workshop_id));
             session.render_subset_to_png(&desk_path, visible_set, 0, false, false)?;
             let synced = apply_custom_image(&desk_path, &format!("{} - 拆解画面", wallpaper.title))?;
             Ok(if synced {
@@ -2986,7 +3666,7 @@ fn execute_studio_export_task(
         "copy" => {
             let cache_dir = cache_root().join("layer-studio");
             let _ = fs::create_dir_all(&cache_dir);
-            let copy_path = cache_dir.join(format!("{safe_title} - 拆解透明图.png"));
+            let copy_path = cache_dir.join(format!("studio-clip-{safe_title}.png"));
             let r = session.render_subset_to_png(
                 &copy_path,
                 visible_set,
@@ -3599,7 +4279,7 @@ fn cleanup_studio_cache_dir(cache_dir: &Path, keep_path: Option<&Path>) {
             let is_studio_png = p
                 .file_name()
                 .and_then(|n| n.to_str())
-                .map(|n| n.starts_with("studio-") && n.ends_with(".png"))
+                .map(|n| (n.starts_with("studio-") || n.starts_with("desktop-")) && n.ends_with(".png"))
                 .unwrap_or(false);
             if !is_studio_png {
                 continue;

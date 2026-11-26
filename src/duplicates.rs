@@ -93,10 +93,11 @@ where
         };
     }
 
+    let mut full_hash_cache: HashMap<String, Option<String>> = HashMap::new();
     let mut parent: Vec<usize> = (0..valid.len()).collect();
     for i in 0..valid.len() {
         for j in (i + 1)..valid.len() {
-            if is_match(&valid[i], &valid[j]) {
+            if is_match(&valid[i], &valid[j], &mut full_hash_cache) {
                 let ra = uf_find(&mut parent, i);
                 let rb = uf_find(&mut parent, j);
                 if ra != rb {
@@ -128,10 +129,22 @@ where
         });
 
         let anchor = cluster[0];
-        let mut members = Vec::with_capacity(cluster.len());
+        let direct_cluster: Vec<&VisualFingerprint<'_>> = std::iter::once(anchor)
+            .chain(
+                cluster[1..]
+                    .iter()
+                    .copied()
+                    .filter(|cur| is_match(anchor, cur, &mut full_hash_cache)),
+            )
+            .collect();
+        if direct_cluster.len() < 2 {
+            continue;
+        }
+
+        let mut members = Vec::with_capacity(direct_cluster.len());
         let mut group_reclaimable = 0i64;
 
-        for (i, cur) in cluster.iter().enumerate() {
+        for (i, cur) in direct_cluster.iter().enumerate() {
             let Some(payload_item) = build_payload(cur.item) else {
                 continue;
             };
@@ -144,7 +157,7 @@ where
                     cur.item.file_size
                 };
                 group_reclaimable += reclaim;
-                describe_match(anchor, cur)
+                describe_match(anchor, cur, &mut full_hash_cache)
             };
             members.push(DuplicateGroupMemberPayload {
                 item: payload_item,
@@ -185,12 +198,29 @@ fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
     x
 }
 
-fn is_match(a: &VisualFingerprint<'_>, b: &VisualFingerprint<'_>) -> bool {
-    if a.exact_digest.is_some()
-        && a.item.file_size > 0
-        && a.item.file_size == b.item.file_size
-        && a.exact_digest == b.exact_digest
+fn is_exact_same_file(
+    a: &VisualFingerprint<'_>,
+    b: &VisualFingerprint<'_>,
+    full_hash_cache: &mut HashMap<String, Option<String>>,
+) -> bool {
+    if a.exact_digest.is_none()
+        || a.item.file_size <= 0
+        || a.item.file_size != b.item.file_size
+        || a.exact_digest != b.exact_digest
     {
+        return false;
+    }
+    let ha = cached_full_sha256(&a.item.source_path, full_hash_cache);
+    let hb = cached_full_sha256(&b.item.source_path, full_hash_cache);
+    matches!((ha, hb), (Some(x), Some(y)) if x == y)
+}
+
+fn is_match(
+    a: &VisualFingerprint<'_>,
+    b: &VisualFingerprint<'_>,
+    full_hash_cache: &mut HashMap<String, Option<String>>,
+) -> bool {
+    if is_exact_same_file(a, b, full_hash_cache) {
         return true;
     }
     if a.luma_range < 14 || b.luma_range < 14 {
@@ -207,15 +237,16 @@ fn is_match(a: &VisualFingerprint<'_>, b: &VisualFingerprint<'_>) -> bool {
     (dr * dr + dg * dg + db * db).sqrt() < 42.0
 }
 
-fn describe_match(anchor: &VisualFingerprint<'_>, cand: &VisualFingerprint<'_>) -> (i32, String) {
-    if anchor.exact_digest.is_some()
-        && anchor.item.file_size == cand.item.file_size
-        && anchor.exact_digest == cand.exact_digest
-    {
+fn describe_match(
+    anchor: &VisualFingerprint<'_>,
+    cand: &VisualFingerprint<'_>,
+    full_hash_cache: &mut HashMap<String, Option<String>>,
+) -> (i32, String) {
+    if is_exact_same_file(anchor, cand, full_hash_cache) {
         return (100, "完全相同源文件".to_string());
     }
     let d_dist = (anchor.d_hash ^ cand.d_hash).count_ones() as f64;
-    let sim = (100.0 - (d_dist / 64.0 * 100.0)).round().clamp(75.0, 99.0) as i32;
+    let sim = (100.0 - (d_dist / 64.0 * 100.0)).round().clamp(0.0, 99.0) as i32;
     let anchor_px = parse_pixel_count(anchor.item.resolution.as_deref());
     let cand_px = parse_pixel_count(cand.item.resolution.as_deref());
     let reason = if cand_px > 0 && anchor_px > cand_px {
@@ -412,6 +443,32 @@ fn compute_fingerprint(item: &WallpaperItem) -> Option<VisualFingerprint<'_>> {
     })
 }
 
+fn cached_full_sha256(
+    path_str: &str,
+    cache: &mut HashMap<String, Option<String>>,
+) -> Option<String> {
+    if let Some(hit) = cache.get(path_str) {
+        return hit.clone();
+    }
+    let computed = try_full_sha256(Path::new(path_str));
+    cache.insert(path_str.to_string(), computed.clone());
+    computed
+}
+
+fn try_full_sha256(path: &Path) -> Option<String> {
+    let mut f = File::open(path).ok()?;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut hasher = Sha256::new();
+    loop {
+        let n = f.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Some(hex::encode_upper(hasher.finalize()))
+}
+
 fn try_prefix_digest(path: &Path) -> Option<String> {
     let mut f = File::open(path).ok()?;
     let mut buf = vec![0u8; 65536];
@@ -511,6 +568,7 @@ mod tests {
                 tags: Vec::new(),
                 customizable_count: 0,
                 is_archived_offline: false,
+                is_slimmable_mp4: false,
                 color_bucket: w.color_bucket.clone(),
             })
         });
@@ -518,5 +576,74 @@ mod tests {
         assert_eq!(res.groups[0].members.len(), 2);
         assert!(res.groups[0].members[0].recommended_keep);
         assert_eq!(res.groups[0].members[0].item.id, "101");
+    }
+
+    #[test]
+    fn transitive_chain_excludes_unrelated_tail_member() {
+        let make_fp = |id: &str, res: &str, d_hash: u64, a_hash: u64| WallpaperItem {
+            id: id.to_string(),
+            workshop_id: id.to_string(),
+            title: id.to_string(),
+            item_type: "image".to_string(),
+            preview_path: "nonexistent.png".to_string(),
+            source_path: "nonexistent.png".to_string(),
+            workshop_directory: format!("C:\\ws\\{id}"),
+            original_type: "image".to_string(),
+            resolution: Some(res.to_string()),
+            duration: None,
+            file_size: 1000,
+            asset_paths: None,
+            has_preview: false,
+            preview_video_path: None,
+            folder_size: 2000,
+            audio_paths: None,
+            color_bucket: Some("blue".to_string()),
+            visual_fingerprint: Some(CachedVisualFingerprint {
+                d_hash,
+                a_hash,
+                mean_r: 100.0,
+                mean_g: 100.0,
+                mean_b: 100.0,
+                luma_range: 80,
+                exact_digest: None,
+            }),
+        };
+        // A (d=0), B (d=0x3F = 6 bits), C (d=0x3FC = bits 2..9: dist(B,C)=4<=8, dist(A,C)=8.. wait 0x3FF has 10 bits from A and 4 bits from B)
+        let items = vec![
+            make_fp("A", "3840 × 2160", 0b00_0000_0000, 0),
+            make_fp("B", "2560 × 1440", 0b00_0011_1111, 0),
+            make_fp("C", "1920 × 1080", 0b11_1111_1111, 0),
+        ];
+        let res = analyze_duplicates(&items, |w| {
+            Some(WallpaperPayloadItem {
+                id: w.id.clone(),
+                workshop_id: w.workshop_id.clone(),
+                title: w.title.clone(),
+                item_type: w.item_type.clone(),
+                original_type: w.original_type.clone(),
+                preview_url: None,
+                preview_video_url: None,
+                media_url: String::new(),
+                asset_urls: Vec::new(),
+                resolution: w.resolution.clone(),
+                duration: None,
+                file_size: w.file_size,
+                folder_size: w.folder_size,
+                audio_tracks: Vec::new(),
+                has_audio: false,
+                has_preview: false,
+                has_scene_layers: false,
+                asset_count: 1,
+                content_rating: "Everyone".to_string(),
+                tags: Vec::new(),
+                customizable_count: 0,
+                is_archived_offline: false,
+                is_slimmable_mp4: false,
+                color_bucket: w.color_bucket.clone(),
+            })
+        });
+        assert_eq!(res.groups.len(), 1);
+        let ids: Vec<&str> = res.groups[0].members.iter().map(|m| m.item.id.as_str()).collect();
+        assert_eq!(ids, vec!["A", "B"]);
     }
 }

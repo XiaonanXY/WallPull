@@ -1,7 +1,76 @@
 import SwiftUI
 import UIKit
 
-struct WallpaperCardView: View {
+struct ShadowRoundedPlate: UIViewRepresentable {
+    let fillColor: Color
+    var cornerRadius: CGFloat = 16
+    var shadowOpacity: Float = 0.08
+    var shadowRadius: CGFloat = 5
+    var shadowOffsetY: CGFloat = 2.5
+
+    final class PlateView: UIView {
+        var radius: CGFloat = 16
+        private var lastSize: CGSize = .zero
+
+        override init(frame: CGRect) {
+            super.init(frame: frame)
+            isUserInteractionEnabled = false
+            layer.cornerCurve = .continuous
+            layer.masksToBounds = false
+        }
+
+        required init?(coder: NSCoder) {
+            fatalError("init(coder:) has not been implemented")
+        }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            if bounds.size != lastSize {
+                lastSize = bounds.size
+                layer.shadowPath = UIBezierPath(roundedRect: bounds, cornerRadius: radius).cgPath
+            }
+        }
+    }
+
+    func makeUIView(context: Context) -> PlateView {
+        let v = PlateView()
+        apply(to: v)
+        return v
+    }
+
+    func updateUIView(_ uiView: PlateView, context: Context) {
+        apply(to: uiView)
+    }
+
+    private func apply(to v: PlateView) {
+        v.radius = cornerRadius
+        v.backgroundColor = UIColor(fillColor)
+        v.layer.cornerRadius = cornerRadius
+        v.layer.shadowColor = UIColor.black.cgColor
+        v.layer.shadowOpacity = shadowOpacity
+        v.layer.shadowRadius = shadowRadius
+        v.layer.shadowOffset = CGSize(width: 0, height: shadowOffsetY)
+    }
+}
+
+struct WallpaperCardView: View, Equatable {
+    static func == (lhs: WallpaperCardView, rhs: WallpaperCardView) -> Bool {
+        lhs.item == rhs.item
+            && lhs.thumbURL == rhs.thumbURL
+            && lhs.mediaURL == rhs.mediaURL
+            && lhs.previewVideoURL == rhs.previewVideoURL
+            && lhs.accentColor == rhs.accentColor
+            && lhs.aspectMode == rhs.aspectMode
+            && lhs.showCaption == rhs.showCaption
+            && lhs.showFileSizeInSubtitle == rhs.showFileSizeInSubtitle
+            && lhs.autoPlayVideo == rhs.autoPlayVideo
+            && lhs.isGalleryPaused == rhs.isGalleryPaused
+            && lhs.thumbRevision == rhs.thumbRevision
+            && lhs.isSelecting == rhs.isSelecting
+            && lhs.isSelected == rhs.isSelected
+            && lhs.isNewlyLanded == rhs.isNewlyLanded
+            && lhs.colorScheme == rhs.colorScheme
+    }
     let item: VaultItem
     let thumbURL: URL?
     let mediaURL: URL
@@ -17,6 +86,7 @@ struct WallpaperCardView: View {
     let isSelecting: Bool
     let isSelected: Bool
     let isNewlyLanded: Bool
+    let colorScheme: ColorScheme
     let onSettledLanding: () -> Void
     let onTap: () -> Void
     let onToggleSelectItem: () -> Void
@@ -27,8 +97,6 @@ struct WallpaperCardView: View {
     let onSendLocalSend: () -> Void
     let onToggleFavorite: () -> Void
     let onDelete: () -> Void
-
-    @Environment(\.colorScheme) private var colorScheme
 
     private var cardShape: RoundedRectangle {
         RoundedRectangle(cornerRadius: 16, style: .continuous)
@@ -72,15 +140,16 @@ struct WallpaperCardView: View {
                                 RetinaCardImageView(
                                     url: thumbURL ?? mediaURL,
                                     isCutout: item.isTransparentCutout,
-                                    revision: thumbRevision
+                                    revision: thumbRevision,
+                                    fallbackSymbol: item.mediaType == .video ? "film" : "photo"
                                 )
 
-                                if item.mediaType == .video && autoPlayVideo && !isGalleryPaused && !isSelecting {
+                                if item.mediaType == .video && autoPlayVideo && !isGalleryPaused {
                                     GalleryInlineVideoView(
                                         id: item.id,
                                         url: previewVideoURL,
                                         fallbackURL: mediaURL,
-                                        isActive: !isGalleryPaused && !isSelecting
+                                        isActive: !isGalleryPaused
                                     )
                                 }
 
@@ -89,13 +158,13 @@ struct WallpaperCardView: View {
                         )
                         .clipShape(cardShape)
                         .background(
-                            cardShape
-                                .fill(WallPullPalette.cardSurface(colorScheme))
-                                .shadow(
-                                    color: .black.opacity(colorScheme == .dark ? 0.34 : 0.09),
-                                    radius: isSelected ? 10 : 6,
-                                    y: 3
-                                )
+                            ShadowRoundedPlate(
+                                fillColor: WallPullPalette.cardSurface(colorScheme),
+                                cornerRadius: 16,
+                                shadowOpacity: colorScheme == .dark ? 0.28 : 0.08,
+                                shadowRadius: 5,
+                                shadowOffsetY: 2.5
+                            )
                         )
                         .overlay(
                             Group {
@@ -127,6 +196,7 @@ struct WallpaperCardView: View {
                 .overlay(alignment: .topTrailing) {
                     if !isSelecting {
                         PulseHeartButton(isFavorite: item.isFavorite, onToggle: onToggleFavorite)
+                            .wallPullMinimumHitArea(28)
                             .padding(9)
                     }
                 }
@@ -135,7 +205,7 @@ struct WallpaperCardView: View {
                 Button(action: onToggleSelectItem) {
                     Label(
                         isSelected ? "取消多选此项" : "加入多选",
-                        systemImage: isSelected ? "checkmark.circle.badge.xmark" : "checkmark.circle"
+                        systemImage: isSelected ? "minus.circle" : "checkmark.circle"
                     )
                 }
                 Divider()
@@ -210,7 +280,7 @@ struct WallpaperCardView: View {
                 HStack(spacing: 5) {
                     if item.allMediaFileNames.count > 1 {
                         HStack(spacing: 3) {
-                            Image(systemName: "photo.stack")
+                            Image(systemName: "square.stack")
                                 .font(.system(size: 9.5, weight: .bold))
                             Text("\(item.allMediaFileNames.count) 张")
                                 .font(.system(size: 10.5, weight: .semibold, design: .rounded))

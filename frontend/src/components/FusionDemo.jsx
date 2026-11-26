@@ -14,7 +14,7 @@ import './FusionDemo.css'
 
 const CARD_RADIUS = 16
 
-function PreviewCard({
+const PreviewCard = memo(function PreviewCard({
   item,
   mode,
   selected,
@@ -24,7 +24,7 @@ function PreviewCard({
   cardSize,
   selectionBorderMode,
   paused = false,
-  onContextMenu,
+  onContextMenuItem,
   onToggleFavorite,
   onSelect,
   onToggleSelect,
@@ -222,13 +222,18 @@ function PreviewCard({
     }
   }
 
+  const handleContextMenu = event => {
+    event.preventDefault()
+    onContextMenuItem?.(item, event.clientX, event.clientY)
+  }
+
   return (
     <article
       className="fusion-card"
       role="button"
       tabIndex={0}
       onClick={handleClick}
-      onContextMenu={onContextMenu}
+      onContextMenu={handleContextMenu}
       onKeyDown={handleKeyDown}
       aria-label={item.title}
       aria-selected={selected}
@@ -237,7 +242,7 @@ function PreviewCard({
       {content}
     </article>
   )
-}
+})
 
 const FusionDemo = memo(function FusionDemo({
   items,
@@ -290,10 +295,7 @@ const FusionDemo = memo(function FusionDemo({
                   cardSize={cardSize}
                   selectionBorderMode={selectionBorderMode}
                   paused={paused}
-                  onContextMenu={event => {
-                    event.preventDefault()
-                    onContextMenuItem?.(item, event.clientX, event.clientY)
-                  }}
+                  onContextMenuItem={onContextMenuItem}
                   onToggleFavorite={onToggleFavorite}
                   onSelect={onSelect}
                   onToggleSelect={onToggleSelect}

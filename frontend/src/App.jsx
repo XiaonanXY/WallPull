@@ -32,8 +32,9 @@ import DeleteConfirmDialog from './components/DeleteConfirmDialog.jsx'
 import DuplicateInspectorDialog from './components/DuplicateInspectorDialog.jsx'
 import SceneLayerStudioDialog from './components/SceneLayerStudioDialog.jsx'
 import SuperToolboxDialog from './components/SuperToolboxDialog.jsx'
-import CallChip from './components/reactbits/CallChip.jsx'
-import FluxProgressBar from './components/reactbits/FluxProgressBar.jsx'
+import FloatingActivityIsland from './components/ui/FloatingActivityIsland.jsx'
+import OtpPinInput from './components/ui/OtpPinInput.jsx'
+import StackedToaster from './components/ui/StackedToaster.jsx'
 import LatticeLoader from './components/reactbits/LatticeLoader.jsx'
 import ShinyText from './components/reactbits/ShinyText.jsx'
 import TechText from './components/reactbits/TechText.jsx'
@@ -86,13 +87,15 @@ export default function App() {
   const filterPopoverRef = useRef(null)
   const [status, setStatus] = useState('正在连接本机壁纸库…')
   const [errorMessage, setErrorMessage] = useState(null)
-  const [toastState, setToastState] = useState(null)
+  const [toasts, setToasts] = useState([])
   const [loading, setLoading] = useState(true)
   const [isMaximized, setIsMaximized] = useState(false)
   const [customCaptionButtons, setCustomCaptionButtons] = useState(false)
   const [appVersion, setAppVersion] = useState(APP_INFO.version)
   const [checkingUpdate, setCheckingUpdate] = useState(false)
-  const toastTimerRef = useRef(null)
+  const toastTimersRef = useRef(new Map())
+  const toastHoveredRef = useRef(false)
+  const nextToastIdRef = useRef(1)
   const [sparkSizeText, setSparkSizeText] = useState(String(DEFAULT_SETTINGS.sparkSizePercent))
   const [gridLayout, setGridLayout] = useState({
     columns: 3,
@@ -113,7 +116,9 @@ export default function App() {
   const [dupState, setDupState] = useState({ open: false, loading: false, result: null })
   const [deleteTargets, setDeleteTargets] = useState([])
   const [localsendStatus, setLocalsendStatus] = useState({ enabled: true, alias: 'WallPull PC', port: 53417, localIps: [], peers: [] })
+  const [localsendProgress, setLocalsendProgress] = useState(null)
   const [peerPickerState, setPeerPickerState] = useState(null)
+  const [pairingPromptState, setPairingPromptState] = useState(null)
   const [scanProgress, setScanProgress] = useState(null)
   const [colorIndexProgress, setColorIndexProgress] = useState({ running: false, indexed: 0, total: 0 })
   const deferredQuery = useDeferredValue(query)
@@ -121,16 +126,45 @@ export default function App() {
   const wheelTurnStampRef = useRef(0)
   const latestScanRequestId = useRef(null)
   const activeToolboxRequestId = useRef(null)
+  const latestUpdateCheckReqIdRef = useRef(null)
+  const latestWePropsReqIdRef = useRef(null)
+  const pairingPromptRef = useRef(null)
+  pairingPromptRef.current = pairingPromptState
   const lastSelectedIdRef = useRef(null)
   const hasHydratedFiltersRef = useRef(false)
+  const [globalAudio, setGlobalAudio] = useState(null)
+  const globalAudioRef = useRef(null)
+  const pendingAutoPlayRef = useRef(false)
   const isNative = Boolean(globalThis.chrome?.webview)
+
+  useEffect(() => () => {
+    const timers = toastTimersRef.current
+    timers.forEach(t => globalThis.clearTimeout(t))
+    timers.clear()
+  }, [])
+
+  useEffect(() => {
+    const preventDropNavigation = event => {
+      event.preventDefault()
+    }
+    globalThis.addEventListener('dragover', preventDropNavigation)
+    globalThis.addEventListener('drop', preventDropNavigation)
+    return () => {
+      globalThis.removeEventListener('dragover', preventDropNavigation)
+      globalThis.removeEventListener('drop', preventDropNavigation)
+    }
+  }, [])
 
   const sendNativeMessage = useCallback((type, payload = {}) => {
     if (!isNative) return null
+    const requestId = createRequestId()
     if (type === 'wallpapers.we-properties.get') {
+      latestWePropsReqIdRef.current = requestId
       setWePropertiesState({ id: payload?.id ?? null, loading: true, properties: [] })
     }
-    const requestId = createRequestId()
+    if (type === 'app.check-update.request') {
+      latestUpdateCheckReqIdRef.current = requestId
+    }
     if (type === 'settings.clear-cache.request') {
       resetRevealedMedia()
       resetColorCache()
@@ -146,9 +180,7 @@ export default function App() {
       'toolbox.migration.execute',
       'wallpapers.slim-videos.request',
     ].includes(type)) {
-      if (!activeToolboxRequestId.current) {
-        activeToolboxRequestId.current = requestId
-      }
+      activeToolboxRequestId.current = requestId
       setToolboxBusy(true)
       setToolboxCancelling(false)
       setToolboxProgress({
@@ -177,11 +209,18 @@ export default function App() {
     return requestId
   }, [isNative])
 
-  const persistSettings = useCallback(nextSettings => {
-    setSettings(nextSettings)
-    setSavedSettings(nextSettings)
-    sendNativeMessage('settings.update.request', nextSettings)
-  }, [sendNativeMessage])
+  const savedSettingsRef = useRef(savedSettings)
+  savedSettingsRef.current = savedSettings
+
+  const persistSettings = useCallback((patchOrFull, uiSettings = null) => {
+    const base = savedSettingsRef.current
+    const nextSaved = { ...base, ...patchOrFull }
+    const isPatchOnly = uiSettings === null && Object.keys(patchOrFull || {}).length < Object.keys(base || {}).length
+    const nextUi = uiSettings ?? (isPatchOnly ? { ...settings, ...patchOrFull } : nextSaved)
+    setSettings(nextUi)
+    setSavedSettings(nextSaved)
+    sendNativeMessage('settings.update.request', nextSaved)
+  }, [sendNativeMessage, settings])
 
   const updateFilterPreferences = useCallback(patch => {
     const nextMedia = patch.mediaFilter !== undefined ? patch.mediaFilter : filter
@@ -197,32 +236,54 @@ export default function App() {
     if (patch.colorFilter !== undefined) setColorFilter(nextColor)
 
     persistSettings({
-      ...settings,
       mediaFilter: nextMedia,
       specFilter: nextSpec,
       ratingFilter: nextRating,
       sortBy: nextSort,
       colorFilter: nextColor,
     })
-  }, [colorFilter, filter, persistSettings, ratingFilter, settings, sortBy, specFilter])
+  }, [colorFilter, filter, persistSettings, ratingFilter, sortBy, specFilter])
+
+  const dismissToast = useCallback(id => {
+    const timer = toastTimersRef.current.get(id)
+    if (timer) {
+      globalThis.clearTimeout(timer)
+      toastTimersRef.current.delete(id)
+    }
+    setToasts(prev => prev.filter(t => t.id !== id))
+  }, [])
+
+  const scheduleToastDismiss = useCallback((id, delayMs) => {
+    const existing = toastTimersRef.current.get(id)
+    if (existing) globalThis.clearTimeout(existing)
+    const timer = globalThis.setTimeout(() => {
+      toastTimersRef.current.delete(id)
+      if (toastHoveredRef.current) {
+        scheduleToastDismiss(id, 1200)
+        return
+      }
+      setToasts(prev => prev.filter(t => t.id !== id))
+    }, delayMs)
+    toastTimersRef.current.set(id, timer)
+  }, [])
 
   const showToast = useCallback((message, options = {}) => {
     if (!message) return
     const nextStatus = options.status || 'done'
-    setToastState({
+    const id = nextToastIdRef.current++
+    const entry = {
+      id,
       message,
       status: nextStatus,
       destination: options.destination || null,
       actionLabel: options.actionLabel || null,
       actionUrl: options.actionUrl || null,
-    })
-    if (toastTimerRef.current) globalThis.clearTimeout(toastTimerRef.current)
-    if (nextStatus !== 'running') {
-      toastTimerRef.current = globalThis.setTimeout(() => {
-        setToastState(null)
-      }, options.destination || options.actionUrl ? 5000 : 2500)
     }
-  }, [])
+    setToasts(prev => [...prev.slice(-4), entry])
+    if (nextStatus !== 'running') {
+      scheduleToastDismiss(id, options.destination || options.actionUrl ? 5000 : 2800)
+    }
+  }, [scheduleToastDismiss])
 
   const openExternalUrl = useCallback(({ url, copyText, toastMessage } = {}) => {
     if (!url) return
@@ -339,11 +400,8 @@ export default function App() {
       if (message.type === 'app.state') {
         if (message.payload?.settings) {
           const incomingSettings = message.payload.settings
-          setSettings(previous => {
-            const merged = { ...previous, ...incomingSettings }
-            setSavedSettings(merged)
-            return merged
-          })
+          setSettings(previous => ({ ...previous, ...incomingSettings }))
+          setSavedSettings(previous => ({ ...previous, ...incomingSettings }))
           setSparkSizeText(String(incomingSettings.sparkSizePercent ?? 0))
           if (!hasHydratedFiltersRef.current) {
             hasHydratedFiltersRef.current = true
@@ -383,11 +441,8 @@ export default function App() {
         }
       }
       if (message.type === 'settings.value') {
-        setSettings(previous => {
-          const merged = { ...previous, ...message.payload }
-          setSavedSettings(merged)
-          return merged
-        })
+        setSettings(previous => ({ ...previous, ...message.payload }))
+        setSavedSettings(previous => ({ ...previous, ...message.payload }))
         setSparkSizeText(String(message.payload?.sparkSizePercent ?? 0))
       }
       if (message.type === 'wallpapers.scan.status') {
@@ -402,9 +457,14 @@ export default function App() {
       }
       if (message.type === 'wallpapers.item') {
         const incoming = message.payload?.items ?? []
+        const prepend = Boolean(message.payload?.prepend)
         if (incoming.length > 0) {
           startTransition(() => {
             setWallpapers(previous => {
+              if (prepend) {
+                const incomingIds = new Set(incoming.map(item => item.id))
+                return [...incoming, ...previous.filter(item => !incomingIds.has(item.id))]
+              }
               const byId = new Map(previous.map(item => [item.id, item]))
               incoming.forEach(item => byId.set(item.id, item))
               return [...byId.values()]
@@ -459,11 +519,63 @@ export default function App() {
           setLocalsendStatus(message.payload)
         }
       }
+      if (message.type === 'localsend.progress') {
+        const p = message.payload
+        setLocalsendProgress(p && typeof p === 'object' ? p : null)
+      }
+      if (message.type === 'localsend.pairing.required') {
+        const p = message.payload
+        if (p?.peerFingerprint) {
+          setPairingPromptState({
+            peerFingerprint: p.peerFingerprint,
+            peerAlias: p.peerAlias || 'WallPull iPad',
+            pendingAction: p,
+            pin: '',
+            submitting: false,
+            error: '',
+          })
+        }
+      }
+      if (message.type === 'localsend.pair.result') {
+        const p = message.payload
+        if (p?.ok) {
+          showToast(p.message || '配对成功')
+          const pending = pairingPromptRef.current?.pendingAction
+          setPairingPromptState(null)
+          if (pending) {
+            const msgType = pending.isStudio ? 'localsend.send-studio.request' : 'localsend.send.request'
+            const retryPayload = pending.isStudio
+              ? {
+                  peerFingerprint: pending.peerFingerprint,
+                  visibleLayerIndices: pending.visibleLayerIndices,
+                  trimBounds: pending.trimBounds,
+                  includeBackground: pending.includeBackground,
+                  targetMode: pending.targetMode || 'vault',
+                }
+              : {
+                  peerFingerprint: pending.peerFingerprint,
+                  ids: pending.ids,
+                  assetIndex: pending.assetIndex,
+                  targetMode: pending.targetMode || 'vault',
+                }
+            sendNativeMessage(msgType, retryPayload)
+          }
+        } else {
+          setPairingPromptState(prev => (
+            prev
+              ? { ...prev, submitting: false, error: p?.message || '配对码错误' }
+              : null
+          ))
+        }
+      }
       if (message.type === 'localsend.peers.dirty') {
         sendNativeMessage('localsend.status.request', {})
       }
       if (message.type === 'app.toast') {
-        setCheckingUpdate(false)
+        if (latestUpdateCheckReqIdRef.current && message.requestId === latestUpdateCheckReqIdRef.current) {
+          latestUpdateCheckReqIdRef.current = null
+          setCheckingUpdate(false)
+        }
         const msg = message.payload?.message
         if (msg) {
           showToast(msg, {
@@ -474,7 +586,7 @@ export default function App() {
         }
       }
       if (message.type === 'wallpapers.action.result') {
-        if (!activeToolboxRequestId.current || !message.requestId || message.requestId === activeToolboxRequestId.current) {
+        if (activeToolboxRequestId.current && message.requestId === activeToolboxRequestId.current) {
           activeToolboxRequestId.current = null
           setToolboxBusy(false)
           setToolboxProgress(null)
@@ -488,7 +600,7 @@ export default function App() {
         }
       }
       if (message.type === 'toolbox.idle') {
-        if (!activeToolboxRequestId.current || !message.requestId || message.requestId === activeToolboxRequestId.current) {
+        if (activeToolboxRequestId.current && message.requestId === activeToolboxRequestId.current) {
           activeToolboxRequestId.current = null
           setToolboxBusy(false)
           setToolboxProgress(null)
@@ -510,11 +622,13 @@ export default function App() {
         }
       }
       if (message.type === 'wallpapers.we-properties.value') {
-        setWePropertiesState({
-          id: message.payload?.id ?? null,
-          loading: false,
-          properties: message.payload?.properties ?? [],
-        })
+        if (!latestWePropsReqIdRef.current || !message.requestId || message.requestId === latestWePropsReqIdRef.current) {
+          setWePropertiesState({
+            id: message.payload?.id ?? null,
+            loading: false,
+            properties: message.payload?.properties ?? [],
+          })
+        }
       }
       if (message.type === 'toolbox.progress') {
         setToolboxProgress(message.payload ?? null)
@@ -533,21 +647,29 @@ export default function App() {
       }
       if (message.type === 'wallpapers.scene-studio.opened') {
         const p = message.payload
-        setStudioState({
-          open: true,
-          loading: false,
-          rendering: false,
-          wallpaperId: p?.wallpaperId ?? null,
-          title: p?.title ?? '',
-          manifest: p?.manifest ?? null,
-          previewUrl: p?.previewUrl ?? '',
-          previewWidth: p?.previewWidth ?? 0,
-          previewHeight: p?.previewHeight ?? 0,
-          hasPixels: p?.hasPixels ?? true,
-        })
+        setStudioState(previous => (
+          previous.open && previous.wallpaperId === p?.wallpaperId
+            ? {
+                ...previous,
+                loading: false,
+                rendering: false,
+                wallpaperId: p?.wallpaperId ?? previous.wallpaperId,
+                title: p?.title ?? previous.title,
+                manifest: p?.manifest ?? null,
+                previewUrl: p?.previewUrl ?? '',
+                baselinePreviewUrl: p?.baselinePreviewUrl || p?.previewUrl || '',
+                previewWidth: p?.previewWidth ?? 0,
+                previewHeight: p?.previewHeight ?? 0,
+                hasPixels: p?.hasPixels ?? true,
+              }
+            : previous
+        ))
       }
       if (message.type === 'wallpapers.scene-studio.preview') {
         const p = message.payload
+        if (p?.error) {
+          showToast(p.error, { status: 'error' })
+        }
         setStudioState(previous => (
           previous.open && previous.wallpaperId === p?.wallpaperId
             ? {
@@ -556,7 +678,7 @@ export default function App() {
                 previewUrl: p?.previewUrl ?? previous.previewUrl,
                 previewWidth: p?.previewWidth ?? previous.previewWidth,
                 previewHeight: p?.previewHeight ?? previous.previewHeight,
-                hasPixels: p?.hasPixels ?? true,
+                hasPixels: p?.hasPixels ?? previous.hasPixels,
               }
             : previous
         ))
@@ -581,11 +703,8 @@ export default function App() {
           return previous
         })
         if (message.payload?.settings) {
-          setSettings(previous => {
-            const merged = { ...previous, ...message.payload.settings }
-            setSavedSettings(merged)
-            return merged
-          })
+          setSettings(previous => ({ ...previous, ...message.payload.settings }))
+          setSavedSettings(previous => ({ ...previous, ...message.payload.settings }))
         }
         if (typeof message.payload?.cacheSizeBytes === 'number') {
           setCacheSizeBytes(message.payload.cacheSizeBytes)
@@ -595,8 +714,11 @@ export default function App() {
         }
       }
       if (message.type === 'error') {
-        setCheckingUpdate(false)
-        if (!activeToolboxRequestId.current || !message.requestId || message.requestId === activeToolboxRequestId.current) {
+        if (latestUpdateCheckReqIdRef.current && message.requestId === latestUpdateCheckReqIdRef.current) {
+          latestUpdateCheckReqIdRef.current = null
+          setCheckingUpdate(false)
+        }
+        if (activeToolboxRequestId.current && message.requestId === activeToolboxRequestId.current) {
           activeToolboxRequestId.current = null
           setToolboxBusy(false)
           setToolboxProgress(null)
@@ -648,12 +770,12 @@ export default function App() {
 
   useEffect(() => {
     setCurrentPage(1)
-    setSelectedIds([])
+    setSelectedIds(prev => (prev.length ? [] : prev))
   }, [colorFilter, filter, query, ratingFilter, sortBy, specFilter])
 
   useEffect(() => {
-    if (loading || wallpapers.length === 0) return
-    sniffWallpaperColors(wallpapers, info => {
+    if (loading || wallpapers.length === 0) return undefined
+    return sniffWallpaperColors(wallpapers, info => {
       setColorVersion(v => v + 1)
       if (info && typeof info === 'object') {
         setColorIndexProgress({
@@ -665,39 +787,15 @@ export default function App() {
     })
   }, [loading, wallpapers])
 
-  const colorCounts = useMemo(() => {
-    void colorVersion
-    const counts = { dark: 0, light: 0, blue: 0, purple: 0, green: 0, warm: 0 }
-    for (const item of wallpapers) {
-      const bucket = getCachedColorBucket(item)
-      if (bucket && Object.prototype.hasOwnProperty.call(counts, bucket)) {
-        counts[bucket] += 1
-      }
-    }
-    return counts
-  }, [colorVersion, wallpapers])
-
   const favoriteIds = useMemo(
     () => (Array.isArray(settings.favoriteIds) ? settings.favoriteIds : []),
     [settings.favoriteIds],
   )
   const favoriteSet = useMemo(() => new Set(favoriteIds), [favoriteIds])
 
-  const toggleFavorite = useCallback(id => {
-    if (!id) return
-    const current = Array.isArray(settings.favoriteIds) ? settings.favoriteIds : []
-    const exists = current.includes(id)
-    const nextFavorites = exists
-      ? current.filter(v => v !== id)
-      : [...current, id]
-    persistSettings({ ...settings, favoriteIds: nextFavorites })
-    showToast(exists ? '已取消收藏' : '已加入收藏 ♥')
-  }, [persistSettings, settings, showToast])
-
-  const filteredWallpapers = useMemo(() => {
-    void colorVersion
+  const contextFilteredWallpapers = useMemo(() => {
     const normalizedQuery = deferredQuery.trim().toLocaleLowerCase()
-    const matched = wallpapers.filter(item => {
+    return wallpapers.filter(item => {
       const matchesType =
         filter === 'all' ||
         (filter === 'favorite' ? favoriteSet.has(item.id) : item.type === filter)
@@ -725,17 +823,42 @@ export default function App() {
         return false
       }
 
-      if (colorFilter) {
-        const bucket = getCachedColorBucket(item)
-        if (bucket !== colorFilter) return false
-      }
-
-      const matchesQuery =
+      return (
         !normalizedQuery ||
         item.title.toLocaleLowerCase().includes(normalizedQuery) ||
         item.workshopId.includes(normalizedQuery)
-      return matchesQuery
+      )
     })
+  }, [deferredQuery, favoriteSet, filter, ratingFilter, specFilter, wallpapers])
+
+  const colorCounts = useMemo(() => {
+    void colorVersion
+    const counts = { dark: 0, light: 0, blue: 0, purple: 0, green: 0, warm: 0 }
+    for (const item of contextFilteredWallpapers) {
+      const bucket = getCachedColorBucket(item)
+      if (bucket && Object.prototype.hasOwnProperty.call(counts, bucket)) {
+        counts[bucket] += 1
+      }
+    }
+    return counts
+  }, [colorVersion, contextFilteredWallpapers])
+
+  const toggleFavorite = useCallback(id => {
+    if (!id) return
+    const current = Array.isArray(savedSettingsRef.current.favoriteIds) ? savedSettingsRef.current.favoriteIds : []
+    const exists = current.includes(id)
+    const nextFavorites = exists
+      ? current.filter(v => v !== id)
+      : [...current, id]
+    persistSettings({ favoriteIds: nextFavorites })
+    showToast(exists ? '已取消收藏' : '已加入收藏 ♥')
+  }, [persistSettings, showToast])
+
+  const filteredWallpapers = useMemo(() => {
+    void colorVersion
+    const matched = colorFilter
+      ? contextFilteredWallpapers.filter(item => getCachedColorBucket(item) === colorFilter)
+      : contextFilteredWallpapers
 
     if (sortBy === 'size') {
       return [...matched].sort(
@@ -751,7 +874,7 @@ export default function App() {
       return [...matched].sort((a, b) => a.title.localeCompare(b.title, 'zh-CN'))
     }
     return matched
-  }, [colorFilter, colorVersion, deferredQuery, favoriteSet, filter, ratingFilter, sortBy, specFilter, wallpapers])
+  }, [colorFilter, colorVersion, contextFilteredWallpapers, sortBy])
 
   const effectiveColumns = Math.max(2, gridLayout.columns)
   const pageSize = effectiveColumns * gridLayout.rows
@@ -833,10 +956,28 @@ export default function App() {
       studioState.open ||
       dupState.open ||
       toolboxOpen ||
-      deleteTargets.length > 0,
+      deleteTargets.length > 0 ||
+      peerPickerState ||
+      pairingPromptState,
     )
     const onKeyDown = event => {
-      if (deleteTargets.length > 0) return
+      if (event.key === 'Escape') {
+        if (pairingPromptState) {
+          event.preventDefault()
+          event.stopPropagation()
+          if (!pairingPromptState.submitting) {
+            setPairingPromptState(null)
+          }
+          return
+        }
+        if (peerPickerState) {
+          event.preventDefault()
+          event.stopPropagation()
+          setPeerPickerState(null)
+          return
+        }
+      }
+      if (deleteTargets.length > 0 || peerPickerState || pairingPromptState) return
       if ((event.ctrlKey || event.metaKey) && event.key === ',') {
         if (!hasBlockingModal) {
           event.preventDefault()
@@ -854,7 +995,12 @@ export default function App() {
       }
       if (page !== 'library' || hasBlockingModal) return
       const tag = document.activeElement?.tagName
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+        if (event.key === 'Escape') {
+          document.activeElement?.blur?.()
+        }
+        return
+      }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') {
         if (filteredWallpapers.length === 0) return
         event.preventDefault()
@@ -887,14 +1033,18 @@ export default function App() {
         return
       }
       if (event.key === 'ArrowLeft') {
-        setCurrentPage(p => Math.max(1, p - 1))
+        event.preventDefault()
+        event.stopPropagation()
+        setCurrentPage(p => Math.max(1, Math.min(p, pageCount) - 1))
       } else if (event.key === 'ArrowRight') {
-        setCurrentPage(p => Math.min(pageCount, p + 1))
+        event.preventDefault()
+        event.stopPropagation()
+        setCurrentPage(p => Math.min(pageCount, Math.min(p, pageCount) + 1))
       }
     }
-    globalThis.addEventListener('keydown', onKeyDown)
-    return () => globalThis.removeEventListener('keydown', onKeyDown)
-  }, [contextMenu, deleteTargets.length, detailItem, dupState.open, filterPopoverOpen, filteredWallpapers, isNative, page, pageCount, selectedIds, studioState.open, toolboxOpen, wallpapers])
+    globalThis.addEventListener('keydown', onKeyDown, true)
+    return () => globalThis.removeEventListener('keydown', onKeyDown, true)
+  }, [contextMenu, deleteTargets.length, detailItem, dupState.open, filterPopoverOpen, filteredWallpapers, isNative, page, pageCount, pairingPromptState, peerPickerState, selectedIds, studioState.open, toolboxOpen, wallpapers])
 
   useEffect(() => {
     const section = stageSectionRef.current
@@ -911,7 +1061,9 @@ export default function App() {
         toolboxOpen ||
         filterPopoverOpen ||
         contextMenu ||
-        deleteTargets.length > 0
+        deleteTargets.length > 0 ||
+        peerPickerState ||
+        pairingPromptState
       ) return
 
       const scroller = section.querySelector('.fusion-stage')
@@ -928,25 +1080,94 @@ export default function App() {
       wheelTurnStampRef.current = now
 
       if (event.deltaY > 0) {
-        setCurrentPage(p => Math.min(pageCount, p + 1))
+        setCurrentPage(p => Math.min(pageCount, Math.min(p, pageCount) + 1))
       } else {
-        setCurrentPage(p => Math.max(1, p - 1))
+        setCurrentPage(p => Math.max(1, Math.min(p, pageCount) - 1))
       }
     }
     section.addEventListener('wheel', onWheel, { passive: true })
     return () => section.removeEventListener('wheel', onWheel)
-  }, [contextMenu, deleteTargets.length, detailItem, dupState.open, filterPopoverOpen, page, pageCount, studioState.open, toolboxOpen])
+  }, [contextMenu, deleteTargets.length, detailItem, dupState.open, filterPopoverOpen, page, pageCount, pairingPromptState, peerPickerState, studioState.open, toolboxOpen])
 
   const detailIndex = useMemo(
     () => (detailItem ? filteredWallpapers.findIndex(item => item.id === detailItem.id) : -1),
     [detailItem, filteredWallpapers],
   )
 
+  useEffect(() => {
+    if (detailItem?.type === 'video' && globalAudioRef.current && !globalAudioRef.current.paused) {
+      globalAudioRef.current.pause()
+      setGlobalAudio(prev => (prev ? { ...prev, playing: false } : null))
+    }
+  }, [detailItem?.id, detailItem?.type])
+
   const handleOpenContextMenu = useCallback((item, x, y) => {
     setContextMenu({ item, x, y })
   }, [])
 
+  const playGlobalAudioTrack = useCallback((targetItem, idx = 0) => {
+    const tracks = targetItem?.audioTracks
+    if (!Array.isArray(tracks) || tracks.length === 0) return
+    const safeIdx = ((idx % tracks.length) + tracks.length) % tracks.length
+    const track = tracks[safeIdx]
+    if (!track?.url) return
+    pendingAutoPlayRef.current = true
+    setGlobalAudio(prev => {
+      const sameUrl = prev?.track?.url === track.url
+      if (sameUrl && globalAudioRef.current) {
+        globalAudioRef.current.play()?.catch(() => {})
+        return { ...prev, item: targetItem, trackIndex: safeIdx, track, playing: true }
+      }
+      return {
+        item: targetItem,
+        trackIndex: safeIdx,
+        track,
+        playing: true,
+        currentTime: 0,
+        duration: 0,
+      }
+    })
+  }, [])
+
+  const toggleGlobalAudio = useCallback(() => {
+    const audio = globalAudioRef.current
+    if (!audio || !globalAudio?.track?.url) return
+    if (audio.paused) {
+      audio.play()?.then(() => {
+        setGlobalAudio(prev => (prev ? { ...prev, playing: true } : null))
+      }).catch(() => {})
+    } else {
+      audio.pause()
+      setGlobalAudio(prev => (prev ? { ...prev, playing: false } : null))
+    }
+  }, [globalAudio?.track?.url])
+
+  const seekGlobalAudio = useCallback(sec => {
+    const audio = globalAudioRef.current
+    if (!audio || !Number.isFinite(sec)) return
+    audio.currentTime = Math.max(0, sec)
+    setGlobalAudio(prev => (prev ? { ...prev, currentTime: Math.max(0, sec) } : null))
+  }, [])
+
+  const stepGlobalAudioTrack = useCallback(delta => {
+    if (!globalAudio?.item?.audioTracks?.length) return
+    playGlobalAudioTrack(globalAudio.item, globalAudio.trackIndex + delta)
+  }, [globalAudio, playGlobalAudioTrack])
+
+  const closeGlobalAudio = useCallback(() => {
+    if (globalAudioRef.current) {
+      globalAudioRef.current.pause()
+      globalAudioRef.current.currentTime = 0
+    }
+    pendingAutoPlayRef.current = false
+    setGlobalAudio(null)
+  }, [])
+
   const openDetails = useCallback((item, rect = null) => {
+    if (item?.type === 'video' && globalAudioRef.current && !globalAudioRef.current.paused) {
+      globalAudioRef.current.pause()
+      setGlobalAudio(prev => (prev ? { ...prev, playing: false } : null))
+    }
     setDetailOriginRect(rect)
     setDetailItem(item)
   }, [])
@@ -959,6 +1180,7 @@ export default function App() {
       rendering: false,
       wallpaperId: item.id,
       title: item.title,
+      baselinePreviewUrl: '',
       manifest: null,
       previewUrl: '',
       previewWidth: 0,
@@ -1069,7 +1291,7 @@ export default function App() {
 
   const toggleFavoriteBatch = useCallback(() => {
     if (selectedIds.length === 0) return
-    const current = Array.isArray(settings.favoriteIds) ? settings.favoriteIds : []
+    const current = Array.isArray(savedSettingsRef.current.favoriteIds) ? savedSettingsRef.current.favoriteIds : []
     let nextFavorites
     if (allSelectedFavorited) {
       const removeSet = new Set(selectedIds)
@@ -1081,8 +1303,8 @@ export default function App() {
       nextFavorites = [...merged]
       showToast(`已批量收藏 ${selectedIds.length} 项 ♥`)
     }
-    persistSettings({ ...settings, favoriteIds: nextFavorites })
-  }, [allSelectedFavorited, persistSettings, selectedIds, settings, showToast])
+    persistSettings({ favoriteIds: nextFavorites })
+  }, [allSelectedFavorited, persistSettings, selectedIds, showToast])
 
   const exportSelected = () => {
     sendNativeMessage('wallpapers.export.request', { ids: selectedIds })
@@ -1139,14 +1361,17 @@ export default function App() {
     if (picked.length > 0) setDeleteTargets(picked)
   }, [selectedIds.length, selectedSet, wallpapers])
 
-  const confirmDeleteTargets = useCallback(() => {
+  const confirmDeleteTargets = useCallback((alsoDeleteVault = false) => {
     if (!isNative || deleteTargets.length === 0) {
       setDeleteTargets([])
       return
     }
     const ids = deleteTargets.map(item => item.id)
     setDeleteTargets([])
-    sendNativeMessage('wallpapers.recycle-workshop.request', { ids })
+    sendNativeMessage('wallpapers.recycle-workshop.request', {
+      ids,
+      alsoDeleteVault: Boolean(alsoDeleteVault),
+    })
   }, [deleteTargets, isNative, sendNativeMessage])
 
   const hasActiveFilter = sortBy !== 'default' || specFilter !== 'all' || ratingFilter !== 'all' || Boolean(colorFilter)
@@ -1207,7 +1432,7 @@ export default function App() {
             <div className="brand-wordmark" aria-label="WallPull">
               <TechText
                 text="WallPull"
-                fontFamily='"MiSans VF", "Segoe UI Variable Text", sans-serif'
+                fontFamily='"MiSans VF", "Segoe UI Variable Text", "Microsoft YaHei UI", system-ui, sans-serif'
                 fontWeight={700}
                 fontSize={22}
                 letterSpacing={-0.03}
@@ -1256,7 +1481,6 @@ export default function App() {
                   className="wv-utility-island__btn w-7 px-0"
                   aria-label={isDark ? '切换到浅色模式' : '切换到暗色模式'}
                   onClick={() => persistSettings({
-                    ...settings,
                     themeMode: isDark ? 'light' : 'dark',
                   })}
                 >
@@ -1289,7 +1513,6 @@ export default function App() {
                   className="btn btn-ghost btn-sm"
                   aria-label={isDark ? '切换到浅色模式' : '切换到暗色模式'}
                   onClick={() => persistSettings({
-                    ...settings,
                     themeMode: isDark ? 'light' : 'dark',
                   })}
                 >
@@ -1369,45 +1592,43 @@ export default function App() {
             <section className="library-heading flex shrink-0 items-end justify-between gap-6">
               <div>
                 <h1 className="text-2xl font-semibold tracking-tight">本机壁纸</h1>
-                <div className="mt-1 flex flex-wrap items-center gap-2.5 text-sm text-base-content/65">
-                  {loading && scanProgress?.phase === 'color-index' ? (
-                    <LatticeLoader
-                      status="working"
-                      pattern="orbit"
-                      grid={3}
-                      cellSize={4}
-                      gap={2}
-                      fontSize={13}
-                      color={sparkColor}
-                      label={scanProgress.message}
-                      showTimer={false}
-                    />
-                  ) : loading ? (
-                    <ShinyText
-                      text={status}
-                      color={isDark ? '#a0a0b4' : '#6d5f7c'}
-                      shineColor={isDark ? '#ffffff' : sparkColor}
-                      speed={1.8}
-                    />
-                  ) : (
-                    <>
-                      <span>{status}</span>
-                      {colorIndexProgress.running ? (
-                        <LatticeLoader
-                          status="working"
-                          pattern="dots"
-                          grid={3}
-                          cellSize={3.5}
-                          gap={1.5}
-                          fontSize={12}
-                          color={sparkColor}
-                          label={`色彩索引 ${colorIndexProgress.indexed}/${colorIndexProgress.total}`}
-                          showTimer={false}
-                        />
-                      ) : null}
-                    </>
-                  )}
-                </div>
+                {(loading || colorIndexProgress.running) ? (
+                  <div className="mt-1 flex flex-wrap items-center gap-2.5 text-sm text-base-content/65">
+                    {loading && scanProgress?.phase === 'color-index' ? (
+                      <LatticeLoader
+                        status="working"
+                        pattern="orbit"
+                        grid={3}
+                        cellSize={4}
+                        gap={2}
+                        fontSize={13}
+                        color={sparkColor}
+                        label={scanProgress.message}
+                        showTimer={false}
+                      />
+                    ) : loading ? (
+                      <ShinyText
+                        text={status}
+                        color={isDark ? '#a0a0b4' : '#6d5f7c'}
+                        shineColor={isDark ? '#ffffff' : sparkColor}
+                        speed={1.8}
+                      />
+                    ) : null}
+                    {!loading && colorIndexProgress.running ? (
+                      <LatticeLoader
+                        status="working"
+                        pattern="dots"
+                        grid={3}
+                        cellSize={3.5}
+                        gap={1.5}
+                        fontSize={12}
+                        color={sparkColor}
+                        label={`色彩索引 ${colorIndexProgress.indexed}/${colorIndexProgress.total}`}
+                        showTimer={false}
+                      />
+                    ) : null}
+                  </div>
+                ) : null}
               </div>
               <div className="library-controls flex flex-wrap items-center justify-end gap-2.5">
                 <div className="wv-segmented" role="group" aria-label="壁纸类型">
@@ -1574,9 +1795,7 @@ export default function App() {
                               <ColorSwatchPickerItem
                                 key={bucket.value}
                                 color={bucket.swatch}
-                                colorName={`${bucket.label}（${colorCounts[bucket.value] || 0} 项）`}
-                                className="tooltip tooltip-top"
-                                data-tip={`${bucket.label}（${colorCounts[bucket.value] || 0} 项）`}
+                                colorName={bucket.label}
                                 onMouseEnter={() => setHoveredColorBucket(bucket.value)}
                                 onMouseLeave={() => setHoveredColorBucket(prev => (prev === bucket.value ? null : prev))}
                                 onClick={event => {
@@ -1666,7 +1885,9 @@ export default function App() {
                     studioState.open ||
                     dupState.open ||
                     toolboxOpen ||
-                    deleteTargets.length > 0
+                    deleteTargets.length > 0 ||
+                    Boolean(peerPickerState) ||
+                    Boolean(pairingPromptState)
                   }
                 />
               ) : wallpapers.length > 0 ? (
@@ -1676,19 +1897,18 @@ export default function App() {
                   </div>
                   <div>
                     <p className="font-medium">没有匹配的壁纸</p>
-                    <p className="mt-1 text-sm text-base-content/60">
-                      当前搜索、收藏、比例或色调筛选下没有结果。
-                    </p>
                   </div>
                   <button
                     type="button"
                     className="btn btn-ghost btn-sm mt-1"
                       onClick={() => {
                         setQuery('')
-                        setFilter('all')
-                        setSpecFilter('all')
-                        setRatingFilter('all')
-                        setColorFilter(null)
+                        updateFilterPreferences({
+                          mediaFilter: 'all',
+                          specFilter: 'all',
+                          ratingFilter: 'all',
+                          colorFilter: null,
+                        })
                       }}
                   >
                     清除全部筛选条件
@@ -1731,7 +1951,7 @@ export default function App() {
                     type="button"
                     className="btn btn-ghost btn-sm h-8 w-8 min-w-0 px-0"
                     disabled={safePage <= 1}
-                    onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                    onClick={() => setCurrentPage(p => Math.max(1, Math.min(p, pageCount) - 1))}
                     aria-label="上一页"
                   >
                     <CaretLeft size={15} weight="bold" />
@@ -1763,7 +1983,7 @@ export default function App() {
                     type="button"
                     className="btn btn-ghost btn-sm h-8 w-8 min-w-0 px-0"
                     disabled={safePage >= pageCount}
-                    onClick={() => setCurrentPage(p => Math.min(pageCount, p + 1))}
+                    onClick={() => setCurrentPage(p => Math.min(pageCount, Math.min(p, pageCount) + 1))}
                     aria-label="下一页"
                   >
                     <CaretRight size={15} weight="bold" />
@@ -1866,6 +2086,7 @@ export default function App() {
             layoutMode={navStyle}
             onClose={() => setPage('library')}
             settings={settings}
+            savedSettings={savedSettings}
             setSettings={setSettings}
             isDark={isDark}
             isDirty={isSettingsDirty}
@@ -1882,6 +2103,9 @@ export default function App() {
             checkingUpdate={checkingUpdate}
             localsendStatus={localsendStatus}
             onRefreshLocalsend={() => sendNativeMessage('localsend.scan.request', {})}
+            onRotatePin={() => sendNativeMessage('localsend.rotate-pin.request', {})}
+            onUnpairAll={() => sendNativeMessage('localsend.unpair-all.request', {})}
+            suppressEscape={Boolean(peerPickerState || pairingPromptState || toolboxOpen || dupState.open || detailItem || studioState.open || deleteTargets.length > 0)}
             onCheckUpdate={checkLatestUpdate}
             onOpenExternalUrl={openExternalUrl}
             sendNativeMessage={sendNativeMessage}
@@ -1908,6 +2132,10 @@ export default function App() {
           onToggleFavorite={toggleFavorite}
           isNative={isNative}
           sendNativeMessage={sendNativeMessage}
+          globalAudio={globalAudio}
+          onPlayGlobalAudio={playGlobalAudioTrack}
+          onToggleGlobalAudio={toggleGlobalAudio}
+          onSeekGlobalAudio={seekGlobalAudio}
           onSendToTablet={(item, assetIndex) => dispatchLocalSendRequest('localsend.send.request', {
             ids: [item.id],
             assetIndex,
@@ -1923,7 +2151,7 @@ export default function App() {
             openLayerStudio(item)
           }}
           onDelete={item => setDeleteTargets([item])}
-          suppressHotkeys={deleteTargets.length > 0}
+          suppressHotkeys={Boolean(deleteTargets.length > 0 || peerPickerState || pairingPromptState)}
           onClose={closeDetails}
         />
         <CardContextMenu
@@ -1938,10 +2166,14 @@ export default function App() {
           onOpenLayerStudio={openLayerStudio}
           onCopy={item => sendNativeMessage('wallpapers.copy.request', { id: item.id })}
           onSetDesktop={item => sendNativeMessage('wallpapers.set-desktop.request', { id: item.id })}
-          onSendToTablet={item => dispatchLocalSendRequest('localsend.send.request', {
-            ids: [item.id],
-            targetMode: 'vault',
-          })}
+          onSendToTablet={item => {
+            const ids =
+              selectedSet.has(item.id) && selectedIds.length > 1 ? selectedIds : [item.id]
+            dispatchLocalSendRequest('localsend.send.request', {
+              ids,
+              targetMode: 'vault',
+            })
+          }}
           onPushClipboardToTablet={item => dispatchLocalSendRequest('localsend.send.request', {
             ids: [item.id],
             targetMode: 'clipboard',
@@ -1962,6 +2194,7 @@ export default function App() {
           open={studioState.open}
           state={studioState}
           isNative={isNative}
+          suppressHotkeys={Boolean(peerPickerState || pairingPromptState)}
           onPreviewChange={handleStudioPreviewChange}
           onExport={handleStudioExport}
           onSendToTablet={req => dispatchLocalSendRequest('localsend.send-studio.request', req)}
@@ -2005,78 +2238,82 @@ export default function App() {
           sendNativeMessage={sendNativeMessage}
           onOpenDuplicates={openDuplicateInspector}
         />
-        {createPortal(
-          <AnimatePresence>
-            {!toolboxOpen && toolboxBusy && toolboxProgress ? (
-              <motion.div
-                key="bg-toolbox-progress"
-                style={{ zIndex: 200 }}
-                className={`pointer-events-auto fixed left-1/2 w-[min(92vw,460px)] -translate-x-1/2 ${
-                  selectedIds.length > 0 &&
-                  page === 'library' &&
-                  !detailItem &&
-                  !toolboxOpen &&
-                  !studioState.open &&
-                  !dupState.open &&
-                  deleteTargets.length === 0
-                    ? 'bottom-[84px]'
-                    : 'bottom-6'
-                }`}
-                initial={{ opacity: 0, y: 12, scale: 0.96 }}
-                animate={{ opacity: 1, y: 0, scale: 1 }}
-                exit={{ opacity: 0, y: 8, scale: 0.96 }}
-                transition={{ duration: 0.18 }}
-              >
-                <FluxProgressBar
-                  compact
-                  progress={toolboxProgress}
-                  cancelling={toolboxCancelling}
-                  onCancel={() => {
-                    setToolboxCancelling(true)
-                    sendNativeMessage('toolbox.task.cancel', {})
-                  }}
-                />
-              </motion.div>
-            ) : toastState ? (
-              <motion.div
-                key={`${toastState.status}-${toastState.message}`}
-                style={{ zIndex: 200 }}
-                className={`pointer-events-auto fixed left-1/2 -translate-x-1/2 ${
-                  selectedIds.length > 0 &&
-                  page === 'library' &&
-                  !detailItem &&
-                  !toolboxOpen &&
-                  !studioState.open &&
-                  !dupState.open &&
-                  deleteTargets.length === 0
-                    ? 'bottom-[84px]'
-                    : 'bottom-6'
-                }`}
-                initial={{ opacity: 0, y: 12, scale: 0.96 }}
-                animate={{ opacity: 1, y: 0, scale: 1 }}
-                exit={{ opacity: 0, y: 8, scale: 0.96 }}
-                transition={{ duration: 0.18 }}
-              >
-                <CallChip
-                  icon="sparkle"
-                  name="WallPull"
-                  argument={toastState.message}
-                  status={toastState.status}
-                  showTimer={toastState.status === 'running'}
-                  color={isDark ? '#f4f4f8' : '#18181b'}
-                  surfaceColor={isDark ? 'rgba(28, 28, 40, 0.92)' : 'rgba(255, 255, 255, 0.92)'}
-                  actionLabel={toastState.actionLabel || (toastState.destination && isNative ? '打开目录' : null)}
-                  onAction={toastState.actionUrl
-                    ? () => openExternalUrl({ url: toastState.actionUrl })
-                    : (toastState.destination && isNative
-                        ? () => sendNativeMessage('shell.open-path.request', { path: toastState.destination })
-                        : null)}
-                />
-              </motion.div>
-            ) : null}
-          </AnimatePresence>,
-          document.body,
-        )}
+        <audio
+          ref={globalAudioRef}
+          src={globalAudio?.track?.url || undefined}
+          preload="metadata"
+          onCanPlay={event => {
+            if (pendingAutoPlayRef.current) {
+              pendingAutoPlayRef.current = false
+              event.currentTarget.play()?.catch(() => {})
+            }
+          }}
+          onLoadedMetadata={event => {
+            const dur = event.currentTarget.duration
+            setGlobalAudio(prev => (prev ? { ...prev, duration: Number.isFinite(dur) ? dur : 0 } : null))
+          }}
+          onTimeUpdate={event => {
+            const cur = event.currentTarget.currentTime
+            const dur = event.currentTarget.duration
+            setGlobalAudio(prev => (prev
+              ? {
+                  ...prev,
+                  currentTime: Number.isFinite(cur) ? cur : 0,
+                  duration: Number.isFinite(dur) ? dur : prev.duration,
+                }
+              : null))
+          }}
+          onPlay={() => setGlobalAudio(prev => (prev ? { ...prev, playing: true } : null))}
+          onPause={() => setGlobalAudio(prev => (prev ? { ...prev, playing: false } : null))}
+          onEnded={() => stepGlobalAudioTrack(1)}
+        />
+        <StackedToaster
+          toasts={toasts}
+          isDark={isDark}
+          offsetBottomClass={
+            selectedIds.length > 0 &&
+            page === 'library' &&
+            !detailItem &&
+            !toolboxOpen &&
+            !studioState.open &&
+            !dupState.open &&
+            deleteTargets.length === 0
+              ? 'bottom-[84px]'
+              : 'bottom-6'
+          }
+          onDismiss={dismissToast}
+          onHoverChange={hovered => { toastHoveredRef.current = hovered }}
+          onAction={toast => {
+            if (toast.actionUrl) openExternalUrl({ url: toast.actionUrl })
+            else if (toast.destination && isNative) sendNativeMessage('shell.open-path.request', { path: toast.destination })
+          }}
+        />
+        <FloatingActivityIsland
+          localsendProgress={localsendProgress}
+          toolboxProgress={toolboxProgress}
+          toolboxBusy={!toolboxOpen && toolboxBusy}
+          toolboxCancelling={toolboxCancelling}
+          onCancelToolbox={() => {
+            setToolboxCancelling(true)
+            sendNativeMessage('toolbox.task.cancel', {})
+          }}
+          globalAudio={globalAudio}
+          onToggleAudio={toggleGlobalAudio}
+          onPrevAudio={() => stepGlobalAudioTrack(-1)}
+          onNextAudio={() => stepGlobalAudioTrack(1)}
+          onSeekAudio={seekGlobalAudio}
+          onCloseAudio={closeGlobalAudio}
+          isDark={isDark}
+          raised={Boolean(
+            selectedIds.length > 0 &&
+            page === 'library' &&
+            !detailItem &&
+            !toolboxOpen &&
+            !studioState.open &&
+            !dupState.open &&
+            deleteTargets.length === 0
+          )}
+        />
         {createPortal(
           <AnimatePresence>
             {peerPickerState ? (
@@ -2129,7 +2366,7 @@ export default function App() {
                       >
                         <div className="min-w-0">
                           <p className="truncate text-sm font-medium">{peer.alias}</p>
-                          <p className="font-mono text-xs text-base-content/55">{peer.ip}:{peer.port}</p>
+                          <p className="tabular-nums text-xs text-base-content/55">{peer.ip}:{peer.port}</p>
                         </div>
                         <span className={`badge badge-sm ${peer.isWallpullIpad ? 'badge-primary' : 'badge-ghost'}`}>
                           {peer.isWallpullIpad ? 'WallPull iPad' : (peer.deviceModel || 'WallPull')}
@@ -2138,6 +2375,107 @@ export default function App() {
                     ))}
                   </div>
                 </motion.div>
+              </motion.div>
+            ) : null}
+          </AnimatePresence>,
+          document.body,
+        )}
+        {createPortal(
+          <AnimatePresence>
+            {pairingPromptState ? (
+              <motion.div
+                key="pairing-pin-backdrop"
+                className="fixed inset-0 z-75 flex items-center justify-center bg-black/45 p-5 backdrop-blur-[4px]"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.16 }}
+                onMouseDown={e => {
+                  if (e.target === e.currentTarget && !pairingPromptState.submitting) {
+                    setPairingPromptState(null)
+                  }
+                }}
+              >
+                <motion.form
+                  role="dialog"
+                  aria-modal="true"
+                  aria-label="设备配对验证"
+                  className="w-full max-w-sm rounded-[22px] border border-base-300/85 bg-base-100/95 p-5 shadow-2xl backdrop-blur-2xl"
+                  initial={{ opacity: 0, scale: 0.95, y: 10 }}
+                  animate={{ opacity: 1, scale: 1, y: 0 }}
+                  exit={{ opacity: 0, scale: 0.96, y: 6 }}
+                  transition={{ duration: 0.16, ease: [0.2, 0, 0, 1] }}
+                  onSubmit={event => {
+                    event.preventDefault()
+                    if (!pairingPromptState || pairingPromptState.submitting) return
+                    const cleanPin = pairingPromptState.pin.replace(/\D/g, '').slice(0, 4)
+                    if (cleanPin.length !== 4) {
+                      setPairingPromptState(prev => (prev ? { ...prev, error: '请输入 4 位数字配对码' } : null))
+                      return
+                    }
+                    setPairingPromptState(prev => (prev ? { ...prev, submitting: true, error: '' } : null))
+                    sendNativeMessage('localsend.pair.request', {
+                      peerFingerprint: pairingPromptState.peerFingerprint,
+                      pin: cleanPin,
+                    })
+                  }}
+                >
+                  <div className="mb-3 flex items-center justify-between">
+                    <h3 className="text-sm font-semibold">配对「{pairingPromptState.peerAlias}」</h3>
+                    <button
+                      type="button"
+                      className="btn btn-xs btn-ghost h-7 w-7 min-w-0 rounded-full p-0"
+                      aria-label="取消配对"
+                      disabled={pairingPromptState.submitting}
+                      onClick={() => setPairingPromptState(null)}
+                    >
+                      <X size={14} weight="bold" />
+                    </button>
+                  </div>
+                  <p className="mb-4 text-center text-xs text-base-content/65">
+                    输入平板「跨端互联」中显示的 4 位配对码
+                  </p>
+                  <OtpPinInput
+                    length={4}
+                    label="跨端配对码"
+                    value={pairingPromptState.pin}
+                    error={pairingPromptState.error}
+                    disabled={pairingPromptState.submitting}
+                    autoFocus
+                    onChange={nextPin => {
+                      setPairingPromptState(prev => (prev ? { ...prev, pin: nextPin, error: '' } : null))
+                    }}
+                    onComplete={cleanPin => {
+                      if (!pairingPromptState || pairingPromptState.submitting) return
+                      setPairingPromptState(prev => (prev ? { ...prev, submitting: true, error: '' } : null))
+                      sendNativeMessage('localsend.pair.request', {
+                        peerFingerprint: pairingPromptState.peerFingerprint,
+                        pin: cleanPin,
+                      })
+                    }}
+                  />
+                  {pairingPromptState.error ? (
+                    <p className="mt-2.5 text-center text-xs font-medium text-error">{pairingPromptState.error}</p>
+                  ) : null}
+                  <div className="mt-5 flex items-center justify-end gap-2">
+                    <button
+                      type="button"
+                      className="btn btn-ghost btn-sm"
+                      disabled={pairingPromptState.submitting}
+                      onClick={() => setPairingPromptState(null)}
+                    >
+                      取消
+                    </button>
+                    <button
+                      type="submit"
+                      className="btn btn-primary btn-sm"
+                      disabled={pairingPromptState.submitting || pairingPromptState.pin.length !== 4}
+                    >
+                      {pairingPromptState.submitting ? <span className="loading loading-spinner loading-xs" /> : null}
+                      确认配对
+                    </button>
+                  </div>
+                </motion.form>
               </motion.div>
             ) : null}
           </AnimatePresence>,

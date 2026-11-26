@@ -1,4 +1,6 @@
+import ImageIO
 import SwiftUI
+import UIKit
 
 struct DuplicateInspectorView: View {
     @ObservedObject var vault: LocalVaultStore
@@ -8,6 +10,9 @@ struct DuplicateInspectorView: View {
     @State private var isScanning: Bool = true
     @State private var report: DuplicateScanReport? = nil
     @State private var selectedDeleteIDs: Set<String> = []
+    @State private var expandedCompareGroupID: String? = nil
+    @State private var compareCandidateIndex: Int = 0
+    @State private var comparePairImages: (keep: UIImage, candidate: UIImage)? = nil
 
     private var selectedDeleteBytes: Int64 {
         guard let report else { return 0 }
@@ -82,7 +87,7 @@ struct DuplicateInspectorView: View {
                     ProgressView()
                         .scaleEffect(1.2)
                         .tint(vault.accentColor)
-                    Text("正在对全库壁纸进行 dHash + 亮度均值视觉指纹比对…")
+                    Text("正在扫描相似壁纸…")
                         .font(.system(size: 14, weight: .medium))
                         .foregroundColor(.secondary)
                 }
@@ -132,23 +137,22 @@ struct DuplicateInspectorView: View {
                     }
                     .buttonStyle(StickerPressButtonStyle())
 
-                    Button {
+                    HoldToConfirmCapsule(
+                        title: "按住清理 (\(selectedDeleteIDs.count))",
+                        icon: "trash.fill",
+                        duration: 0.85,
+                        tint: .red,
+                        isDisabled: selectedDeleteIDs.isEmpty
+                    ) {
                         let targetIDs = selectedDeleteIDs
                         let freed = selectedDeleteBytes
                         vault.deleteItems(ids: targetIDs)
                         selectedDeleteIDs.removeAll()
+                        expandedCompareGroupID = nil
+                        comparePairImages = nil
                         vault.showToast("已清理 \(targetIDs.count) 项重复壁纸，释放 \(formatFileSize(freed))")
                         Task { await runScan() }
-                    } label: {
-                        Label("一键清理所选 (\(selectedDeleteIDs.count))", systemImage: "trash.fill")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 14)
-                            .frame(height: 34)
-                            .background(selectedDeleteIDs.isEmpty ? Color.gray : Color.red, in: Capsule())
                     }
-                    .disabled(selectedDeleteIDs.isEmpty)
-                    .buttonStyle(StickerPressButtonStyle())
                 }
                 .padding(.horizontal, 24)
                 .padding(.vertical, 12)
@@ -157,11 +161,85 @@ struct DuplicateInspectorView: View {
                 ScrollView {
                     LazyVStack(spacing: 16) {
                         ForEach(Array(report.groups.enumerated()), id: \.element.id) { gIdx, group in
+                            let imageCandidates = group.items.filter { $0.item.mediaType == .image }
+                            let keepCand = imageCandidates.first(where: \.isRecommendedKeep) ?? imageCandidates.first
+                            let otherCands = imageCandidates.filter { $0.id != keepCand?.id }
+                            let canCompare = keepCand != nil && !otherCands.isEmpty
+                            let isComparing = expandedCompareGroupID == group.id && canCompare
+                            let safeIdx = otherCands.isEmpty ? 0 : min(compareCandidateIndex, otherCands.count - 1)
+
                             WallPullSectionCard(
                                 title: "相似组 #\(gIdx + 1) · 共 \(group.items.count) 项",
                                 icon: "square.on.square",
                                 badge: "可释放 \(formatFileSize(group.reclaimableBytes))"
                             ) {
+                                if canCompare, let keepCand {
+                                    HStack(spacing: 8) {
+                                        Button {
+                                            withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                                                if isComparing {
+                                                    expandedCompareGroupID = nil
+                                                    comparePairImages = nil
+                                                } else {
+                                                    expandedCompareGroupID = group.id
+                                                    compareCandidateIndex = 0
+                                                    loadCompareImages(keep: keepCand.item, candidate: otherCands[0].item)
+                                                }
+                                            }
+                                        } label: {
+                                            Label(isComparing ? "收起对比" : "左右像素对比", systemImage: "square.split.2x1")
+                                                .font(.system(size: 12, weight: .semibold))
+                                                .foregroundColor(isComparing ? .white : vault.accentColor)
+                                                .padding(.horizontal, 11)
+                                                .padding(.vertical, 5)
+                                                .background(
+                                                    isComparing ? vault.accentColor : vault.accentColor.opacity(0.12),
+                                                    in: Capsule()
+                                                )
+                                        }
+                                        .buttonStyle(StickerPressButtonStyle())
+
+                                        if isComparing && otherCands.count > 1 {
+                                            ScrollView(.horizontal, showsIndicators: false) {
+                                                HStack(spacing: 6) {
+                                                    ForEach(Array(otherCands.enumerated()), id: \.element.id) { idx, c in
+                                                        Button {
+                                                            compareCandidateIndex = idx
+                                                            loadCompareImages(keep: keepCand.item, candidate: c.item)
+                                                        } label: {
+                                                            Text(c.item.title)
+                                                                .font(.system(size: 11, weight: .medium))
+                                                                .lineLimit(1)
+                                                                .frame(maxWidth: 120)
+                                                                .padding(.horizontal, 9)
+                                                                .padding(.vertical, 4)
+                                                                .background(
+                                                                    idx == safeIdx ? vault.accentColor.opacity(0.16) : WallPullPalette.elevatedPill(colorScheme),
+                                                                    in: Capsule()
+                                                                )
+                                                        }
+                                                        .buttonStyle(.plain)
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Spacer()
+                                    }
+
+                                    if isComparing, let pair = comparePairImages {
+                                        let chosenCand = otherCands[safeIdx]
+                                        TouchCompareSliderView(
+                                            beforeImage: pair.keep,
+                                            afterImage: pair.candidate,
+                                            beforeLabel: "保留 · \(keepCand.item.resolutionText ?? "")",
+                                            afterLabel: "候选 · \(chosenCand.item.resolutionText ?? "")",
+                                            accentColor: vault.accentColor
+                                        )
+                                        .frame(height: 250)
+                                        .transition(.opacity.combined(with: .scale(scale: 0.98)))
+                                    }
+                                }
+
                                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 185, maximum: 230), spacing: 14)], spacing: 14) {
                                     ForEach(group.items) { cand in
                                         let isChecked = selectedDeleteIDs.contains(cand.id)
@@ -246,10 +324,10 @@ struct DuplicateInspectorView: View {
 
     private var headerSubtitle: String {
         guard let report else {
-            return "基于视觉感知哈希与文件摘要识别重复壁纸与低清晰度版本"
+            return "自动识别重复或低清近似壁纸"
         }
         if report.groups.isEmpty {
-            return "已扫描 \(report.scannedCount) 项 · 未检测到重复或低清近似副本"
+            return "已扫描 \(report.scannedCount) 项 · 未检测到重复副本"
         }
         return "已扫描 \(report.scannedCount) 项 · 发现 \(report.groups.count) 组共 \(report.totalRedundantCount) 项冗余副本"
     }
@@ -258,8 +336,37 @@ struct DuplicateInspectorView: View {
         isScanning = true
         let res = await vault.scanDuplicates()
         report = res
-        let redundant = res.groups.flatMap(\.items).filter { !$0.isRecommendedKeep }.map(\.id)
-        selectedDeleteIDs = Set(redundant)
+        let safeExactIDs = res.groups.flatMap(\.items)
+            .filter { !$0.isRecommendedKeep && $0.isExactMatch && !$0.item.hasMusic }
+            .map(\.id)
+        selectedDeleteIDs = Set(safeExactIDs)
         isScanning = false
+    }
+
+    private func loadCompareImages(keep: VaultItem, candidate: VaultItem) {
+        let keepURL = vault.mediaURL(for: keep)
+        let candURL = vault.mediaURL(for: candidate)
+        let keepThumb = vault.thumbURL(for: keep)
+        let candThumb = vault.thumbURL(for: candidate)
+        let opts: [CFString: Any] = [
+            kCGImageSourceThumbnailMaxPixelSize: 1600,
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+        ]
+        func decode(_ primary: URL, _ fallback: URL?) -> UIImage? {
+            for u in [primary, fallback].compactMap({ $0 }) {
+                if let src = CGImageSourceCreateWithURL(u as CFURL, nil),
+                   let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) {
+                    return UIImage(cgImage: cg)
+                }
+                if let ui = UIImage(contentsOfFile: u.path) {
+                    return ui
+                }
+            }
+            return nil
+        }
+        if let kImg = decode(keepURL, keepThumb), let cImg = decode(candURL, candThumb) {
+            comparePairImages = (kImg, cImg)
+        }
     }
 }

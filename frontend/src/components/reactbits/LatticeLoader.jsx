@@ -86,12 +86,12 @@ export default function LatticeLoader({
       paint(Math.round(elapsed * 10))
       return undefined
     }
-    if (status !== 'working') return undefined
+    if (status !== 'working' || !showTimer) return undefined
     const startedAt = performance.now()
     paint(0)
     const id = globalThis.setInterval(() => paint(Math.floor((performance.now() - startedAt) / 100)), 100)
     return () => globalThis.clearInterval(id)
-  }, [status, elapsed])
+  }, [elapsed, showTimer, status])
 
   useEffect(() => {
     if (status === 'working') setAnnounce(`${label}, in progress`)

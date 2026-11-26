@@ -9,6 +9,8 @@ enum LocalSendSheetTab: String, CaseIterable, Identifiable {
 struct LocalSendSheetView: View {
     @ObservedObject var vault: LocalVaultStore
     @ObservedObject var localSend: LocalSendService
+    let catalogFrameTracker: CardFrameTracker
+    let onOpenCatalogPreview: (PCCatalogItem, [PCCatalogItem], LocalSendPeer, CGRect?, UIImage?) -> Void
     let onClose: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
@@ -18,6 +20,10 @@ struct LocalSendSheetView: View {
     @State private var catalogQuery: String = ""
     @State private var selectedCatalogIDs: Set<String> = []
     @State private var showPullAllConfirm: Bool = false
+    @State private var pairingPinInput: String = ""
+    @State private var isSubmittingPair: Bool = false
+    @State private var pairingErrorText: String = ""
+    @State private var pairingShakeCount: Int = 0
 
     private enum CatalogTypeOpt: String, CaseIterable, Identifiable {
         case all = "全部"
@@ -74,23 +80,31 @@ struct LocalSendSheetView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            sheetHeader
+        ZStack {
+            VStack(spacing: 0) {
+                sheetHeader
 
-            WallPullSegmentedPill(
-                options: LocalSendSheetTab.allCases,
-                selection: $tab,
-                label: { $0.rawValue },
-                height: 36
-            )
-            .padding(.bottom, 14)
+                WallPullSegmentedPill(
+                    options: LocalSendSheetTab.allCases,
+                    selection: $tab,
+                    label: { $0.rawValue },
+                    height: 36
+                )
+                .padding(.bottom, 12)
 
-            if tab == .devices {
-                devicesTab
-            } else {
-                pcCatalogTab
+                if tab == .devices {
+                    devicesTab
+                } else {
+                    pcCatalogTab
+                }
+            }
+
+            if let targetPeer = localSend.pairingRequiredPeer {
+                pairingPromptOverlay(for: targetPeer)
+                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
             }
         }
+        .animation(.spring(response: 0.34, dampingFraction: 0.85), value: localSend.pairingRequiredPeer?.fingerprint)
         .onAppear {
             if let pc = localSend.primaryPCPeer, pc.isWallPullPC {
                 if tab == .devices && !localSend.pcCatalog.isEmpty {
@@ -104,6 +118,15 @@ struct LocalSendSheetView: View {
             if newTab == .catalog, let pc = localSend.primaryPCPeer, pc.isWallPullPC {
                 Task { await localSend.fetchPCCatalog(from: pc) }
             }
+        }
+        .onChange(of: localSend.pairingRequiredPeer?.fingerprint) { _ in
+            pairingPinInput = ""
+            pairingErrorText = ""
+            isSubmittingPair = false
+        }
+        .onChange(of: catalogQuery) { _ in
+            let validIDs = Set(filteredCatalog.map(\.id))
+            selectedCatalogIDs.formIntersection(validIDs)
         }
         .onChange(of: catalogTypeOpt) { _ in
             let validIDs = Set(filteredCatalog.map(\.id))
@@ -122,7 +145,119 @@ struct LocalSendSheetView: View {
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("准备将电脑端未入库的 \(unimportedFilteredCatalog.count) 项壁纸（总大小约 \(formatFileSize(unimportedTotalBytes))）全部无损下载并入库。\n\n开始后将自动返回主画廊，每下载完成一张即刻 3D 翻转入库！")
+            Text("共 \(unimportedFilteredCatalog.count) 项未入库，约 \(formatFileSize(unimportedTotalBytes))。")
+        }
+    }
+
+    @ViewBuilder
+    private func pairingPromptOverlay(for peer: LocalSendPeer) -> some View {
+        ZStack {
+            Color.black.opacity(0.45)
+                .ignoresSafeArea()
+                .onTapGesture {
+                    if !isSubmittingPair {
+                        localSend.pairingRequiredPeer = nil
+                    }
+                }
+
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Text("配对「\(peer.alias)」")
+                        .font(.system(size: 17, weight: .bold, design: .rounded))
+                    Spacer()
+                    Button {
+                        localSend.pairingRequiredPeer = nil
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 12.5, weight: .bold))
+                            .foregroundColor(.secondary)
+                            .frame(width: 28, height: 28)
+                            .background(WallPullPalette.track(colorScheme), in: Circle())
+                    }
+                    .disabled(isSubmittingPair)
+                }
+
+                Text("输入电脑「跨端互联」中显示的 4 位配对码")
+                    .font(.system(size: 13))
+                    .foregroundColor(.secondary)
+
+                SegmentedPinInputView(
+                    pin: $pairingPinInput,
+                    isDisabled: isSubmittingPair,
+                    shakeTrigger: pairingShakeCount,
+                    hasError: !pairingErrorText.isEmpty,
+                    accentColor: vault.accentColor,
+                    onComplete: { _ in
+                        submitPairing(with: peer)
+                    }
+                )
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 4)
+
+                if !pairingErrorText.isEmpty {
+                    Text(pairingErrorText)
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundColor(.red)
+                }
+
+                HStack(spacing: 10) {
+                    Spacer()
+                    Button {
+                        localSend.pairingRequiredPeer = nil
+                    } label: {
+                        Text("取消")
+                            .font(.system(size: 13.5, weight: .medium))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .background(WallPullPalette.track(colorScheme), in: Capsule())
+                    }
+                    .disabled(isSubmittingPair)
+
+                    Button {
+                        submitPairing(with: peer)
+                    } label: {
+                        HStack(spacing: 6) {
+                            if isSubmittingPair {
+                                ProgressView().controlSize(.small).tint(.white)
+                            }
+                            Text("确认配对")
+                                .font(.system(size: 13.5, weight: .semibold))
+                        }
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(pairingPinInput.count == 4 ? vault.accentColor : Color.gray, in: Capsule())
+                    }
+                    .disabled(isSubmittingPair || pairingPinInput.count != 4)
+                }
+            }
+            .padding(20)
+            .frame(maxWidth: 340)
+            .background(WallPullPalette.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).strokeBorder(WallPullPalette.hairline(colorScheme), lineWidth: 1))
+            .shadow(color: .black.opacity(0.25), radius: 22, y: 10)
+        }
+    }
+
+    private func submitPairing(with peer: LocalSendPeer) {
+        guard !isSubmittingPair, pairingPinInput.count == 4 else { return }
+        isSubmittingPair = true
+        pairingErrorText = ""
+        let pin = pairingPinInput
+        Task {
+            let (ok, msg) = await localSend.pair(with: peer, pin: pin)
+            await MainActor.run {
+                isSubmittingPair = false
+                if ok {
+                    if tab == .catalog {
+                        Task { await localSend.fetchPCCatalog(from: peer) }
+                    }
+                } else {
+                    pairingErrorText = msg
+                    pairingShakeCount += 1
+                    UINotificationFeedbackGenerator().notificationOccurred(.error)
+                }
+            }
         }
     }
 
@@ -135,14 +270,8 @@ struct LocalSendSheetView: View {
 
     private var sheetHeader: some View {
         HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("跨端互联")
-                    .font(.system(size: 22, weight: .bold, design: .rounded))
-                Text("WallPull 独立局域网高速频段（与 LocalSend 彻底隔离）· 支持一键全收与剪贴板联动")
-                    .font(.system(size: 12.5))
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-            }
+            Text("跨端互联")
+                .font(.system(size: 22, weight: .bold, design: .rounded))
             Spacer()
             HStack(spacing: 8) {
                 Button {
@@ -176,7 +305,7 @@ struct LocalSendSheetView: View {
             }
         }
         .padding(.horizontal, 24)
-        .padding(.top, 20)
+        .padding(.top, 18)
         .padding(.bottom, 12)
     }
 
@@ -186,17 +315,12 @@ struct LocalSendSheetView: View {
                 WallPullSectionCard(
                     title: "本机接收服务",
                     icon: "dot.radiowaves.left.and.right",
-                    badge: "\(localSend.localIP):\(localSend.listeningPort)"
+                    badge: "\(localSend.localIP):\(String(localSend.listeningPort))"
                 ) {
-                    VStack(alignment: .leading, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 10) {
                         HStack {
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(vault.deviceAlias)
-                                    .font(.system(size: 16, weight: .semibold))
-                                Text("使用专属 WallPull 频段与电脑端直连（不与 LocalSend 等其他传文件软件冲突），收到文件将永久存入本机离线库。")
-                                    .font(.system(size: 12.5))
-                                    .foregroundColor(.secondary)
-                            }
+                            Text(vault.deviceAlias)
+                                .font(.system(size: 16, weight: .semibold))
                             Spacer()
                             HStack(spacing: 6) {
                                 Circle().fill(Color.green).frame(width: 8, height: 8)
@@ -208,31 +332,40 @@ struct LocalSendSheetView: View {
                             .padding(.vertical, 5)
                             .background(Color.green.opacity(0.12), in: Capsule())
                         }
-
                         Divider()
-
                         HStack(spacing: 10) {
-                            Text("未连接顶栏署名")
-                                .font(.system(size: 13, weight: .semibold))
+                            Text("配对码")
+                                .font(.system(size: 13, weight: .medium))
                                 .foregroundColor(.secondary)
-                            ClampedBadgeTextField(
-                                placeholder: "默认「电脑互联」（英文<=10 / 中文<=7）",
-                                text: $vault.customDisconnectedLabel
-                            )
-                            .frame(height: 20)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 7)
-                            .background(WallPullPalette.elevatedPill(colorScheme), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                    .strokeBorder(WallPullPalette.hairline(colorScheme), lineWidth: 1)
-                            )
-                            if !vault.customDisconnectedLabel.isEmpty {
-                                Button("重置") {
-                                    vault.customDisconnectedLabel = ""
-                                }
-                                .font(.system(size: 12, weight: .semibold))
+                            Text(localSend.pairPin)
+                                .font(.system(size: 14, weight: .bold, design: .monospaced))
                                 .foregroundColor(vault.accentColor)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 4)
+                                .background(vault.accentColor.opacity(0.12), in: Capsule())
+                            Button {
+                                localSend.rotatePairPin()
+                            } label: {
+                                Text("换码")
+                                    .font(.system(size: 12.5, weight: .semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 4)
+                                    .background(WallPullPalette.track(colorScheme), in: Capsule())
+                            }
+                            .buttonStyle(StickerPressButtonStyle())
+                            Spacer()
+                            if !localSend.trustedPeers.isEmpty {
+                                Button {
+                                    localSend.clearTrustedPeers()
+                                } label: {
+                                    Text("解除配对 (\(localSend.trustedPeers.count))")
+                                        .font(.system(size: 12, weight: .semibold))
+                                        .foregroundColor(.red)
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 4)
+                                        .background(Color.red.opacity(0.10), in: Capsule())
+                                }
+                                .buttonStyle(StickerPressButtonStyle())
                             }
                         }
                     }
@@ -243,7 +376,7 @@ struct LocalSendSheetView: View {
                     icon: "desktopcomputer"
                 ) {
                     if localSend.peers.isEmpty {
-                        Text("暂未发现其他设备。请确认电脑端 WallPull v1.0.2 已打开并连在同一个 Wi-Fi 下。")
+                        Text("暂未发现电脑端设备，请确认电脑与平板处于同一局域网。")
                             .font(.system(size: 13))
                             .foregroundColor(.secondary)
                     } else {
@@ -265,7 +398,7 @@ struct LocalSendSheetView: View {
                                                 .padding(.vertical, 2)
                                                 .background((peer.isWallPullPC ? vault.accentColor : Color.secondary).opacity(0.14), in: Capsule())
                                         }
-                                        Text("\(peer.scheme.uppercased()) · \(peer.ip):\(peer.port)")
+                                        Text("\(peer.scheme.uppercased()) · \(peer.ip):\(String(peer.port))")
                                             .font(.system(size: 12, design: .monospaced))
                                             .foregroundColor(.secondary)
                                     }
@@ -299,9 +432,9 @@ struct LocalSendSheetView: View {
                     }
                 }
 
-                WallPullSectionCard(title: "手动输入电脑地址直连（可选兜底）", icon: "link") {
+                WallPullSectionCard(title: "手动输入 IP 直连", icon: "link") {
                     HStack(spacing: 10) {
-                        TextField("例如 192.168.1.108 或 192.168.1.108:53417", text: $manualIP)
+                        TextField("如 192.168.1.8", text: $manualIP)
                             .keyboardType(.numbersAndPunctuation)
                             .autocorrectionDisabled()
                             .padding(.horizontal, 12)
@@ -339,8 +472,8 @@ struct LocalSendSheetView: View {
     private func catalogToolbar(for pc: LocalSendPeer) -> some View {
         let searchBox = HStack(spacing: 6) {
             Image(systemName: "magnifyingglass").foregroundColor(.secondary)
-            TextField("搜索电脑已解析壁纸…", text: $catalogQuery)
-                .frame(minWidth: 105, maxWidth: 145)
+            TextField("搜索壁纸名称…", text: $catalogQuery)
+                .frame(width: 168)
             if !catalogQuery.isEmpty {
                 Button {
                     catalogQuery = ""
@@ -361,6 +494,7 @@ struct LocalSendSheetView: View {
             label: { $0.rawValue },
             height: 34
         )
+        .fixedSize(horizontal: true, vertical: false)
 
         let ratingPill = WallPullSegmentedPill(
             options: CatalogRatingOpt.allCases,
@@ -368,6 +502,7 @@ struct LocalSendSheetView: View {
             label: { $0.rawValue },
             height: 34
         )
+        .fixedSize(horizontal: true, vertical: false)
 
         let pendingList = unimportedFilteredCatalog
         let pendingIDs = Set(pendingList.map(\.id))
@@ -390,6 +525,7 @@ struct LocalSendSheetView: View {
         }
         .buttonStyle(StickerPressButtonStyle())
 
+        let isBusyPulling = !localSend.activePullIDs.isEmpty
         let pullAllButton = Button {
             if pendingList.count > 30 {
                 showPullAllConfirm = true
@@ -400,16 +536,22 @@ struct LocalSendSheetView: View {
             HStack(spacing: 5) {
                 Image(systemName: "tray.and.arrow.down.fill")
                     .font(.system(size: 12, weight: .bold))
-                Text(pendingList.isEmpty ? "已全部入库" : "一键全部收入 (\(pendingList.count))")
+                Text(
+                    isBusyPulling
+                        ? "传输中…"
+                        : (pendingList.isEmpty
+                            ? "已全部入库"
+                            : "一键全部收入 (\(pendingList.count) · \(formatFileSize(unimportedTotalBytes)))")
+                )
                     .font(.system(size: 12.5, weight: .semibold))
                     .fixedSize(horizontal: true, vertical: false)
             }
-            .foregroundColor(pendingList.isEmpty ? .secondary : .white)
+            .foregroundColor(pendingList.isEmpty || isBusyPulling ? .secondary : .white)
             .padding(.horizontal, 13)
             .frame(height: 34)
-            .background(pendingList.isEmpty ? WallPullPalette.track(colorScheme) : vault.accentColor, in: Capsule())
+            .background((pendingList.isEmpty || isBusyPulling) ? WallPullPalette.track(colorScheme) : vault.accentColor, in: Capsule())
         }
-        .disabled(pendingList.isEmpty || localSend.transferProgress != nil)
+        .disabled(pendingList.isEmpty || isBusyPulling)
         .buttonStyle(StickerPressButtonStyle())
 
         let refreshButton = Button {
@@ -478,7 +620,51 @@ struct LocalSendSheetView: View {
 
                     if localSend.isLoadingCatalog && localSend.pcCatalog.isEmpty {
                         Spacer()
-                        ProgressView("正在读取电脑端已提取壁纸目录…")
+                        ProgressView("正在读取电脑端壁纸目录…")
+                        Spacer()
+                    } else if let errMsg = localSend.catalogErrorMessage, localSend.pcCatalog.isEmpty {
+                        Spacer()
+                        VStack(spacing: 12) {
+                            Image(systemName: "wifi.exclamationmark")
+                                .font(.system(size: 38))
+                                .foregroundColor(.secondary)
+                            Text(errMsg)
+                                .font(.headline)
+                                .multilineTextAlignment(.center)
+                            Button {
+                                Task { await localSend.fetchPCCatalog(from: pc) }
+                            } label: {
+                                Text("重试")
+                                    .font(.system(size: 13.5, weight: .semibold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 18)
+                                    .padding(.vertical, 8)
+                                    .background(vault.accentColor, in: Capsule())
+                            }
+                            .buttonStyle(StickerPressButtonStyle())
+                        }
+                        .padding(24)
+                        Spacer()
+                    } else if localSend.pcCatalog.isEmpty && !localSend.isPeerTrusted(pc) {
+                        Spacer()
+                        VStack(spacing: 12) {
+                            Image(systemName: "lock.shield")
+                                .font(.system(size: 38))
+                                .foregroundColor(vault.accentColor)
+                            Text("需要输入配对码连接「\(pc.alias)」")
+                                .font(.headline)
+                            Button {
+                                localSend.pairingRequiredPeer = pc
+                            } label: {
+                                Text("输入配对码")
+                                    .font(.system(size: 13.5, weight: .semibold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 18)
+                                    .padding(.vertical, 8)
+                                    .background(vault.accentColor, in: Capsule())
+                            }
+                            .buttonStyle(StickerPressButtonStyle())
+                        }
                         Spacer()
                     } else if filteredCatalog.isEmpty && !localSend.pcCatalog.isEmpty {
                         Spacer()
@@ -505,135 +691,52 @@ struct LocalSendSheetView: View {
                         Spacer()
                     } else {
                         ScrollView {
-                            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 14), count: 3), spacing: 14) {
+                            let filterSig = "\(catalogTypeOpt.rawValue)|\(catalogRatingOpt.rawValue)|\(catalogQuery)|\(filteredCatalog.count)".hashValue
+                            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 14), count: 3), spacing: 16) {
                                 ForEach(filteredCatalog) { item in
                                     let isSel = selectedCatalogIDs.contains(item.id)
                                     let owned = vault.hasImportedCatalogItem(item)
-                                    let crLower = (item.contentRating ?? "everyone").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                                    VStack(alignment: .leading, spacing: 8) {
-                                        ZStack(alignment: .topTrailing) {
-                                            Color.clear
-                                                .aspectRatio(16.0 / 10.0, contentMode: .fit)
-                                                .overlay(
-                                                    LANThumbView(item: item, peer: pc, localSend: localSend)
-                                                )
-                                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-
-                                            VStack {
-                                                HStack {
-                                                    if isSel {
-                                                        SpringCheckBadge(checked: true, accentColor: vault.accentColor, size: 22)
-                                                    } else {
-                                                        HStack(spacing: 4) {
-                                                            if (item.assetCount ?? 1) > 1 {
-                                                                Text("\(item.assetCount ?? 1) 张")
-                                                                    .font(.system(size: 9.5, weight: .bold))
-                                                                    .foregroundColor(.white)
-                                                                    .padding(.horizontal, 6)
-                                                                    .padding(.vertical, 2.5)
-                                                                    .background(Color.black.opacity(0.6), in: Capsule())
-                                                            }
-                                                            if item.supportsStudio {
-                                                                Text("✦ 可拆")
-                                                                    .font(.system(size: 9.5, weight: .bold))
-                                                                    .foregroundColor(.white)
-                                                                    .padding(.horizontal, 6)
-                                                                    .padding(.vertical, 2.5)
-                                                                    .background(vault.accentColor.opacity(0.9), in: Capsule())
-                                                            }
-                                                            if crLower == "mature" {
-                                                                Text("18+")
-                                                                    .font(.system(size: 9.5, weight: .bold))
-                                                                    .foregroundColor(.white)
-                                                                    .padding(.horizontal, 6)
-                                                                    .padding(.vertical, 2.5)
-                                                                    .background(Color(hex: "#EF4444").opacity(0.92), in: Capsule())
-                                                            } else if crLower == "questionable" {
-                                                                Text("擦边")
-                                                                    .font(.system(size: 9.5, weight: .bold))
-                                                                    .foregroundColor(.white)
-                                                                    .padding(.horizontal, 6)
-                                                                    .padding(.vertical, 2.5)
-                                                                    .background(Color.orange.opacity(0.92), in: Capsule())
-                                                            }
-                                                            if item.hasMusic {
-                                                                Image(systemName: "music.note")
-                                                                    .font(.system(size: 9.5, weight: .bold))
-                                                                    .foregroundColor(.white)
-                                                                    .padding(5)
-                                                                    .background(Color.black.opacity(0.55), in: Circle())
-                                                            }
-                                                        }
-                                                    }
-                                                    Spacer()
-                                                    if owned {
-                                                        Text("✓ 已入库")
-                                                            .font(.caption2.weight(.semibold))
-                                                            .foregroundColor(.white)
-                                                            .padding(.horizontal, 7)
-                                                            .padding(.vertical, 3)
-                                                            .background(Color.green.opacity(0.88), in: Capsule())
-                                                    }
-                                                }
-                                                Spacer()
-                                                if item.isVideo {
-                                                    HStack {
-                                                        Spacer()
-                                                        Text(item.duration ?? "视频")
-                                                            .font(.caption2.weight(.semibold))
-                                                            .foregroundColor(.white)
-                                                            .padding(.horizontal, 7)
-                                                            .padding(.vertical, 3)
-                                                            .background(Color.black.opacity(0.6), in: Capsule())
-                                                    }
-                                                }
-                                            }
-                                            .padding(6)
-                                        }
-                                        .contentShape(Rectangle())
-                                        .onTapGesture {
+                                    let isPullingThis = localSend.activePullIDs.contains(item.id)
+                                    let anyPullActive = !localSend.activePullIDs.isEmpty
+                                    let req = localSend.makePCThumbRequest(for: item, peer: pc)
+                                    PCCatalogCardCell(
+                                        item: item,
+                                        thumbCacheKey: "\(pc.ip):\(item.id)",
+                                        thumbRequest: req,
+                                        thumbSession: localSend.lanURLSession,
+                                        filterSignature: filterSig,
+                                        isSelected: isSel,
+                                        owned: owned,
+                                        isPullingThis: isPullingThis,
+                                        anyPullActive: anyPullActive,
+                                        accentColor: vault.accentColor,
+                                        colorScheme: colorScheme,
+                                        catalogFrameTracker: catalogFrameTracker,
+                                        onToggleSelect: {
                                             if isSel { selectedCatalogIDs.remove(item.id) }
                                             else { selectedCatalogIDs.insert(item.id) }
                                             UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                        }
-
-                                        Text(item.title)
-                                            .font(.system(size: 13.5, weight: .semibold))
-                                            .lineLimit(1)
-                                        HStack {
-                                            Text("\(item.resolution ?? "") · \(formatFileSize(item.fileSize))")
-                                                .font(.system(size: 11))
-                                                .foregroundColor(.secondary)
-                                                .lineLimit(1)
-                                            Spacer()
-                                            Button {
-                                                Task { await localSend.pullCatalogItemsToVault([item], from: pc) }
-                                            } label: {
-                                                Text(owned ? "已存在" : "收入平板")
-                                                    .font(.system(size: 11.5, weight: .semibold))
-                                                    .foregroundColor(owned ? .secondary : .white)
-                                                    .fixedSize(horizontal: true, vertical: false)
-                                                    .padding(.horizontal, 10)
-                                                    .padding(.vertical, 4)
-                                                    .background(owned ? WallPullPalette.track(colorScheme) : vault.accentColor, in: Capsule())
+                                        },
+                                        onPreview: {
+                                            let rect = catalogFrameTracker.rect(for: "cat_\(item.id)")
+                                            let cover = localSend.cachedThumbImage(for: item, peer: pc)
+                                            onOpenCatalogPreview(item, filteredCatalog, pc, rect, cover)
+                                        },
+                                        onPullSingle: {
+                                            Task { await localSend.pullCatalogItemsToVault([item], from: pc) }
+                                        },
+                                        onUnauthorized: {
+                                            if localSend.pairingRequiredPeer == nil {
+                                                localSend.pairingRequiredPeer = pc
                                             }
-                                            .disabled(owned)
-                                            .buttonStyle(StickerPressButtonStyle())
                                         }
-                                    }
-                                    .padding(10)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                            .fill(WallPullPalette.cardSurface(colorScheme))
                                     )
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                            .strokeBorder(isSel ? vault.accentColor : WallPullPalette.hairline(colorScheme), lineWidth: isSel ? 2.5 : 1)
-                                    )
+                                    .equatable()
                                 }
                             }
                             .padding(.horizontal, 24)
-                            .padding(.bottom, selectedCatalogIDs.isEmpty ? 28 : 88)
+                            .padding(.top, 6)
+                            .padding(.bottom, selectedCatalogIDs.isEmpty ? 20 : 88)
                         }
 
                         if !selectedCatalogIDs.isEmpty {
@@ -652,7 +755,7 @@ struct LocalSendSheetView: View {
                                         .background(WallPullPalette.track(colorScheme), in: Capsule())
                                 }
                                 Button {
-                                    let chosen = localSend.pcCatalog.filter { selectedCatalogIDs.contains($0.id) }
+                                    let chosen = filteredCatalog.filter { selectedCatalogIDs.contains($0.id) && !vault.hasImportedCatalogItem($0) }
                                     selectedCatalogIDs.removeAll()
                                     startPullAndReturnToGallery(chosen, from: pc)
                                 } label: {
@@ -663,6 +766,7 @@ struct LocalSendSheetView: View {
                                         .padding(.vertical, 7)
                                         .background(vault.accentColor, in: Capsule())
                                 }
+                                .disabled(!localSend.activePullIDs.isEmpty)
                             }
                             .padding(.horizontal, 20)
                             .padding(.vertical, 12)
@@ -702,5 +806,177 @@ struct LocalSendSheetView: View {
                 Spacer()
             }
         }
+    }
+}
+
+private struct PCCatalogCardCell: View, Equatable {
+    let item: PCCatalogItem
+    let thumbCacheKey: String
+    let thumbRequest: URLRequest?
+    let thumbSession: URLSession
+    let filterSignature: Int
+    let isSelected: Bool
+    let owned: Bool
+    let isPullingThis: Bool
+    let anyPullActive: Bool
+    let accentColor: Color
+    let colorScheme: ColorScheme
+    let catalogFrameTracker: CardFrameTracker
+    let onToggleSelect: () -> Void
+    let onPreview: () -> Void
+    let onPullSingle: () -> Void
+    let onUnauthorized: () -> Void
+
+    static func == (lhs: PCCatalogCardCell, rhs: PCCatalogCardCell) -> Bool {
+        lhs.item == rhs.item
+            && lhs.thumbCacheKey == rhs.thumbCacheKey
+            && lhs.thumbRequest == rhs.thumbRequest
+            && lhs.filterSignature == rhs.filterSignature
+            && lhs.isSelected == rhs.isSelected
+            && lhs.owned == rhs.owned
+            && lhs.isPullingThis == rhs.isPullingThis
+            && lhs.anyPullActive == rhs.anyPullActive
+            && lhs.accentColor == rhs.accentColor
+            && lhs.colorScheme == rhs.colorScheme
+    }
+
+    var body: some View {
+        let crLower = (item.contentRating ?? "everyone").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return VStack(alignment: .leading, spacing: 8) {
+            ZStack(alignment: .topTrailing) {
+                Color.clear
+                    .aspectRatio(16.0 / 10.0, contentMode: .fit)
+                    .overlay(
+                        LANThumbView(
+                            cacheKey: thumbCacheKey,
+                            request: thumbRequest,
+                            session: thumbSession,
+                            isVideo: item.isVideo,
+                            onUnauthorized: onUnauthorized
+                        )
+                    )
+                    .background(CardAnchorView(id: "cat_\(item.id)", tracker: catalogFrameTracker))
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+                VStack {
+                    HStack(alignment: .top) {
+                        Button(action: onToggleSelect) {
+                            SpringCheckBadge(checked: isSelected, accentColor: accentColor, size: 22)
+                                .wallPullMinimumHitArea(22)
+                                .padding(2)
+                        }
+                        .buttonStyle(.plain)
+
+                        Spacer()
+
+                        HStack(spacing: 4) {
+                            if item.isPCFavorite {
+                                Image(systemName: "heart.fill")
+                                    .font(.system(size: 10, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .padding(5)
+                                    .background(Color(hex: "#FF4D6D").opacity(0.92), in: Circle())
+                            }
+                            if owned {
+                                Text("✓ 已入库")
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 7)
+                                    .padding(.vertical, 3)
+                                    .background(Color.green.opacity(0.88), in: Capsule())
+                            }
+                        }
+                    }
+                    Spacer()
+                    HStack {
+                        HStack(spacing: 4) {
+                            if (item.assetCount ?? 1) > 1 {
+                                Text("\(item.assetCount ?? 1) 张")
+                                    .font(.system(size: 9.5, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2.5)
+                                    .background(Color.black.opacity(0.6), in: Capsule())
+                            }
+                            if item.supportsStudio {
+                                Text("✦ 可拆")
+                                    .font(.system(size: 9.5, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2.5)
+                                    .background(accentColor.opacity(0.9), in: Capsule())
+                            }
+                            if crLower == "mature" {
+                                Text("18+")
+                                    .font(.system(size: 9.5, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2.5)
+                                    .background(Color(hex: "#EF4444").opacity(0.92), in: Capsule())
+                            } else if crLower == "questionable" {
+                                Text("擦边")
+                                    .font(.system(size: 9.5, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2.5)
+                                    .background(Color.orange.opacity(0.92), in: Capsule())
+                            }
+                            if item.hasMusic {
+                                Image(systemName: "music.note")
+                                    .font(.system(size: 9.5, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .padding(5)
+                                    .background(Color.black.opacity(0.55), in: Circle())
+                            }
+                        }
+                        Spacer()
+                        if item.isVideo {
+                            Text(item.duration ?? "视频")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(Color.black.opacity(0.6), in: Capsule())
+                        }
+                    }
+                }
+                .padding(6)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture(perform: onPreview)
+
+            Text(item.title)
+                .font(.system(size: 13.5, weight: .semibold))
+                .lineLimit(1)
+                .frame(height: 17, alignment: .leading)
+            HStack {
+                Text("\(item.resolution ?? "") · \(formatFileSize(item.fileSize))")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                Spacer()
+                Button(action: onPullSingle) {
+                    Text(owned ? "已存在" : (isPullingThis ? "传输中" : "收入平板"))
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundColor(owned || isPullingThis ? .secondary : .white)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background((owned || isPullingThis) ? WallPullPalette.track(colorScheme) : accentColor, in: Capsule())
+                }
+                .disabled(owned || isPullingThis || anyPullActive)
+                .buttonStyle(StickerPressButtonStyle())
+            }
+            .frame(height: 24)
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(WallPullPalette.cardSurface(colorScheme))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(isSelected ? accentColor : WallPullPalette.hairline(colorScheme), lineWidth: isSelected ? 2.5 : 1)
+        )
     }
 }

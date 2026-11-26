@@ -4,8 +4,10 @@ const pending = new Set()
 let scratchCanvas = null
 let scratchCtx = null
 let notifyTimer = null
+let activeRunGeneration = 0
 
 export function resetColorCache() {
+  activeRunGeneration += 1
   colorCache.clear()
   pending.clear()
   if (notifyTimer) {
@@ -99,9 +101,17 @@ export function getCachedColorBucket(itemOrId) {
 }
 
 export function sniffWallpaperColors(items, onUpdated) {
+  const gen = ++activeRunGeneration
+  let disposed = false
+  let idleHandle = null
+  let timeoutHandle = null
+  const inRunPending = new Set()
+
   if (!Array.isArray(items) || items.length === 0) {
     onUpdated?.({ indexed: 0, total: 0, running: false })
-    return
+    return () => {
+      disposed = true
+    }
   }
 
   let preIndexed = 0
@@ -117,33 +127,53 @@ export function sniffWallpaperColors(items, onUpdated) {
       preIndexed += 1
       continue
     }
-    if (!pending.has(item.id) && (item.previewUrl || item.mediaUrl)) {
-      queue.push(item)
+    const thumbUrl = item.previewUrl || (item.type !== 'video' ? item.mediaUrl : '')
+    if (!pending.has(item.id) && thumbUrl) {
+      queue.push({ item, url: thumbUrl })
     }
   }
 
   const total = items.length
   if (queue.length === 0) {
     onUpdated?.({ indexed: preIndexed, total, running: false })
-    return
+    return () => {
+      disposed = true
+    }
   }
 
   let doneCount = preIndexed
   onUpdated?.({ indexed: doneCount, total, running: true })
 
   let index = 0
+  const isActive = () => !disposed && activeRunGeneration === gen
+
+  const scheduleNext = fn => {
+    if (typeof globalThis.requestIdleCallback === 'function') {
+      idleHandle = globalThis.requestIdleCallback(fn, { timeout: 800 })
+    } else {
+      timeoutHandle = globalThis.setTimeout(fn, 48)
+    }
+  }
+
   const step = () => {
+    idleHandle = null
+    timeoutHandle = null
+    if (!isActive()) return
+
     const batch = queue.slice(index, index + 6)
     index += 6
 
-    for (const item of batch) {
+    for (const entry of batch) {
+      const { item, url } = entry
       pending.add(item.id)
-      const url = item.previewUrl || item.mediaUrl
+      inRunPending.add(item.id)
       const img = new Image()
       img.crossOrigin = 'anonymous'
       img.decoding = 'async'
       img.onload = () => {
         pending.delete(item.id)
+        inRunPending.delete(item.id)
+        if (!isActive()) return
         try {
           const ctx = getScratchContext()
           if (ctx) {
@@ -156,40 +186,48 @@ export function sniffWallpaperColors(items, onUpdated) {
           // Cross-origin fallback ignored silently
         }
         doneCount += 1
-        scheduleColorUpdate(() =>
+        scheduleColorUpdate(() => {
+          if (!isActive()) return
           onUpdated?.({
             indexed: Math.min(total, doneCount),
             total,
-            running: pending.size > 0 || index < queue.length,
-          }),
-        )
+            running: inRunPending.size > 0 || index < queue.length,
+          })
+        })
       }
       img.onerror = () => {
         pending.delete(item.id)
+        inRunPending.delete(item.id)
+        if (!isActive()) return
         doneCount += 1
-        scheduleColorUpdate(() =>
+        scheduleColorUpdate(() => {
+          if (!isActive()) return
           onUpdated?.({
             indexed: Math.min(total, doneCount),
             total,
-            running: pending.size > 0 || index < queue.length,
-          }),
-        )
+            running: inRunPending.size > 0 || index < queue.length,
+          })
+        })
       }
       img.src = url
     }
 
-    if (index < queue.length) {
-      if (typeof globalThis.requestIdleCallback === 'function') {
-        globalThis.requestIdleCallback(step, { timeout: 800 })
-      } else {
-        globalThis.setTimeout(step, 48)
-      }
+    if (index < queue.length && isActive()) {
+      scheduleNext(step)
     }
   }
 
-  if (typeof globalThis.requestIdleCallback === 'function') {
-    globalThis.requestIdleCallback(step, { timeout: 500 })
-  } else {
-    globalThis.setTimeout(step, 32)
+  scheduleNext(step)
+
+  return () => {
+    disposed = true
+    for (const id of inRunPending) pending.delete(id)
+    inRunPending.clear()
+    if (idleHandle && typeof globalThis.cancelIdleCallback === 'function') {
+      globalThis.cancelIdleCallback(idleHandle)
+    }
+    if (timeoutHandle) {
+      globalThis.clearTimeout(timeoutHandle)
+    }
   }
 }

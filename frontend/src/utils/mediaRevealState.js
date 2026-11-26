@@ -31,7 +31,7 @@ export function preloadWallpaperBatch(items, startIndex = 0, count = 24) {
   const slice = items.slice(startIndex, startIndex + count)
   const run = () => {
     for (const item of slice) {
-      const url = item.previewUrl || item.mediaUrl
+      const url = item.previewUrl || (item.type !== 'video' ? item.mediaUrl : '')
       if (url) preloadImageUrl(url)
     }
   }

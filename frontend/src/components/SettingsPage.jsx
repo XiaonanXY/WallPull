@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { ArrowsClockwise, ChatCircleDots, Cpu, DeviceTablet, GithubLogo, Info, X } from '@phosphor-icons/react'
 import { AnimatePresence, motion } from 'motion/react'
 import { formatColor } from '@appica/ui-react'
@@ -51,6 +51,7 @@ export default function SettingsPage({
   layoutMode = 'island',
   onClose,
   settings,
+  savedSettings = null,
   setSettings,
   isDark = false,
   isDirty = false,
@@ -67,23 +68,30 @@ export default function SettingsPage({
   checkingUpdate = false,
   localsendStatus = null,
   onRefreshLocalsend,
+  onRotatePin,
+  onUnpairAll,
+  suppressEscape = false,
   onCheckUpdate,
   onOpenExternalUrl,
   sendNativeMessage,
   persistSettings,
 }) {
   const [savedNotice, setSavedNotice] = useState(false)
+  const noticeTimerRef = useRef(null)
+  const restartTimerRef = useRef(null)
   const sliderMax = 100
   const currentAccelMode = settings.hardwareAccelerationMode === 'cpu' ? 'cpu' : 'gpu'
   const currentThemeMode = settings.themeMode === 'dark' ? 'dark' : 'light'
-  const selectedAccelMeta = HARDWARE_ACCELERATION_MODES.find(
-    item => item.value === currentAccelMode,
-  ) ?? HARDWARE_ACCELERATION_MODES[0]
   const needsRestartForAccel = currentAccelMode !== activeHardwareAccelerationMode
   const hasInvalidColor = !isValidHexColor(settings.sparkColor)
 
+  useEffect(() => () => {
+    if (noticeTimerRef.current) globalThis.clearTimeout(noticeTimerRef.current)
+    if (restartTimerRef.current) globalThis.clearTimeout(restartTimerRef.current)
+  }, [])
+
   useEffect(() => {
-    if (!visible) return undefined
+    if (!visible || suppressEscape) return undefined
     const handleEscape = event => {
       if (event.key === 'Escape') {
         event.preventDefault()
@@ -92,18 +100,29 @@ export default function SettingsPage({
     }
     globalThis.addEventListener('keydown', handleEscape)
     return () => globalThis.removeEventListener('keydown', handleEscape)
-  }, [onClose, visible])
+  }, [onClose, suppressEscape, visible])
+
+  const commitSettingPatch = patch => {
+    if (savedSettings) {
+      persistSettings?.({ ...savedSettings, ...patch }, { ...settings, ...patch })
+    } else {
+      persistSettings?.({ ...settings, ...patch })
+    }
+  }
 
   const handleSave = () => {
     if (hasInvalidColor) return
     persistSettings(settings)
     setSavedNotice(true)
-    globalThis.setTimeout(() => setSavedNotice(false), 2000)
+    if (noticeTimerRef.current) globalThis.clearTimeout(noticeTimerRef.current)
+    noticeTimerRef.current = globalThis.setTimeout(() => setSavedNotice(false), 2000)
   }
 
   const saveAndRestart = () => {
+    if (hasInvalidColor) return
     persistSettings(settings)
-    globalThis.setTimeout(() => {
+    if (restartTimerRef.current) globalThis.clearTimeout(restartTimerRef.current)
+    restartTimerRef.current = globalThis.setTimeout(() => {
       sendNativeMessage('app.restart.request')
     }, 150)
   }
@@ -113,7 +132,6 @@ export default function SettingsPage({
       <div className="flex items-start justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">设置</h1>
-          <p className="mt-1 text-sm text-base-content/65">扫描、导出、外观与硬件加速选项都保存在本机。</p>
         </div>
         <div className="flex items-center gap-2">
           {savedNotice ? (
@@ -162,11 +180,11 @@ export default function SettingsPage({
                   选择
                 </button>
               </div>
-              <p className="label whitespace-normal">
-                {detectedWorkshopRoots.length > 0
-                  ? `当前已自动检测到：${detectedWorkshopRoots.join('；')}`
-                  : '未检测到默认目录时，可点击「自动检测」全盘查找或手动选择。'}
-              </p>
+              {detectedWorkshopRoots.length > 0 && !settings.workshopRoot ? (
+                <p className="label whitespace-normal">
+                  已自动识别：{detectedWorkshopRoots.join('；')}
+                </p>
+              ) : null}
             </fieldset>
 
             <fieldset className="fieldset">
@@ -191,9 +209,9 @@ export default function SettingsPage({
 
             <div className="flex flex-wrap items-center justify-between gap-3 border-t border-base-300/60 pt-4">
               <div>
-                <p className="text-sm font-medium">本地预览与解包缓存</p>
-                <p className="mt-0.5 text-xs text-base-content/60">
-                  当前占用：{cacheSizeBytes > 0 ? formatBytes(cacheSizeBytes) : '计算中 / 0 B'}（清理不会删除创意工坊源文件或已导出的壁纸）
+                <p className="text-sm font-medium">本地缓存</p>
+                <p className="mt-0.5 text-xs text-base-content/60 tabular-nums">
+                  {cacheSizeBytes > 0 ? formatBytes(cacheSizeBytes) : '0 B'}
                 </p>
               </div>
               <button
@@ -222,16 +240,13 @@ export default function SettingsPage({
                       type="button"
                       className={`btn btn-sm ${isActive ? 'btn-primary' : 'btn-ghost'}`}
                       aria-pressed={isActive}
-                      onClick={() => persistSettings({ ...settings, themeMode: item.value })}
+                      onClick={() => commitSettingPatch({ themeMode: item.value })}
                     >
                       {item.label}
                     </button>
                   )
                 })}
               </div>
-              <p className="label whitespace-normal">
-                暗色模式下自动启用深色画布与流光白字壁纸标题，更适合暗光环境浏览。
-              </p>
             </fieldset>
 
             <fieldset className="fieldset">
@@ -245,7 +260,7 @@ export default function SettingsPage({
                   onValueChange={color => {
                     const hex = extractSixDigitHex(color)
                     if (hex) {
-                      persistSettings({ ...settings, sparkColor: hex })
+                      commitSettingPatch({ sparkColor: hex })
                     }
                   }}
                 >
@@ -264,9 +279,6 @@ export default function SettingsPage({
                   aria-label="自定义界面主题色号"
                 />
               </div>
-              <p className="label whitespace-normal">
-                同时控制按钮、选中状态、滑杆和点击火花。支持六位色号，例如 #0066FF。
-              </p>
             </fieldset>
 
             <fieldset className="fieldset">
@@ -313,9 +325,6 @@ export default function SettingsPage({
                   aria-label="火花大小百分比"
                 />
               </div>
-              <p className="label whitespace-normal">
-                0 为关闭，100 为标准大小；右侧输入框数值不限上限。
-              </p>
             </fieldset>
 
             <fieldset className="fieldset">
@@ -329,19 +338,13 @@ export default function SettingsPage({
                       type="button"
                       className={`btn btn-sm ${isActive ? 'btn-primary' : 'btn-ghost'}`}
                       aria-pressed={isActive}
-                      onClick={() => persistSettings({
-                        ...settings,
-                        selectionBorderMode: item.value,
-                      })}
+                      onClick={() => commitSettingPatch({ selectionBorderMode: item.value })}
                     >
                       {item.label}
                     </button>
                   )
                 })}
               </div>
-              <p className="label whitespace-normal">
-                环绕流光沿图片边缘移动；旋转边框保留当前整框旋转效果。
-              </p>
             </fieldset>
 
             <fieldset className="fieldset">
@@ -355,19 +358,13 @@ export default function SettingsPage({
                       type="button"
                       className={`btn btn-sm ${isActive ? 'btn-primary' : 'btn-ghost'}`}
                       aria-pressed={isActive}
-                      onClick={() => persistSettings({
-                        ...settings,
-                        navigationStyle: item.value,
-                      })}
+                      onClick={() => commitSettingPatch({ navigationStyle: item.value })}
                     >
                       {item.label}
                     </button>
                   )
                 })}
               </div>
-              <p className="label whitespace-normal">
-                默认使用右上角一体工具岛搭配居中毛玻璃弹窗；也可随时切回分立齿轮与右侧抽屉（改主题色时可直接对照左侧壁纸效果）。
-              </p>
             </fieldset>
 
             <fieldset className="fieldset">
@@ -381,16 +378,13 @@ export default function SettingsPage({
                       type="button"
                       className={`btn btn-sm ${isActive ? 'btn-primary' : 'btn-ghost'}`}
                       aria-pressed={isActive}
-                      onClick={() => persistSettings({ ...settings, cardMode: item.value })}
+                      onClick={() => commitSettingPatch({ cardMode: item.value })}
                     >
                       {item.value === 'tilt' ? '全息 3D 倾斜' : '磁吸弹性跟随'}
                     </button>
                   )
                 })}
               </div>
-              <p className="label whitespace-normal">
-                从主界面收口进此处，保持日常浏览区简洁。
-              </p>
             </fieldset>
           </section>
 
@@ -402,9 +396,6 @@ export default function SettingsPage({
             <div className="flex flex-wrap items-center justify-between gap-4">
               <div>
                 <p className="text-sm font-medium">关闭窗口时最小化到系统托盘</p>
-                <p className="mt-0.5 text-xs text-base-content/60">
-                  开启后点击右上角 × 会缩进右下角系统托盘待命，右键托盘图标可随时唤出主窗口或彻底退出。
-                </p>
               </div>
               <button
                 type="button"
@@ -412,10 +403,7 @@ export default function SettingsPage({
                 className="wv-switch"
                 aria-label="关闭时最小化到系统托盘"
                 aria-checked={Boolean(settings.closeToTray)}
-                onClick={() => persistSettings({
-                  ...settings,
-                  closeToTray: !settings.closeToTray,
-                })}
+                onClick={() => commitSettingPatch({ closeToTray: !settings.closeToTray })}
               >
                 <span className="wv-switch__thumb" />
               </button>
@@ -428,7 +416,7 @@ export default function SettingsPage({
                 <DeviceTablet size={14} weight="bold" />
                 跨端互联
               </h2>
-              <span className="badge badge-sm border-base-300/80 bg-base-100/75 font-mono font-medium text-base-content/70">
+              <span className="badge badge-sm border-base-300/80 bg-base-100/75 tabular-nums font-medium text-base-content/70">
                 {settings.localsendEnabled === false
                   ? '已关闭'
                   : (localsendStatus?.localIps?.[0]
@@ -440,9 +428,6 @@ export default function SettingsPage({
             <div className="flex flex-wrap items-center justify-between gap-4">
               <div>
                 <p className="text-sm font-medium">启用局域网跨端传输</p>
-                <p className="mt-0.5 text-xs text-base-content/60">
-                  开启后将使用独立 WallPull 专有频段（端口 53417），不与 LocalSend 等其他传文件软件冲突，与同 Wi-Fi 下的 iPad 无损互传原图、透明立绘及剪贴板画面。
-                </p>
               </div>
               <button
                 type="button"
@@ -450,8 +435,7 @@ export default function SettingsPage({
                 className="wv-switch"
                 aria-label="启用局域网跨端传输"
                 aria-checked={settings.localsendEnabled !== false}
-                onClick={() => persistSettings({
-                  ...settings,
+                onClick={() => commitSettingPatch({
                   localsendEnabled: settings.localsendEnabled === false,
                 })}
               >
@@ -470,14 +454,42 @@ export default function SettingsPage({
                   onChange={event => setSettings(prev => ({ ...prev, localsendAlias: event.target.value }))}
                   onBlur={event => {
                     const nextAlias = event.target.value.trim() || 'WallPull PC'
-                    if (nextAlias !== (settings.localsendAlias || 'WallPull PC')) {
-                      persistSettings({ ...settings, localsendAlias: nextAlias })
+                    const savedAlias = savedSettings?.localsendAlias || 'WallPull PC'
+                    if (nextAlias !== savedAlias) {
+                      commitSettingPatch({ localsendAlias: nextAlias })
                     }
                   }}
                   placeholder="WallPull PC"
                 />
               </div>
             </fieldset>
+
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-base-300/60 pt-4">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-sm font-medium">配对码</span>
+                <span className="badge badge-sm border-base-300/80 bg-base-100/90 tabular-nums text-xs font-bold tracking-widest text-primary">
+                  {localsendStatus?.pairPin || '----'}
+                </span>
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-xs h-7 px-2.5"
+                  disabled={!isNative}
+                  onClick={() => onRotatePin?.()}
+                >
+                  换码
+                </button>
+              </div>
+              {(localsendStatus?.trustedCount || 0) > 0 ? (
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-xs h-7 px-2.5 text-error hover:bg-error/10"
+                  disabled={!isNative}
+                  onClick={() => onUnpairAll?.()}
+                >
+                  解除配对 ({localsendStatus.trustedCount})
+                </button>
+              ) : null}
+            </div>
 
             <div className="flex flex-wrap items-center justify-between gap-3 border-t border-base-300/60 pt-4">
               <div className="min-w-0 flex-1">
@@ -493,14 +505,12 @@ export default function SettingsPage({
                       >
                         <span className={`h-1.5 w-1.5 rounded-full ${peer.isWallpullIpad ? 'bg-primary' : 'bg-success'}`} />
                         <span className="font-medium">{peer.alias}</span>
-                        <span className="font-mono text-[11px] text-base-content/50">{peer.ip}</span>
+                        <span className="tabular-nums text-[11px] text-base-content/50">{peer.ip}</span>
                       </span>
                     ))}
                   </div>
                 ) : (
-                  <p className="mt-0.5 text-xs text-base-content/60">
-                    暂未发现其他设备，在 iPad 打开 WallPull 后会自动浮现。
-                  </p>
+                  <p className="mt-0.5 text-xs text-base-content/60">暂未发现在线设备</p>
                 )}
               </div>
               <button
@@ -533,10 +543,7 @@ export default function SettingsPage({
                       type="button"
                       className={`btn btn-sm ${isActive ? 'btn-primary' : 'btn-ghost'}`}
                       aria-pressed={isActive}
-                      onClick={() => {
-                        const next = { ...settings, hardwareAccelerationMode: item.value }
-                        persistSettings(next)
-                      }}
+                      onClick={() => commitSettingPatch({ hardwareAccelerationMode: item.value })}
                     >
                       {item.label}
                     </button>
@@ -552,7 +559,6 @@ export default function SettingsPage({
                   </button>
                 ) : null}
               </div>
-              <p className="label whitespace-normal">{selectedAccelMeta.description}</p>
               {gpuAdapters.length > 0 ? (
                 <p className="label whitespace-normal">
                   本机已检测到显卡：
@@ -582,54 +588,46 @@ export default function SettingsPage({
               </span>
             </div>
 
-            <div>
-              <p className="text-sm font-medium text-base-content">
-                {APP_INFO.name} v{appVersion} · 作者：{APP_INFO.author} · 开源免费的 Wallpaper Engine 壁纸管理工具
-              </p>
-              <p className="mt-1 text-xs leading-relaxed text-base-content/60">
-                点击「交流反馈」打开反馈页面时会自动将群号 {APP_INFO.feedbackGroupNumber} 复制到剪贴板，方便随时粘贴查找或反馈问题。
-              </p>
+            <div className="flex flex-wrap items-center justify-between gap-2.5">
+              <span className="text-sm font-medium text-base-content">
+                作者：{APP_INFO.author}
+              </span>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  className="btn btn-sm btn-outline border-base-300/80 bg-base-100/75 hover:bg-base-100"
+                  onClick={() => onOpenExternalUrl?.({ url: APP_INFO.repoUrl })}
+                >
+                  <GithubLogo size={15} weight="fill" />
+                  GitHub 链接
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-sm btn-primary"
+                  onClick={() => onOpenExternalUrl?.({
+                    url: APP_INFO.feedbackUrl,
+                    copyText: APP_INFO.feedbackGroupNumber,
+                    toastMessage: `已复制群号：${APP_INFO.feedbackGroupNumber}`,
+                  })}
+                >
+                  <ChatCircleDots size={15} weight="fill" />
+                  交流反馈
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-sm btn-outline border-base-300/80 bg-base-100/75 hover:bg-base-100"
+                  disabled={checkingUpdate}
+                  onClick={() => onCheckUpdate?.()}
+                >
+                  <ArrowsClockwise
+                    size={15}
+                    weight="bold"
+                    className={checkingUpdate ? 'animate-spin' : ''}
+                  />
+                  {checkingUpdate ? '正在检查…' : '检查更新'}
+                </button>
+              </div>
             </div>
-
-            <div className="flex flex-wrap items-center gap-2.5">
-              <button
-                type="button"
-                className="btn btn-sm btn-outline border-base-300/80 bg-base-100/75 hover:bg-base-100"
-                onClick={() => onOpenExternalUrl?.({ url: APP_INFO.repoUrl })}
-              >
-                <GithubLogo size={15} weight="fill" />
-                GitHub 链接
-              </button>
-              <button
-                type="button"
-                className="btn btn-sm btn-primary"
-                onClick={() => onOpenExternalUrl?.({
-                  url: APP_INFO.feedbackUrl,
-                  copyText: APP_INFO.feedbackGroupNumber,
-                  toastMessage: `已打开交流反馈链接，并复制群号：${APP_INFO.feedbackGroupNumber}`,
-                })}
-              >
-                <ChatCircleDots size={15} weight="fill" />
-                交流反馈
-              </button>
-              <button
-                type="button"
-                className="btn btn-sm btn-outline border-base-300/80 bg-base-100/75 hover:bg-base-100"
-                disabled={checkingUpdate}
-                onClick={() => onCheckUpdate?.()}
-              >
-                <ArrowsClockwise
-                  size={15}
-                  weight="bold"
-                  className={checkingUpdate ? 'animate-spin' : ''}
-                />
-                {checkingUpdate ? '正在检查…' : '检查更新'}
-              </button>
-            </div>
-
-            <p className="border-t border-base-300/60 pt-3 text-xs leading-relaxed text-base-content/55">
-              本软件基于 GNU GPL-3.0 协议永久免费开源，若付费购得请立即退款并举报卖家。
-            </p>
           </section>
 
           {isDirty ? (

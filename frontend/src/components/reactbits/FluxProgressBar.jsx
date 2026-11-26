@@ -31,7 +31,7 @@ export default function FluxProgressBar({
   const displayPct = filePct ?? overallPct
   const etaLabel = formatEta(progress.etaSeconds)
   const savedLabel = Number(progress.savedBytes) > 0 ? formatBytes(progress.savedBytes) : null
-  const showCancel = Boolean(onCancel && progress.cancellable !== false)
+  const showCancel = Boolean(onCancel && progress.cancellable === true)
 
   if (compact) {
     return (

@@ -1,15 +1,56 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
+use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject,
+};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 pub const CANCELLED_ERR: &str = "__CANCELLED__";
+
+static CHILD_JOB_HANDLE: OnceLock<Option<usize>> = OnceLock::new();
+
+fn global_child_job() -> Option<HANDLE> {
+    let raw = *CHILD_JOB_HANDLE.get_or_init(|| unsafe {
+        let Ok(job) = CreateJobObjectW(None, None) else {
+            return None;
+        };
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&raw const info).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+        .is_err()
+        {
+            return None;
+        }
+        Some(job.0 as usize)
+    });
+    raw.map(|ptr| HANDLE(ptr as *mut std::ffi::c_void))
+}
+
+fn assign_child_to_job(child: &Child) {
+    if let Some(job) = global_child_job() {
+        let proc_handle = HANDLE(child.as_raw_handle() as *mut std::ffi::c_void);
+        unsafe {
+            let _ = AssignProcessToJobObject(job, proc_handle);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FfmpegProgressTick {
@@ -74,6 +115,7 @@ where
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("启动 {tool_name} 失败：{e}"))?;
+    assign_child_to_job(&child);
 
     let stdout_pipe = child.stdout.take();
     let (tx, rx) = mpsc::channel::<FfmpegProgressTick>();
@@ -219,6 +261,7 @@ pub fn run_status(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("启动 {tool_name} 失败：{e}"))?;
+    assign_child_to_job(&child);
 
     let start = Instant::now();
     loop {
@@ -270,6 +313,7 @@ pub fn run_output(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("启动 {tool_name} 失败：{e}"))?;
+    assign_child_to_job(&child);
 
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();

@@ -117,7 +117,7 @@ export const HARDWARE_ACCELERATION_MODES = [
 
 export const APP_INFO = {
   name: 'WallPull',
-  version: '1.0.2',
+  version: '1.0.3',
   author: 'Xiaonan',
   license: 'GNU GPL-3.0',
   repoUrl: 'https://github.com/XiaonanXY/WallPull',

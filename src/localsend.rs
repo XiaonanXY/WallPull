@@ -1,8 +1,8 @@
 use crate::actions::{clean_track_title, format_byte_size, get_safe_file_name, get_unique_destination_path};
 use crate::clipboard::copy_media_to_clipboard;
-use crate::models::{SceneLayerManifest, WallpaperItem};
+use crate::models::{SceneLayerManifest, TrustedLanPeer, WallpaperItem};
 use crate::scene_studio::{SceneStudioSession, has_inspectable_2d_scene, open_studio_session};
-use crate::settings::cache_root;
+use crate::settings::{cache_root, generate_lan_device_id, generate_lan_pair_pin, is_valid_pair_pin};
 use crate::we_bridge::resolve_wallpaper_asset_path;
 use image::GenericImageView;
 use image::codecs::jpeg::JpegEncoder;
@@ -20,8 +20,8 @@ use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::os::windows::io::FromRawSocket;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::Win32::Networking::WinSock::{
     AF_INET, IN_ADDR, INVALID_SOCKET, IPPROTO_UDP, SO_REUSEADDR, SOCK_DGRAM, SOCKADDR,
@@ -36,6 +36,10 @@ const PEER_TTL_MS: u64 = 95_000;
 const PEER_HEARTBEAT_STALE_MS: u64 = 25_000;
 const PEER_MAX_MISSED_PROBES: u8 = 3;
 const SESSION_TTL_MS: u64 = 1_800_000;
+const MAX_LAN_UPLOAD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_HTTP_THREADS: usize = 32;
+static ACTIVE_HTTP_THREADS: AtomicUsize = AtomicUsize::new(0);
+static TOK_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -84,6 +88,8 @@ pub struct CatalogAudioTrack {
     pub file_name: String,
     pub mime_type: String,
     pub size: u64,
+    #[serde(default)]
+    pub is_embedded: bool,
     #[serde(skip_serializing)]
     pub source_path: String,
 }
@@ -112,6 +118,8 @@ pub struct CatalogEntry {
     pub asset_count: usize,
     #[serde(default)]
     pub audio_tracks: Vec<CatalogAudioTrack>,
+    #[serde(default)]
+    pub is_favorite: bool,
     #[serde(skip_serializing)]
     pub source_path: String,
     #[serde(skip_serializing)]
@@ -148,10 +156,34 @@ pub struct OutgoingTransferFile {
 #[derive(Debug, Clone)]
 pub enum LocalSendEvent {
     PeersChanged,
+    TrustUpdated(Vec<TrustedLanPeer>),
     FileReceived {
         message: String,
         destination: Option<String>,
     },
+    WallpaperImported {
+        project_dir: String,
+        title: String,
+        sender_alias: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendProgressInfo {
+    pub title: String,
+    pub stage: String,
+    pub current: usize,
+    pub total: usize,
+    pub bytes_sent: u64,
+    pub total_bytes: u64,
+    pub bytes_per_second: u64,
+}
+
+#[derive(Debug)]
+pub enum SendTransferError {
+    PairingRequired,
+    Message(String),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -212,13 +244,18 @@ struct HubRuntimeState {
     enabled: bool,
     alias: String,
     export_dir: String,
+    imported_dir: PathBuf,
     port: u16,
     fingerprint: String,
+    pair_pin: String,
+    trusted_peers: HashMap<String, TrustedLanPeer>,
+    pair_failures: HashMap<String, Vec<Instant>>,
     peers: HashMap<String, LocalSendPeer>,
     known_endpoints: HashSet<(Ipv4Addr, u16)>,
     sessions: HashMap<String, UploadSession>,
     catalog: Vec<CatalogEntry>,
     catalog_by_id: HashMap<String, CatalogEntry>,
+    favorite_ids: HashSet<String>,
     studio_cache: Option<(String, Arc<SceneStudioSession>)>,
 }
 
@@ -229,6 +266,7 @@ pub struct LocalSendHub {
 }
 
 impl LocalSendHub {
+    #[allow(dead_code)]
     pub fn start(
         enabled: bool,
         alias: &str,
@@ -236,17 +274,64 @@ impl LocalSendHub {
         bind_sockets: bool,
         on_event: impl Fn(LocalSendEvent) + Send + Sync + 'static,
     ) -> Arc<Self> {
+        let hub = Self::start_with_identity(
+            enabled,
+            alias,
+            export_dir,
+            &generate_lan_device_id(),
+            &generate_lan_pair_pin(),
+            &[],
+            bind_sockets,
+            on_event,
+        );
+        if let Ok(mut guard) = hub.state.write() {
+            guard.imported_dir = Path::new(export_dir).join("ImportedWallpapers");
+        }
+        hub
+    }
+
+    pub fn start_with_identity(
+        enabled: bool,
+        alias: &str,
+        export_dir: &str,
+        device_id: &str,
+        pair_pin: &str,
+        trusted: &[TrustedLanPeer],
+        bind_sockets: bool,
+        on_event: impl Fn(LocalSendEvent) + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        let fp = if device_id.trim().len() >= 16 {
+            device_id.trim().to_string()
+        } else {
+            generate_lan_device_id()
+        };
+        let pin = if is_valid_pair_pin(pair_pin) {
+            pair_pin.trim().to_string()
+        } else {
+            generate_lan_pair_pin()
+        };
+        let mut trusted_map = HashMap::new();
+        for t in trusted {
+            if !t.fingerprint.is_empty() && !t.incoming_token.is_empty() {
+                trusted_map.insert(t.fingerprint.clone(), t.clone());
+            }
+        }
         let state = Arc::new(RwLock::new(HubRuntimeState {
             enabled,
             alias: clean_alias(alias),
             export_dir: export_dir.to_string(),
+            imported_dir: crate::settings::imported_wallpapers_root(),
             port: 0,
-            fingerprint: generate_fingerprint(),
+            fingerprint: fp,
+            pair_pin: pin,
+            trusted_peers: trusted_map,
+            pair_failures: HashMap::new(),
             peers: HashMap::new(),
             known_endpoints: HashSet::new(),
             sessions: HashMap::new(),
             catalog: Vec::new(),
             catalog_by_id: HashMap::new(),
+            favorite_ids: HashSet::new(),
             studio_cache: None,
         }));
         let stop = Arc::new(AtomicBool::new(false));
@@ -265,6 +350,23 @@ impl LocalSendHub {
         hub
     }
 
+    pub fn rotate_pair_pin(&self) -> String {
+        let new_pin = generate_lan_pair_pin();
+        if let Ok(mut guard) = self.state.write() {
+            guard.pair_pin = new_pin.clone();
+        }
+        new_pin
+    }
+
+    pub fn clear_trusted_peers(&self) -> Vec<TrustedLanPeer> {
+        if let Ok(mut guard) = self.state.write() {
+            guard.trusted_peers.clear();
+        }
+        emit_event(&self.event_cb, LocalSendEvent::TrustUpdated(Vec::new()));
+        emit_event(&self.event_cb, LocalSendEvent::PeersChanged);
+        Vec::new()
+    }
+
     pub fn update_config(&self, enabled: bool, alias: &str, export_dir: &str) {
         if let Ok(mut guard) = self.state.write() {
             guard.enabled = enabled;
@@ -276,7 +378,25 @@ impl LocalSendHub {
         }
     }
 
+    pub fn set_favorite_ids(&self, ids: &[String]) {
+        let fav_set: HashSet<String> = ids.iter().cloned().collect();
+        if let Ok(mut guard) = self.state.write() {
+            for entry in &mut guard.catalog {
+                entry.is_favorite = fav_set.contains(&entry.id);
+            }
+            for entry in guard.catalog_by_id.values_mut() {
+                entry.is_favorite = fav_set.contains(&entry.id);
+            }
+            guard.favorite_ids = fav_set;
+        }
+    }
+
     pub fn update_catalog(&self, items: &[WallpaperItem]) {
+        let fav_set = self
+            .state
+            .read()
+            .map(|g| g.favorite_ids.clone())
+            .unwrap_or_default();
         let mut entries = Vec::with_capacity(items.len());
         let mut by_id = HashMap::with_capacity(items.len());
         let has_ffmpeg = crate::media::find_executable("ffmpeg.exe").is_some();
@@ -303,7 +423,7 @@ impl LocalSendHub {
                 .cloned();
             let needs_ios_mp4 = w.item_type == "video"
                 && !matches!(ext_lower.as_str(), "mp4" | "mov" | "m4v")
-                && (has_ffmpeg || preview_video_path.is_some());
+                && has_ffmpeg;
             let file_name = if needs_ios_mp4 {
                 let stem = Path::new(&raw_file_name)
                     .file_stem()
@@ -344,13 +464,23 @@ impl LocalSendHub {
                     if !tp.is_file() {
                         continue;
                     }
+                    let is_video_audio = crate::media::detect_media_type(tp) == Some("video");
+                    if is_video_audio && !has_ffmpeg {
+                        continue;
+                    }
                     let ext = tp
                         .extension()
                         .and_then(|e| e.to_str())
                         .map(|s| s.to_ascii_lowercase())
                         .unwrap_or_default();
-                    let safe_title = get_safe_file_name(&clean_track_title(raw_p), "bgm");
-                    let (out_name, out_mime) = if ext == "ogg" {
+                    let track_title_buf = clean_track_title(raw_p);
+                    let safe_title = get_safe_file_name(
+                        if is_video_audio { &w.title } else { &track_title_buf },
+                        "bgm",
+                    );
+                    let (out_name, out_mime) = if is_video_audio {
+                        (format!("{safe_title}.m4a"), "audio/mp4".to_string())
+                    } else if ext == "ogg" {
                         (format!("{safe_title}.wav"), "audio/wav".to_string())
                     } else {
                         let actual_name = tp
@@ -363,10 +493,15 @@ impl LocalSendHub {
                     let size = fs::metadata(tp).map(|m| m.len()).unwrap_or(0);
                     audio_tracks.push(CatalogAudioTrack {
                         index: audio_tracks.len(),
-                        name: clean_track_title(raw_p),
+                        name: if is_video_audio {
+                            format!("{} (视频原声)", w.title)
+                        } else {
+                            clean_track_title(raw_p)
+                        },
                         file_name: out_name,
                         mime_type: out_mime,
                         size,
+                        is_embedded: is_video_audio,
                         source_path: raw_p.clone(),
                     });
                     let _ = t_idx;
@@ -388,6 +523,7 @@ impl LocalSendHub {
                 has_scene_layers,
                 asset_count,
                 audio_tracks,
+                is_favorite: fav_set.contains(&w.id),
                 source_path: resolved,
                 asset_paths,
                 preview_path: w.preview_path.clone(),
@@ -410,7 +546,7 @@ impl LocalSendHub {
 
     pub fn status_snapshot(&self) -> serde_json::Value {
         let now = now_ms();
-        let (enabled, alias, port, fingerprint, peers) = {
+        let (enabled, alias, port, fingerprint, pair_pin, peers_json, trusted_count) = {
             let mut guard = self.state.write().unwrap_or_else(|e| e.into_inner());
             guard.peers.retain(|_, p| !is_peer_expired(p, now));
             let mut peer_list: Vec<LocalSendPeer> = guard.peers.values().cloned().collect();
@@ -419,12 +555,29 @@ impl LocalSendHub {
                     .cmp(&a.is_wallpull_ipad)
                     .then_with(|| a.alias.to_lowercase().cmp(&b.alias.to_lowercase()))
             });
+            let enriched: Vec<serde_json::Value> = peer_list
+                .into_iter()
+                .map(|p| {
+                    let is_trusted = guard
+                        .trusted_peers
+                        .get(&p.fingerprint)
+                        .map(|t| !t.outgoing_token.is_empty() && !t.incoming_token.is_empty())
+                        .unwrap_or(false);
+                    let mut v = serde_json::to_value(&p).unwrap_or_else(|_| serde_json::json!({}));
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert("isTrusted".to_string(), serde_json::Value::Bool(is_trusted));
+                    }
+                    v
+                })
+                .collect();
             (
                 guard.enabled,
                 guard.alias.clone(),
                 guard.port,
                 guard.fingerprint.clone(),
-                peer_list,
+                guard.pair_pin.clone(),
+                enriched,
+                guard.trusted_peers.len(),
             )
         };
         serde_json::json!({
@@ -432,8 +585,10 @@ impl LocalSendHub {
             "alias": alias,
             "port": port,
             "fingerprint": fingerprint,
+            "pairPin": pair_pin,
+            "trustedCount": trusted_count,
             "localIps": list_lan_ipv4s(),
-            "peers": peers,
+            "peers": peers_json,
         })
     }
 
@@ -457,11 +612,7 @@ impl LocalSendHub {
                 return Some(found.clone());
             }
         }
-        peers
-            .iter()
-            .find(|p| p.is_wallpull_ipad)
-            .cloned()
-            .or_else(|| peers.into_iter().next())
+        peers.into_iter().find(|p| p.is_wallpull_ipad)
     }
 
     pub fn device_info(&self, announce: Option<bool>) -> LocalSendDeviceInfo {
@@ -534,6 +685,7 @@ impl LocalSendHub {
                     port,
                     "/api/localsend/v2/register",
                     &body_bytes,
+                    None,
                     Duration::from_millis(1600),
                 ) {
                     if let Ok(peer_info) = serde_json::from_slice::<LocalSendDeviceInfo>(&resp_bytes) {
@@ -554,7 +706,7 @@ impl LocalSendHub {
 
             if let Some((peer_info, used_proto)) = responded_info {
                 if peer_info.fingerprint != my_fp && is_wallpull_device_info(&peer_info) {
-                    if upsert_peer(&self.state, peer_info, ip.to_string(), Some(port), Some(used_proto)) {
+                    if upsert_peer(&self.state, peer_info, ip.to_string(), Some(port), Some(used_proto), false) {
                         any_changed = true;
                     }
                 }
@@ -619,8 +771,9 @@ impl LocalSendHub {
                     if target == lan_ip {
                         continue;
                     }
-                    candidates.insert((target, LOCALSEND_DEFAULT_PORT));
-                    candidates.insert((target, LOCALSEND_DEFAULT_PORT + 1));
+                    for offset in 0..=5u16 {
+                        candidates.insert((target, LOCALSEND_DEFAULT_PORT + offset));
+                    }
                 }
             }
             let list: Vec<(Ipv4Addr, u16)> = candidates.into_iter().collect();
@@ -642,11 +795,12 @@ impl LocalSendHub {
                                 port,
                                 "/api/localsend/v2/register",
                                 &body_bytes,
+                                None,
                                 Duration::from_millis(420),
                             ) {
                                 if let Ok(peer_info) = serde_json::from_slice::<LocalSendDeviceInfo>(&resp_bytes) {
                                     if peer_info.fingerprint != info_ref.fingerprint {
-                                        upsert_peer(state_ref, peer_info, ip.to_string(), Some(port), Some("http"));
+                                        upsert_peer(state_ref, peer_info, ip.to_string(), Some(port), Some("http"), false);
                                         found_ref.store(true, Ordering::SeqCst);
                                     }
                                     continue;
@@ -657,7 +811,7 @@ impl LocalSendHub {
                                 if let Ok(resp) = https_agent.post(&url).send_json(payload) {
                                     if let Ok(peer_info) = resp.into_json::<LocalSendDeviceInfo>() {
                                         if peer_info.fingerprint != info_ref.fingerprint {
-                                            upsert_peer(state_ref, peer_info, ip.to_string(), Some(port), Some("https"));
+                                            upsert_peer(state_ref, peer_info, ip.to_string(), Some(port), Some("https"), false);
                                             found_ref.store(true, Ordering::SeqCst);
                                         }
                                     }
@@ -673,21 +827,123 @@ impl LocalSendHub {
         });
     }
 
+    pub fn pair_with_peer(&self, peer: &LocalSendPeer, pin: &str) -> Result<String, String> {
+        let pin_trimmed = pin.trim();
+        if !is_valid_pair_pin(pin_trimmed) {
+            return Err("请输入 4 位数字配对码".to_string());
+        }
+        let client_token = generate_hex_token_32();
+        let req_body = serde_json::json!({
+            "info": self.device_info(None),
+            "pin": pin_trimmed,
+            "clientToken": client_token,
+        });
+        let req_bytes = serde_json::to_vec(&req_body).map_err(|e| e.to_string())?;
+        let ip: Ipv4Addr = peer
+            .ip
+            .parse()
+            .map_err(|_| format!("设备 IP 无效：{}", peer.ip))?;
+        let (status, resp_bytes) = lan_http_post_json(
+            ip,
+            peer.port,
+            "/api/localsend/v2/wallpull/pair",
+            &req_bytes,
+            None,
+            Duration::from_secs(12),
+        )
+        .map_err(|e| format!("无法连接设备「{}」配对：{e}", peer.alias))?;
+
+        if status == 401 {
+            return Err("配对码错误，请核对 iPad 上显示的 4 位数字".to_string());
+        }
+        if status == 429 {
+            return Err("配对失败次数过多，请 1 分钟后再试".to_string());
+        }
+        if !(200..300).contains(&status) {
+            return Err(format!("设备「{}」拒绝配对（HTTP {status}）", peer.alias));
+        }
+
+        let parsed: serde_json::Value = serde_json::from_slice(&resp_bytes)
+            .map_err(|e| format!("解析配对响应失败：{e}"))?;
+        let server_token = parsed
+            .get("token")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "对端未返回配对凭证".to_string())?
+            .to_string();
+        let remote_fp = parsed
+            .get("fingerprint")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&peer.fingerprint)
+            .to_string();
+        let remote_alias = parsed
+            .get("alias")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&peer.alias)
+            .to_string();
+
+        let trust_rec = TrustedLanPeer {
+            fingerprint: remote_fp.clone(),
+            alias: clean_alias(&remote_alias),
+            incoming_token: client_token,
+            outgoing_token: server_token,
+        };
+        let list = {
+            let mut guard = self.state.write().unwrap_or_else(|e| e.into_inner());
+            if peer.fingerprint != remote_fp && !peer.fingerprint.is_empty() {
+                guard.trusted_peers.insert(peer.fingerprint.clone(), trust_rec.clone());
+            }
+            guard.trusted_peers.insert(remote_fp, trust_rec);
+            guard.trusted_peers.values().cloned().collect::<Vec<_>>()
+        };
+        emit_event(&self.event_cb, LocalSendEvent::TrustUpdated(list));
+        emit_event(&self.event_cb, LocalSendEvent::PeersChanged);
+        Ok(format!("已与「{remote_alias}」完成安全配对"))
+    }
+
+    #[allow(dead_code)]
     pub fn send_files_to_peer(
         &self,
         peer: &LocalSendPeer,
         files: &[OutgoingTransferFile],
     ) -> Result<String, String> {
+        self.send_files_to_peer_with_progress(peer, files, |_| {})
+            .map_err(|e| match e {
+                SendTransferError::PairingRequired => "需要首次 4 位配对码验证".to_string(),
+                SendTransferError::Message(m) => m,
+            })
+    }
+
+    pub fn send_files_to_peer_with_progress<F>(
+        &self,
+        peer: &LocalSendPeer,
+        files: &[OutgoingTransferFile],
+        mut on_progress: F,
+    ) -> Result<String, SendTransferError>
+    where
+        F: FnMut(SendProgressInfo),
+    {
         if files.is_empty() {
-            return Err("没有可发送的文件。".to_string());
+            return Err(SendTransferError::Message("没有可发送的文件。".to_string()));
         }
+        let outgoing_token = self
+            .state
+            .read()
+            .ok()
+            .and_then(|g| g.trusted_peers.get(&peer.fingerprint).map(|t| t.outgoing_token.clone()))
+            .filter(|t| !t.is_empty());
+
         let mut file_dtos: HashMap<String, serde_json::Value> = HashMap::new();
         let mut hashes: HashMap<String, String> = HashMap::new();
         let mut sizes: HashMap<String, u64> = HashMap::new();
+        let mut grand_total_bytes = 0u64;
 
         for item in files {
-            let (size, sha256) = compute_source_metrics(&item.source)?;
+            let (size, sha256) = compute_source_metrics(&item.source).map_err(SendTransferError::Message)?;
             sizes.insert(item.id.clone(), size);
+            grand_total_bytes = grand_total_bytes.saturating_add(size);
             hashes.insert(item.id.clone(), sha256.clone());
             let mut meta = serde_json::Map::new();
             meta.insert("wallpullTarget".into(), serde_json::Value::String(item.wallpull_target.clone()));
@@ -724,60 +980,97 @@ impl LocalSendHub {
             "info": self.device_info(None),
             "files": file_dtos,
         });
-        let prepare_bytes = serde_json::to_vec(&prepare_body).map_err(|e| e.to_string())?;
+        let prepare_bytes = serde_json::to_vec(&prepare_body)
+            .map_err(|e| SendTransferError::Message(e.to_string()))?;
         let parsed: serde_json::Value = if peer.protocol.eq_ignore_ascii_case("http") {
             let ip: Ipv4Addr = peer
                 .ip
                 .parse()
-                .map_err(|_| format!("设备 IP 无效：{}", peer.ip))?;
+                .map_err(|_| SendTransferError::Message(format!("设备 IP 无效：{}", peer.ip)))?;
             let (status, resp_bytes) = lan_http_post_json(
                 ip,
                 peer.port,
                 "/api/localsend/v2/prepare-upload",
                 &prepare_bytes,
+                outgoing_token.as_deref(),
                 Duration::from_secs(15),
             )
-            .map_err(|e| format!("无法连接设备「{}」({}:{})：{e}", peer.alias, peer.ip, peer.port))?;
+            .map_err(|e| {
+                SendTransferError::Message(format!("无法连接设备「{}」({}:{})：{e}", peer.alias, peer.ip, peer.port))
+            })?;
+            if status == 401 {
+                self.invalidate_outgoing_trust(&peer.fingerprint);
+                return Err(SendTransferError::PairingRequired);
+            }
             if status == 204 {
                 return Ok(format!("{} 已确认无需重复传输。", peer.alias));
             }
             if status != 200 {
-                return Err(format!("设备「{}」返回状态码 {status}。", peer.alias));
+                return Err(SendTransferError::Message(format!(
+                    "设备「{}」返回状态码 {status}。",
+                    peer.alias
+                )));
             }
             serde_json::from_slice(&resp_bytes)
-                .map_err(|e| format!("解析设备响应失败：{e}"))?
+                .map_err(|e| SendTransferError::Message(format!("解析设备响应失败：{e}")))?
         } else {
             let agent = build_lan_https_agent(Duration::from_secs(120));
             let base_url = format!("https://{}:{}", peer.ip, peer.port);
-            let prepare_resp = agent
-                .post(&format!("{base_url}/api/localsend/v2/prepare-upload"))
-                .send_json(prepare_body)
-                .map_err(|e| format!("无法连接设备「{}」({}:{})：{e}", peer.alias, peer.ip, peer.port))?;
+            let mut req = agent.post(&format!("{base_url}/api/localsend/v2/prepare-upload"));
+            if let Some(tok) = outgoing_token.as_deref() {
+                req = req.set("X-WallPull-Token", tok);
+            }
+            let prepare_resp = match req.send_json(prepare_body) {
+                Ok(r) => r,
+                Err(ureq::Error::Status(401, _)) => {
+                    self.invalidate_outgoing_trust(&peer.fingerprint);
+                    return Err(SendTransferError::PairingRequired);
+                }
+                Err(e) => {
+                    return Err(SendTransferError::Message(format!(
+                        "无法连接设备「{}」({}:{})：{e}",
+                        peer.alias, peer.ip, peer.port
+                    )));
+                }
+            };
             if prepare_resp.status() == 204 {
                 return Ok(format!("{} 已确认无需重复传输。", peer.alias));
             }
             prepare_resp
                 .into_json()
-                .map_err(|e| format!("解析设备响应失败：{e}"))?
+                .map_err(|e| SendTransferError::Message(format!("解析设备响应失败：{e}")))?
         };
 
         let session_id = parsed
             .get("sessionId")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| "对端未返回有效的传输会话 ID。".to_string())?
+            .ok_or_else(|| SendTransferError::Message("对端未返回有效的传输会话 ID。".to_string()))?
             .to_string();
         let accepted_tokens = parsed
             .get("files")
             .and_then(|v| v.as_object())
-            .ok_or_else(|| "对端拒绝了本次传输请求。".to_string())?;
+            .ok_or_else(|| SendTransferError::Message("对端拒绝了本次传输请求。".to_string()))?;
 
+        let started_at = Instant::now();
+        let mut last_emit = Instant::now() - Duration::from_secs(1);
+        let mut bytes_sent_cum = 0u64;
         let mut sent_count = 0usize;
-        let mut total_bytes = 0u64;
-        for item in files {
+        let total_items = files.len();
+
+        for (idx, item) in files.iter().enumerate() {
             let Some(token) = accepted_tokens.get(&item.id).and_then(|v| v.as_str()) else {
                 continue;
             };
+            on_progress(SendProgressInfo {
+                title: item.wallpull_title.clone(),
+                stage: "sending".to_string(),
+                current: idx + 1,
+                total: total_items,
+                bytes_sent: bytes_sent_cum,
+                total_bytes: grand_total_bytes,
+                bytes_per_second: (bytes_sent_cum as f64 / started_at.elapsed().as_secs_f64().max(0.1)) as u64,
+            });
             let upload_path = format!(
                 "/api/localsend/v2/upload?sessionId={}&fileId={}&token={}",
                 urlencoding::encode(&session_id),
@@ -786,34 +1079,74 @@ impl LocalSendHub {
             );
 
             let res = if peer.protocol.eq_ignore_ascii_case("http") {
-                let ip: Ipv4Addr = peer.ip.parse().map_err(|_| "无效 IP".to_string())?;
+                let ip: Ipv4Addr = peer
+                    .ip
+                    .parse()
+                    .map_err(|_| SendTransferError::Message("无效 IP".to_string()))?;
                 match &item.source {
                     TransferSource::Memory(bytes) => {
-                        total_bytes = total_bytes.saturating_add(bytes.len() as u64);
-                        lan_http_upload_bytes(ip, peer.port, &upload_path, bytes.as_slice(), Duration::from_secs(120))
+                        let r = lan_http_upload_bytes(
+                            ip,
+                            peer.port,
+                            &upload_path,
+                            bytes.as_slice(),
+                            outgoing_token.as_deref(),
+                            Duration::from_secs(120),
+                        );
+                        bytes_sent_cum = bytes_sent_cum.saturating_add(bytes.len() as u64);
+                        r
                     }
                     TransferSource::File(path) => {
                         let size = *sizes.get(&item.id).unwrap_or(&0);
-                        total_bytes = total_bytes.saturating_add(size);
-                        lan_http_upload_file(ip, peer.port, &upload_path, path, size, Duration::from_secs(180))
+                        lan_http_upload_file_with_progress(
+                            ip,
+                            peer.port,
+                            &upload_path,
+                            path,
+                            size,
+                            outgoing_token.as_deref(),
+                            Duration::from_secs(600),
+                            |delta| {
+                                bytes_sent_cum = bytes_sent_cum.saturating_add(delta);
+                                if last_emit.elapsed() >= Duration::from_millis(120) {
+                                    last_emit = Instant::now();
+                                    let speed = (bytes_sent_cum as f64
+                                        / started_at.elapsed().as_secs_f64().max(0.1))
+                                        as u64;
+                                    on_progress(SendProgressInfo {
+                                        title: item.wallpull_title.clone(),
+                                        stage: "sending".to_string(),
+                                        current: idx + 1,
+                                        total: total_items,
+                                        bytes_sent: bytes_sent_cum,
+                                        total_bytes: grand_total_bytes,
+                                        bytes_per_second: speed,
+                                    });
+                                }
+                            },
+                        )
                     }
                 }
             } else {
-                let agent = build_lan_https_agent(Duration::from_secs(180));
+                let agent = build_lan_https_agent(Duration::from_secs(600));
                 let upload_url = format!("https://{}:{}{upload_path}", peer.ip, peer.port);
-                let req = agent
+                let mut req = agent
                     .post(&upload_url)
                     .set("Content-Type", "application/octet-stream");
+                if let Some(tok) = outgoing_token.as_deref() {
+                    req = req.set("X-WallPull-Token", tok);
+                }
                 let r = match &item.source {
                     TransferSource::Memory(bytes) => {
-                        total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+                        bytes_sent_cum = bytes_sent_cum.saturating_add(bytes.len() as u64);
                         req.set("Content-Length", &bytes.len().to_string())
                             .send_bytes(bytes.as_slice())
                     }
                     TransferSource::File(path) => {
                         let size = *sizes.get(&item.id).unwrap_or(&0);
-                        total_bytes = total_bytes.saturating_add(size);
-                        let f = File::open(path).map_err(|e| format!("打开待发文件失败：{e}"))?;
+                        bytes_sent_cum = bytes_sent_cum.saturating_add(size);
+                        let f = File::open(path)
+                            .map_err(|e| SendTransferError::Message(format!("打开待发文件失败：{e}")))?;
                         req.set("Content-Length", &size.to_string()).send(f)
                     }
                 };
@@ -828,17 +1161,18 @@ impl LocalSendHub {
                             peer.port,
                             &format!("/api/localsend/v2/cancel?sessionId={}", urlencoding::encode(&session_id)),
                             &[],
+                            outgoing_token.as_deref(),
                             Duration::from_secs(3),
                         );
                     }
                 }
-                return Err(format!("发送到「{}」时中断：{err}", peer.alias));
+                return Err(SendTransferError::Message(format!("发送到「{}」时中断：{err}", peer.alias)));
             }
             sent_count += 1;
         }
 
         if sent_count == 0 {
-            return Err(format!("设备「{}」未接收任何文件。", peer.alias));
+            return Err(SendTransferError::Message(format!("设备「{}」未接收任何文件。", peer.alias)));
         }
         touch_peer_by_ip(&self.state, &peer.ip);
         let target_clipboard = files.iter().all(|f| f.wallpull_target == "clipboard");
@@ -849,14 +1183,37 @@ impl LocalSendHub {
                 "已通过 WallPull 跨端直传发送给「{}」：{}（{}）",
                 peer.alias,
                 files[0].wallpull_title,
-                format_byte_size(total_bytes as i64)
+                format_byte_size(grand_total_bytes as i64)
             ))
         } else {
             Ok(format!(
                 "已通过 WallPull 跨端直传发送 {sent_count} 项到「{}」（共 {}）",
                 peer.alias,
-                format_byte_size(total_bytes as i64)
+                format_byte_size(grand_total_bytes as i64)
             ))
+        }
+    }
+
+    fn invalidate_outgoing_trust(&self, fp: &str) {
+        let updated = if let Ok(mut guard) = self.state.write() {
+            let mut changed = false;
+            if let Some(t) = guard.trusted_peers.get_mut(fp) {
+                if !t.outgoing_token.is_empty() {
+                    t.outgoing_token.clear();
+                    changed = true;
+                }
+            }
+            if changed {
+                Some(guard.trusted_peers.values().cloned().collect::<Vec<_>>())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(list) = updated {
+            emit_event(&self.event_cb, LocalSendEvent::TrustUpdated(list));
+            emit_event(&self.event_cb, LocalSendEvent::PeersChanged);
         }
     }
 
@@ -912,25 +1269,42 @@ impl LocalSendHub {
 fn run_http_accept_loop(hub: Arc<LocalSendHub>, listener: TcpListener) {
     let _ = listener.set_nonblocking(true);
     while !hub.stop.load(Ordering::SeqCst) {
-        match listener.accept() {
-            Ok((stream, remote_addr)) => {
-                // CRITICAL: Always force blocking I/O + TCP_NODELAY so large media never hits WouldBlock
-                let _ = stream.set_nonblocking(false);
-                let _ = stream.set_nodelay(true);
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-                let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
-                let hub_clone = hub.clone();
-                std::thread::spawn(move || {
-                    let _ = handle_http_connection(&hub_clone, stream, remote_addr);
-                });
-            }
+        let (stream, remote_addr) = match listener.accept() {
+            Ok(pair) => pair,
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(25));
+                continue;
             }
             Err(_) => {
                 std::thread::sleep(Duration::from_millis(100));
+                continue;
             }
+        };
+        let active = ACTIVE_HTTP_THREADS.fetch_add(1, Ordering::SeqCst);
+        if active >= MAX_HTTP_THREADS {
+            ACTIVE_HTTP_THREADS.fetch_sub(1, Ordering::SeqCst);
+            let mut rejected = stream;
+            let _ = rejected.set_nonblocking(false);
+            let _ = rejected.set_write_timeout(Some(Duration::from_secs(2)));
+            let _ = write_json_error(&mut rejected, 503, "Server busy");
+            continue;
         }
+        // CRITICAL: Always force blocking I/O + TCP_NODELAY so large media never hits WouldBlock
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_nodelay(true);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+        let hub_clone = hub.clone();
+        std::thread::spawn(move || {
+            struct ThreadSlotGuard;
+            impl Drop for ThreadSlotGuard {
+                fn drop(&mut self) {
+                    ACTIVE_HTTP_THREADS.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            let _slot_guard = ThreadSlotGuard;
+            let _ = handle_http_connection(&hub_clone, stream, remote_addr);
+        });
     }
 }
 
@@ -942,8 +1316,13 @@ fn handle_http_connection(
     let enabled = hub.state.read().map(|g| g.enabled).unwrap_or(false);
     let mut header_buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
+    let header_start = Instant::now();
     let header_end;
     loop {
+        if header_start.elapsed() > Duration::from_secs(15) {
+            write_json_error(&mut stream, 408, "Header read timeout")?;
+            return Ok(());
+        }
         if header_buf.len() > 64 * 1024 {
             write_json_error(&mut stream, 431, "Headers too large")?;
             return Ok(());
@@ -991,6 +1370,22 @@ fn handle_http_connection(
         return Ok(());
     }
 
+    let is_protected = !matches!(
+        (method.as_str(), path),
+        ("GET", "/api/localsend/v2/info")
+            | ("POST", "/api/localsend/v2/register")
+            | ("POST", "/api/localsend/v2/wallpull/pair")
+    );
+    if is_protected && !is_request_authorized(&hub.state, &headers, &query) {
+        write_json_error_code(
+            &mut stream,
+            401,
+            "PAIRING_REQUIRED",
+            "需要首次 4 位配对码验证",
+        )?;
+        return Ok(());
+    }
+
     match (method.as_str(), path) {
         ("GET", "/api/localsend/v2/info") => {
             let info = hub.device_info(None);
@@ -1008,13 +1403,83 @@ fn handle_http_connection(
             let my_fp = hub.state.read().map(|g| g.fingerprint.clone()).unwrap_or_default();
             if peer_info.fingerprint != my_fp {
                 let peer_ip = remote_addr.ip().to_string();
-                let changed = upsert_peer(&hub.state, peer_info, peer_ip, None, None);
+                let auth_ok = is_request_authorized(&hub.state, &headers, &query);
+                let changed = upsert_peer(&hub.state, peer_info, peer_ip, None, None, auth_ok);
                 if changed {
                     emit_event(&hub.event_cb, LocalSendEvent::PeersChanged);
                 }
             }
             let reply = hub.device_info(None);
             write_json_response(&mut stream, 200, &reply)?;
+        }
+        ("POST", "/api/localsend/v2/wallpull/pair") => {
+            let sender_ip = remote_addr.ip().to_string();
+            let rate_limited = {
+                let mut guard = hub.state.write().unwrap_or_else(|e| e.into_inner());
+                let now = Instant::now();
+                let list = guard.pair_failures.entry(sender_ip.clone()).or_default();
+                list.retain(|t| now.duration_since(*t) <= Duration::from_secs(60));
+                list.len() >= 8
+            };
+            if rate_limited {
+                write_json_error_code(&mut stream, 429, "RATE_LIMITED", "配对尝试过于频繁，请稍后再试")?;
+                return Ok(());
+            }
+            let body = read_small_body(&mut stream, leftover, content_len, is_chunked, 128 * 1024)?;
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct PairReq {
+                info: LocalSendDeviceInfo,
+                pin: String,
+                client_token: String,
+            }
+            let Ok(req) = serde_json::from_slice::<PairReq>(&body) else {
+                write_json_error(&mut stream, 400, "Invalid pair payload")?;
+                return Ok(());
+            };
+            if !is_wallpull_device_info(&req.info) || req.client_token.trim().len() < 16 {
+                write_json_error(&mut stream, 403, "Rejected device")?;
+                return Ok(());
+            }
+            let expected_pin = hub.state.read().map(|g| g.pair_pin.clone()).unwrap_or_default();
+            if !constant_time_eq(req.pin.trim().as_bytes(), expected_pin.as_bytes()) {
+                if let Ok(mut guard) = hub.state.write() {
+                    guard.pair_failures.entry(sender_ip).or_default().push(Instant::now());
+                }
+                write_json_error_code(&mut stream, 401, "INVALID_PIN", "配对码错误")?;
+                return Ok(());
+            }
+
+            let server_token = generate_hex_token_32();
+            let trust_rec = TrustedLanPeer {
+                fingerprint: req.info.fingerprint.clone(),
+                alias: clean_alias(&req.info.alias),
+                incoming_token: server_token.clone(),
+                outgoing_token: req.client_token.trim().to_string(),
+            };
+            let (my_fp, my_alias, trust_list) = {
+                let mut guard = hub.state.write().unwrap_or_else(|e| e.into_inner());
+                guard.pair_failures.remove(&sender_ip);
+                guard.trusted_peers.insert(trust_rec.fingerprint.clone(), trust_rec);
+                (
+                    guard.fingerprint.clone(),
+                    guard.alias.clone(),
+                    guard.trusted_peers.values().cloned().collect::<Vec<_>>(),
+                )
+            };
+            upsert_peer(&hub.state, req.info, sender_ip, None, None, true);
+            emit_event(&hub.event_cb, LocalSendEvent::TrustUpdated(trust_list));
+            emit_event(&hub.event_cb, LocalSendEvent::PeersChanged);
+            write_json_response(
+                &mut stream,
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "token": server_token,
+                    "fingerprint": my_fp,
+                    "alias": my_alias,
+                }),
+            )?;
         }
         ("POST", "/api/localsend/v2/prepare-upload") => {
             let body = read_small_body(&mut stream, leftover, content_len, is_chunked, 8 * 1024 * 1024)?;
@@ -1025,9 +1490,19 @@ fn handle_http_connection(
                     return Ok(());
                 }
             };
+            if !is_wallpull_device_info(&req.info) {
+                write_json_error(&mut stream, 403, "Only WallPull devices are permitted")?;
+                return Ok(());
+            }
             if req.files.is_empty() {
                 write_status_empty(&mut stream, 204, "No Content")?;
                 return Ok(());
+            }
+            for dto in req.files.values() {
+                if dto.size == 0 || dto.size > MAX_LAN_UPLOAD_BYTES {
+                    write_json_error(&mut stream, 413, "File size exceeds limit or is empty")?;
+                    return Ok(());
+                }
             }
             let session_id = format!("wp-{}", generate_token());
             let mut file_tokens = HashMap::new();
@@ -1039,7 +1514,7 @@ fn handle_http_connection(
             }
             let sender_ip = remote_addr.ip().to_string();
             let sender_alias = req.info.alias.clone();
-            upsert_peer(&hub.state, req.info, sender_ip, None, None);
+            upsert_peer(&hub.state, req.info, sender_ip, None, None, true);
             emit_event(&hub.event_cb, LocalSendEvent::PeersChanged);
 
             {
@@ -1077,7 +1552,7 @@ fn handle_http_connection(
                 return Ok(());
             };
 
-            let (pending, sender_alias, export_dir) = {
+            let (pending, sender_alias, managed_root) = {
                 let guard = hub.state.read().unwrap_or_else(|e| e.into_inner());
                 let Some(sess) = guard.sessions.get(&session_id) else {
                     write_json_error(&mut stream, 403, "Invalid session")?;
@@ -1091,8 +1566,21 @@ fn handle_http_connection(
                     write_json_error(&mut stream, 403, "Invalid token")?;
                     return Ok(());
                 }
-                (item.clone(), sess.sender_alias.clone(), guard.export_dir.clone())
+                (item.clone(), sess.sender_alias.clone(), guard.imported_dir.clone())
             };
+
+            let max_expected = pending.dto.size.min(MAX_LAN_UPLOAD_BYTES);
+            if !is_chunked {
+                if let Some(cl) = content_len {
+                    if cl != pending.dto.size || cl > MAX_LAN_UPLOAD_BYTES {
+                        write_json_error(&mut stream, 413, "Content-Length mismatch or exceeds limit")?;
+                        return Ok(());
+                    }
+                } else {
+                    write_json_error(&mut stream, 411, "Content-Length required")?;
+                    return Ok(());
+                }
+            }
 
             let tmp_dir = cache_root().join("localsend-tmp");
             let _ = fs::create_dir_all(&tmp_dir);
@@ -1103,11 +1591,18 @@ fn handle_http_connection(
                 }
             }
 
-            let sha_hex = match stream_body_to_file(&mut stream, leftover, content_len, is_chunked, &tmp_file) {
+            let sha_hex = match stream_body_to_file(
+                &mut stream,
+                leftover,
+                content_len,
+                is_chunked,
+                max_expected,
+                &tmp_file,
+            ) {
                 Ok(h) => h,
                 Err(e) => {
                     let _ = fs::remove_file(&tmp_file);
-                    write_json_error(&mut stream, 500, &format!("Receive error: {e}"))?;
+                    write_json_error(&mut stream, 400, &format!("Receive error: {e}"))?;
                     return Ok(());
                 }
             };
@@ -1133,16 +1628,41 @@ fn handle_http_connection(
                         .and_then(|e| e.to_str())
                         .map(|s| s.to_ascii_lowercase())
                         .as_deref(),
-                    Some("png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif")
+                    Some("png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif" | "heic" | "heif" | "avif")
                 );
 
             if meta_target == "clipboard" && is_img {
-                if let Err(err) = copy_media_to_clipboard(&tmp_file, true) {
+                let clip_dir = cache_root().join("clipboard-staging");
+                if let Err(err) = fs::create_dir_all(&clip_dir) {
                     let _ = fs::remove_file(&tmp_file);
+                    write_json_error(&mut stream, 500, &err.to_string())?;
+                    return Ok(());
+                }
+                let raw_ext = Path::new(&pending.dto.file_name)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.to_ascii_lowercase())
+                    .filter(|s| s.chars().all(|c| c.is_ascii_alphanumeric()))
+                    .unwrap_or_else(|| "png".to_string());
+                let staged_file = clip_dir.join(format!("clip-{}.{raw_ext}", generate_token()));
+                let staged_ok = if fs::rename(&tmp_file, &staged_file).is_ok() {
+                    true
+                } else {
+                    let copied = fs::copy(&tmp_file, &staged_file).is_ok();
+                    let _ = fs::remove_file(&tmp_file);
+                    copied
+                };
+                if !staged_ok {
+                    let _ = fs::remove_file(&staged_file);
+                    write_json_error(&mut stream, 500, "Staging clipboard image failed")?;
+                    return Ok(());
+                }
+                prune_older_clipboard_files(&clip_dir, &staged_file, 2);
+                if let Err(err) = copy_media_to_clipboard(&staged_file, true) {
+                    let _ = fs::remove_file(&staged_file);
                     write_json_error(&mut stream, 500, &err)?;
                     return Ok(());
                 }
-                let _ = fs::remove_file(&tmp_file);
                 complete_session_file(&hub.state, &session_id, &file_id);
                 touch_peer_by_ip(&hub.state, &remote_addr.ip().to_string());
                 write_status_empty(&mut stream, 200, "OK")?;
@@ -1156,22 +1676,100 @@ fn handle_http_connection(
                 return Ok(());
             }
 
-            let dest_dir = Path::new(&export_dir).join("LocalSend接收");
-            fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
-            let clean_name = sanitize_incoming_filename(&pending.dto.file_name);
-            let final_path = get_unique_destination_path(&dest_dir, &clean_name);
-            if fs::rename(&tmp_file, &final_path).is_err() {
-                fs::copy(&tmp_file, &final_path).map_err(|e| e.to_string())?;
+            if let Err(err) = fs::create_dir_all(&managed_root) {
                 let _ = fs::remove_file(&tmp_file);
+                write_json_error(&mut stream, 500, &err.to_string())?;
+                return Ok(());
             }
+            let clean_name = sanitize_incoming_filename(&pending.dto.file_name);
+            let fallback_title = Path::new(&clean_name)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("iPad 壁纸")
+                .to_string();
+            let item_title = pending
+                .dto
+                .metadata
+                .as_ref()
+                .and_then(|m| m.wallpull_title.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .unwrap_or(fallback_title);
+            let content_rating = pending
+                .dto
+                .metadata
+                .as_ref()
+                .and_then(|m| m.wallpull_content_rating.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Everyone")
+                .to_string();
+
+            let imported_dir = if let Some((existing_dir, existing_title)) =
+                find_existing_imported_by_sha(&managed_root, &sha_hex)
+            {
+                let _ = fs::remove_file(&tmp_file);
+                (existing_dir, existing_title)
+            } else {
+                let seq = TOK_SEQ.fetch_add(1, Ordering::Relaxed) % 1000;
+                let folder_id = format!("99{:013}{:03}", now_ms() % 10_000_000_000_000, seq);
+                let project_dir = managed_root.join(&folder_id);
+                let persist_res: Result<(), String> = (|| {
+                    fs::create_dir_all(&project_dir).map_err(|e| e.to_string())?;
+                    let final_path = get_unique_destination_path(&project_dir, &clean_name);
+                    if fs::rename(&tmp_file, &final_path).is_err() {
+                        fs::copy(&tmp_file, &final_path).map_err(|e| e.to_string())?;
+                        let _ = fs::remove_file(&tmp_file);
+                    }
+                    let stored_rel_name = final_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&clean_name)
+                        .to_string();
+                    let media_type = if crate::media::detect_media_type(&final_path) == Some("video") {
+                        "video"
+                    } else {
+                        "image"
+                    };
+                    let project_json = serde_json::json!({
+                        "title": item_title,
+                        "file": stored_rel_name,
+                        "type": media_type,
+                        "contentrating": content_rating,
+                        "wallpullSource": sender_alias,
+                        "wallpullSha256": sha_hex,
+                    });
+                    let pj_bytes = serde_json::to_vec_pretty(&project_json).map_err(|e| e.to_string())?;
+                    let pj_tmp = project_dir.join("project.json.tmp");
+                    let pj_final = project_dir.join("project.json");
+                    fs::write(&pj_tmp, &pj_bytes).map_err(|e| e.to_string())?;
+                    if fs::rename(&pj_tmp, &pj_final).is_err() {
+                        let _ = fs::remove_file(&pj_final);
+                        fs::rename(&pj_tmp, &pj_final).map_err(|e| e.to_string())?;
+                    }
+                    Ok(())
+                })();
+                if let Err(err) = persist_res {
+                    let _ = fs::remove_file(&tmp_file);
+                    let _ = fs::remove_dir_all(&project_dir);
+                    write_json_error(&mut stream, 500, &err)?;
+                    return Ok(());
+                }
+                (project_dir, item_title)
+            };
+
             complete_session_file(&hub.state, &session_id, &file_id);
             touch_peer_by_ip(&hub.state, &remote_addr.ip().to_string());
             write_status_empty(&mut stream, 200, "OK")?;
             emit_event(
                 &hub.event_cb,
-                LocalSendEvent::FileReceived {
-                    message: format!("已从「{sender_alias}」无损接收：{clean_name}"),
-                    destination: Some(dest_dir.to_string_lossy().into_owned()),
+                LocalSendEvent::WallpaperImported {
+                    project_dir: crate::models::clean_path_str(&imported_dir.0),
+                    title: imported_dir.1,
+                    sender_alias,
                 },
             );
         }
@@ -1230,9 +1828,16 @@ fn handle_http_connection(
                 (PathBuf::from(&entry.source_path), mime_for_path(Path::new(&entry.source_path), &entry.media_type))
             };
             let (serve_path, serve_mime) = if entry.media_type == "video" {
-                match ensure_ios_compatible_mp4(&entry.id, &raw_path, entry.preview_video_path.as_deref()) {
+                let cache_id = match asset_idx {
+                    Some(idx) if idx > 0 => format!("{}_a{idx}", entry.id),
+                    _ => entry.id.clone(),
+                };
+                match ensure_ios_compatible_mp4(&cache_id, &raw_path, None) {
                     Ok(mp4_path) => (mp4_path, "video/mp4".to_string()),
-                    Err(_) => (raw_path, raw_mime),
+                    Err(err_msg) => {
+                        write_json_error(&mut stream, 500, &err_msg)?;
+                        return Ok(());
+                    }
                 }
             } else {
                 (raw_path, raw_mime)
@@ -1280,7 +1885,12 @@ fn handle_http_connection(
                 .map(|e| e.eq_ignore_ascii_case("ogg"))
                 .unwrap_or(false);
             let range_hdr = headers.get("range").map(|s| s.as_str());
-            if is_ogg {
+            if track.is_embedded || crate::media::detect_media_type(src_path) == Some("video") {
+                match ensure_m4a_from_video(&entry.id, track_idx, src_path) {
+                    Ok(m4a_path) => serve_file_with_range(&mut stream, &m4a_path, "audio/mp4", range_hdr)?,
+                    Err(e) => write_json_error(&mut stream, 500, &format!("Video BGM extract failed: {e}"))?,
+                }
+            } else if is_ogg {
                 match ensure_wav_from_ogg(&entry.id, track_idx, src_path) {
                     Ok(wav_path) => serve_file_with_range(&mut stream, &wav_path, "audio/wav", range_hdr)?,
                     Err(e) => write_json_error(&mut stream, 500, &format!("Audio decode failed: {e}"))?,
@@ -1409,7 +2019,7 @@ fn run_udp_multicast_loop(hub: Arc<LocalSendHub>) {
         let should_reply = peer_info.announce.unwrap_or(false);
         let peer_port = peer_info.port.unwrap_or(LOCALSEND_DEFAULT_PORT);
         let peer_proto = peer_info.protocol.clone().unwrap_or_else(|| "https".to_string());
-        let changed = upsert_peer(&hub.state, peer_info, peer_ip.clone(), None, None);
+        let changed = upsert_peer(&hub.state, peer_info, peer_ip.clone(), None, None, false);
         if changed {
             emit_event(&hub.event_cb, LocalSendEvent::PeersChanged);
         }
@@ -1424,7 +2034,7 @@ fn run_udp_multicast_loop(hub: Arc<LocalSendHub>) {
                         .ok()
                         .and_then(|ip| {
                             let body = serde_json::to_vec(&reply_info).ok()?;
-                            lan_http_post_json(ip, peer_port, "/api/localsend/v2/register", &body, Duration::from_millis(800)).ok()
+                            lan_http_post_json(ip, peer_port, "/api/localsend/v2/register", &body, None, Duration::from_millis(800)).ok()
                         })
                         .is_some()
                 } else {
@@ -1619,6 +2229,7 @@ fn upsert_peer(
     ip: String,
     port_override: Option<u16>,
     proto_override: Option<&str>,
+    auth_verified: bool,
 ) -> bool {
     if !is_wallpull_device_info(&info) {
         return false;
@@ -1665,12 +2276,23 @@ fn upsert_peer(
         missed_probes: 0,
     };
     let mut guard = state.write().unwrap_or_else(|e| e.into_inner());
+    // Prevent unauthenticated LAN peer IP hijacking against an already-trusted peer fingerprint
+    if !auth_verified && guard.trusted_peers.contains_key(&peer.fingerprint) {
+        if let Some(prev) = guard.peers.get(&peer.fingerprint) {
+            if prev.ip != peer.ip || prev.port != peer.port {
+                return false;
+            }
+        }
+    }
     if let Ok(parsed_ip) = ip.parse::<Ipv4Addr>() {
         if guard.known_endpoints.len() >= 16 {
             guard.known_endpoints.clear();
         }
         guard.known_endpoints.insert((parsed_ip, port));
     }
+    guard
+        .peers
+        .retain(|fp, prev| fp == &peer.fingerprint || prev.ip != peer.ip || prev.port != peer.port);
     let changed = guard
         .peers
         .get(&peer.fingerprint)
@@ -1696,18 +2318,103 @@ fn emit_event(
     }
 }
 
-fn get_or_build_lan_thumb(entry: &CatalogEntry) -> Result<Vec<u8>, String> {
-    let cache_dir = cache_root().join("lan-thumbs-v2");
-    let _ = fs::create_dir_all(&cache_dir);
-    let safe_id = get_safe_file_name(&entry.id, "thumb");
-    let cache_path = cache_dir.join(format!("{safe_id}.jpg"));
-    if cache_path.is_file() {
-        if let Ok(bytes) = fs::read(&cache_path) {
-            if !bytes.is_empty() {
-                return Ok(bytes);
-            }
+fn inflight_lock_for(
+    map_cell: &OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    key: &str,
+) -> Arc<Mutex<()>> {
+    let map = map_cell.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.len() > 512 {
+        guard.retain(|_, arc| Arc::strong_count(arc) > 1);
+    }
+    guard
+        .entry(key.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn thumb_decode_sema() -> &'static (Mutex<usize>, Condvar) {
+    static SEMA: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
+    SEMA.get_or_init(|| (Mutex::new(0usize), Condvar::new()))
+}
+
+fn source_cache_stamp(path: &Path) -> String {
+    let Ok(meta) = fs::metadata(path) else {
+        return "0".to_string();
+    };
+    let len = meta.len();
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{len:x}-{mtime:x}")
+}
+
+fn commit_temp_file_strict(tmp: &Path, dest: &Path) -> Result<(), String> {
+    if fs::rename(tmp, dest).is_ok() {
+        return Ok(());
+    }
+    if let Err(err) = fs::copy(tmp, dest) {
+        let _ = fs::remove_file(dest);
+        let _ = fs::remove_file(tmp);
+        return Err(err.to_string());
+    }
+    let _ = fs::remove_file(tmp);
+    Ok(())
+}
+
+struct TempFileGuard(Option<PathBuf>);
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self(Some(path))
+    }
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = fs::remove_file(p);
         }
     }
+}
+
+fn prune_older_clipboard_files(dir: &Path, keep: &Path, max_keep: usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if p == keep || !p.is_file() {
+                return None;
+            }
+            let name = p.file_name()?.to_str()?;
+            if !name.starts_with("clip-") {
+                return None;
+            }
+            let mtime = e
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(UNIX_EPOCH);
+            Some((mtime, p))
+        })
+        .collect();
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, p) in files.into_iter().skip(max_keep.saturating_sub(1)) {
+        let _ = fs::remove_file(p);
+    }
+}
+
+fn get_or_build_lan_thumb(entry: &CatalogEntry) -> Result<Vec<u8>, String> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    let cache_dir = cache_root().join("lan-thumbs-v2");
+    let _ = fs::create_dir_all(&cache_dir);
 
     let candidate_path = if entry.media_type == "image" && Path::new(&entry.source_path).is_file() {
         Path::new(&entry.source_path)
@@ -1717,7 +2424,53 @@ fn get_or_build_lan_thumb(entry: &CatalogEntry) -> Result<Vec<u8>, String> {
         return Err("No preview image".to_string());
     };
 
-    let img = image::open(candidate_path).map_err(|e| e.to_string())?;
+    let safe_id = get_safe_file_name(&entry.id, "thumb");
+    let stamp = source_cache_stamp(candidate_path);
+    let cache_key = format!("{safe_id}_{stamp}");
+    let cache_path = cache_dir.join(format!("{cache_key}.jpg"));
+    if cache_path.is_file() {
+        if let Ok(bytes) = fs::read(&cache_path) {
+            if !bytes.is_empty() {
+                return Ok(bytes);
+            }
+        }
+    }
+
+    let key_lock = inflight_lock_for(&LOCKS, &cache_key);
+    let _guard = key_lock.lock().unwrap_or_else(|e| e.into_inner());
+    if cache_path.is_file() {
+        if let Ok(bytes) = fs::read(&cache_path) {
+            if !bytes.is_empty() {
+                return Ok(bytes);
+            }
+        }
+    }
+
+    let (mtx, cv) = thumb_decode_sema();
+    {
+        let mut active = mtx.lock().unwrap_or_else(|e| e.into_inner());
+        while *active >= 4 {
+            active = cv.wait(active).unwrap_or_else(|e| e.into_inner());
+        }
+        *active += 1;
+    }
+    struct SlotRelease;
+    impl Drop for SlotRelease {
+        fn drop(&mut self) {
+            let (mtx, cv) = thumb_decode_sema();
+            let mut active = mtx.lock().unwrap_or_else(|e| e.into_inner());
+            *active = active.saturating_sub(1);
+            cv.notify_one();
+        }
+    }
+    let _slot = SlotRelease;
+
+    let img = image::ImageReader::open(candidate_path)
+        .map_err(|e| e.to_string())?
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?
+        .decode()
+        .map_err(|e| e.to_string())?;
     let (w, h) = img.dimensions();
     let resized = if w > 1280 || h > 1280 {
         img.resize(1280, 1280, FilterType::Triangle)
@@ -1728,7 +2481,14 @@ fn get_or_build_lan_thumb(entry: &CatalogEntry) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     let mut enc = JpegEncoder::new_with_quality(&mut out, 90);
     enc.encode_image(&rgb).map_err(|e| e.to_string())?;
-    let _ = fs::write(&cache_path, &out);
+    let tmp_path = cache_dir.join(format!("{safe_id}.{}.tmp", generate_token()));
+    if fs::write(&tmp_path, &out).is_ok() {
+        if fs::rename(&tmp_path, &cache_path).is_err() {
+            let _ = fs::remove_file(&cache_path);
+            let _ = fs::rename(&tmp_path, &cache_path);
+        }
+        let _ = fs::remove_file(&tmp_path);
+    }
     Ok(out)
 }
 
@@ -1776,12 +2536,27 @@ fn get_or_open_lan_studio_session(
 }
 
 fn render_studio_offline_groups(session: &SceneStudioSession) -> Vec<OfflineGroupPayload> {
+    let default_set: HashSet<usize> = session
+        .manifest
+        .layers
+        .iter()
+        .filter(|l| l.default_visible)
+        .map(|l| l.index)
+        .collect();
     session
         .manifest
         .groups
         .par_iter()
         .filter_map(|group| {
-            let vis: HashSet<usize> = group.layer_indices.iter().copied().collect();
+            let mut vis: HashSet<usize> = group
+                .layer_indices
+                .iter()
+                .copied()
+                .filter(|idx| default_set.contains(idx))
+                .collect();
+            if vis.is_empty() {
+                vis = group.layer_indices.iter().copied().collect();
+            }
             let (bytes, r) = session
                 .render_subset_to_png_bytes(&vis, 1920, true, false)
                 .ok()?;
@@ -1821,7 +2596,8 @@ fn write_wav_pcm16_from_samples(
     sample_rate: u32,
     samples_iter: impl Iterator<Item = i16>,
 ) -> Result<(), String> {
-    let tmp = dest.with_extension("wav.part");
+    let tmp = dest.with_extension(format!("wav.{}.part", generate_token()));
+    let mut tmp_guard = TempFileGuard::new(tmp.clone());
     let mut f = std::io::BufWriter::new(File::create(&tmp).map_err(|e| e.to_string())?);
     let ch = channels.max(1);
     let sr = sample_rate.max(8000);
@@ -1856,21 +2632,27 @@ fn write_wav_pcm16_from_samples(
     raw.write_all(&data_bytes.to_le_bytes()).map_err(|e| e.to_string())?;
     drop(raw);
 
-    if fs::rename(&tmp, dest).is_err() {
-        fs::copy(&tmp, dest).map_err(|e| e.to_string())?;
-        let _ = fs::remove_file(&tmp);
-    }
+    commit_temp_file_strict(&tmp, dest)?;
+    tmp_guard.disarm();
     Ok(())
 }
 
 fn ensure_wav_from_ogg(item_id: &str, track_idx: usize, src_ogg: &Path) -> Result<PathBuf, String> {
+    static WAV_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
     if !src_ogg.is_file() {
         return Err("音频源文件不存在".to_string());
     }
     let dir = cache_root().join("lan-audio");
     let _ = fs::create_dir_all(&dir);
     let safe_id = get_safe_file_name(item_id, "audio");
-    let dest = dir.join(format!("{safe_id}_{track_idx}.wav"));
+    let stamp = source_cache_stamp(src_ogg);
+    let key = format!("{safe_id}_{track_idx}_{stamp}");
+    let dest = dir.join(format!("{key}.wav"));
+    if dest.is_file() && fs::metadata(&dest).map(|m| m.len() > 44).unwrap_or(false) {
+        return Ok(dest);
+    }
+    let lock = inflight_lock_for(&WAV_LOCKS, &key);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     if dest.is_file() && fs::metadata(&dest).map(|m| m.len() > 44).unwrap_or(false) {
         return Ok(dest);
     }
@@ -1890,6 +2672,88 @@ fn ensure_wav_from_ogg(item_id: &str, track_idx: usize, src_ogg: &Path) -> Resul
     Ok(dest)
 }
 
+fn ensure_m4a_from_video(item_id: &str, track_idx: usize, src_video: &Path) -> Result<PathBuf, String> {
+    static M4A_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    if !src_video.is_file() {
+        return Err("视频源文件不存在".to_string());
+    }
+    let dir = cache_root().join("lan-audio");
+    let _ = fs::create_dir_all(&dir);
+    let safe_id = get_safe_file_name(item_id, "audio");
+    let stamp = source_cache_stamp(src_video);
+    let key = format!("{safe_id}_{track_idx}_{stamp}_m4a");
+    let dest = dir.join(format!("{key}.m4a"));
+    if dest.is_file() && fs::metadata(&dest).map(|m| m.len() > 256).unwrap_or(false) {
+        return Ok(dest);
+    }
+    let lock = inflight_lock_for(&M4A_LOCKS, &key);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if dest.is_file() && fs::metadata(&dest).map(|m| m.len() > 256).unwrap_or(false) {
+        return Ok(dest);
+    }
+    let ffmpeg = crate::media::find_executable("ffmpeg.exe")
+        .ok_or_else(|| "未找到 ffmpeg".to_string())?;
+    let tmp = dir.join(format!("{key}.{}.tmp.m4a", generate_token()));
+    let mut tmp_guard = TempFileGuard::new(tmp.clone());
+    let args = crate::process_runner::os_args([
+        "-y",
+        "-i",
+        &src_video.to_string_lossy(),
+        "-vn",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-movflags",
+        "+faststart",
+        &tmp.to_string_lossy(),
+    ]);
+    let out = crate::process_runner::run_output(&ffmpeg, &args, None, Duration::from_secs(120), None)?;
+    if !out.status.success()
+        || !tmp.is_file()
+        || !fs::metadata(&tmp).map(|m| m.len() > 256).unwrap_or(false)
+    {
+        return Err("提取视频音频失败".to_string());
+    }
+    commit_temp_file_strict(&tmp, &dest)?;
+    tmp_guard.disarm();
+    Ok(dest)
+}
+
+fn find_existing_imported_by_sha(managed_root: &Path, sha_hex: &str) -> Option<(PathBuf, String)> {
+    if sha_hex.trim().is_empty() {
+        return None;
+    }
+    let entries = fs::read_dir(managed_root).ok()?;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let pj = dir.join("project.json");
+        let Ok(bytes) = fs::read(&pj) else {
+            continue;
+        };
+        let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        let stored_sha = val.get("wallpullSha256").and_then(|s| s.as_str()).unwrap_or("");
+        let rel_file = val.get("file").and_then(|s| s.as_str()).unwrap_or("");
+        if !rel_file.is_empty()
+            && stored_sha.eq_ignore_ascii_case(sha_hex.trim())
+            && dir.join(rel_file).is_file()
+        {
+            let title = val
+                .get("title")
+                .and_then(|s| s.as_str())
+                .unwrap_or("iPad 壁纸")
+                .to_string();
+            return Some((dir, title));
+        }
+    }
+    None
+}
+
 fn parse_ffprobe_fps(raw: &str) -> f64 {
     let trimmed = raw.trim();
     if let Some((num_s, den_s)) = trimmed.split_once('/') {
@@ -1901,6 +2765,7 @@ fn parse_ffprobe_fps(raw: &str) -> f64 {
     }
 }
 
+#[derive(Clone, Copy)]
 enum IosMp4Action {
     Direct,
     RemuxHevcTag,
@@ -1908,6 +2773,42 @@ enum IosMp4Action {
 }
 
 fn inspect_mp4_for_ios(src_path: &Path) -> IosMp4Action {
+    static PROBE_CACHE: OnceLock<Mutex<HashMap<String, (u64, u64, IosMp4Action)>>> = OnceLock::new();
+    let meta = fs::metadata(src_path).ok();
+    let sig = meta.map(|m| {
+        let mt = m
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        (m.len(), mt)
+    });
+    let key = src_path.to_string_lossy().into_owned();
+    let cache = PROBE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some((len, mt)) = sig {
+        if let Ok(guard) = cache.lock() {
+            if let Some(&(c_len, c_mt, act)) = guard.get(&key) {
+                if c_len == len && c_mt == mt {
+                    return act;
+                }
+            }
+        }
+    }
+
+    let action = inspect_mp4_for_ios_uncached(src_path);
+    if let Some((len, mt)) = sig {
+        if let Ok(mut guard) = cache.lock() {
+            if guard.len() > 2048 {
+                guard.clear();
+            }
+            guard.insert(key, (len, mt, action));
+        }
+    }
+    action
+}
+
+fn inspect_mp4_for_ios_uncached(src_path: &Path) -> IosMp4Action {
     let Some(ffprobe) = crate::media::find_executable("ffprobe.exe") else {
         return IosMp4Action::Direct;
     };
@@ -1943,7 +2844,10 @@ fn inspect_mp4_for_ios(src_path: &Path) -> IosMp4Action {
     if codec == "h264" && matches!(pix_fmt.as_str(), "yuv420p" | "yuvj420p") && fps_ok {
         return IosMp4Action::Direct;
     }
-    if codec == "hevc" && fps_ok {
+    if codec == "hevc"
+        && matches!(pix_fmt.as_str(), "yuv420p" | "yuvj420p" | "yuv420p10le" | "")
+        && fps_ok
+    {
         if tag.eq_ignore_ascii_case("hvc1") {
             return IosMp4Action::Direct;
         }
@@ -1955,8 +2859,9 @@ fn inspect_mp4_for_ios(src_path: &Path) -> IosMp4Action {
 pub fn ensure_ios_compatible_mp4(
     item_id: &str,
     src_path: &Path,
-    fallback_preview: Option<&str>,
+    _fallback_preview: Option<&str>,
 ) -> Result<PathBuf, String> {
+    static TRANSCODE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
     if !src_path.is_file() {
         return Err("视频源文件不存在".to_string());
     }
@@ -1977,13 +2882,22 @@ pub fn ensure_ios_compatible_mp4(
     let dir = cache_root().join("lan_ios_mp4_v2");
     let _ = fs::create_dir_all(&dir);
     let safe_id = get_safe_file_name(item_id, "video");
-    let dest = dir.join(format!("{safe_id}.mp4"));
+    let stamp = source_cache_stamp(src_path);
+    let cache_key = format!("{safe_id}_{stamp}");
+    let dest = dir.join(format!("{cache_key}.mp4"));
+    if dest.is_file() && fs::metadata(&dest).map(|m| m.len() > 1024).unwrap_or(false) {
+        return Ok(dest);
+    }
+
+    let key_lock = inflight_lock_for(&TRANSCODE_LOCKS, &cache_key);
+    let _guard = key_lock.lock().unwrap_or_else(|e| e.into_inner());
     if dest.is_file() && fs::metadata(&dest).map(|m| m.len() > 1024).unwrap_or(false) {
         return Ok(dest);
     }
 
     if let Some(ffmpeg) = crate::media::find_executable("ffmpeg.exe") {
-        let tmp = dir.join(format!("{safe_id}_{}.part.mp4", generate_token()));
+        let tmp = dir.join(format!("{cache_key}_{}.part.mp4", generate_token()));
+        let mut tmp_guard = TempFileGuard::new(tmp.clone());
         let args = if matches!(action, IosMp4Action::RemuxHevcTag) {
             crate::process_runner::os_args([
                 "-y",
@@ -2022,32 +2936,24 @@ pub fn ensure_ios_compatible_mp4(
             ])
         };
         if matches!(
-            crate::process_runner::run_status(&ffmpeg, &args, None, Duration::from_secs(90), None),
+            crate::process_runner::run_status(&ffmpeg, &args, None, Duration::from_secs(180), None),
             Ok(true)
         ) {
             if tmp.is_file() && fs::metadata(&tmp).map(|m| m.len() > 1024).unwrap_or(false) {
-                if fs::rename(&tmp, &dest).is_err() {
-                    let _ = fs::copy(&tmp, &dest);
-                    let _ = fs::remove_file(&tmp);
-                }
-                if dest.is_file() {
+                if commit_temp_file_strict(&tmp, &dest).is_ok() && dest.is_file() {
+                    tmp_guard.disarm();
                     return Ok(dest);
                 }
             }
         }
-        let _ = fs::remove_file(&tmp);
+        return Err("视频转码为 iPad 兼容格式失败（可能编码异常或超时），已中止发送以避免损坏文件入库。".to_string());
     }
 
-    if let Some(prev) = fallback_preview.map(Path::new).filter(|p| p.is_file()) {
-        return Ok(prev.to_path_buf());
-    }
-    if matches!(ext.as_str(), "mp4" | "mov" | "m4v") {
-        return Ok(src_path.to_path_buf());
-    }
-    Err("缺少 ffmpeg.exe，无法将该非 MP4 视频转为 iPad 兼容格式".to_string())
+    Err("当前视频编码不被 iPad 原生支持，且电脑端未找到 ffmpeg.exe 转码组件。".to_string())
 }
 
 fn ensure_lan_preview_video(entry: &CatalogEntry) -> Result<PathBuf, String> {
+    static PREVIEW_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
     if entry.media_type != "video" {
         return Err("Not a video".to_string());
     }
@@ -2073,12 +2979,20 @@ fn ensure_lan_preview_video(entry: &CatalogEntry) -> Result<PathBuf, String> {
     let dir = cache_root().join("lan_preview_mp4_v3");
     let _ = fs::create_dir_all(&dir);
     let safe_id = get_safe_file_name(&entry.id, "prev");
-    let dest = dir.join(format!("{safe_id}.mp4"));
+    let stamp = source_cache_stamp(src);
+    let cache_key = format!("{safe_id}_{stamp}");
+    let dest = dir.join(format!("{cache_key}.mp4"));
+    if dest.is_file() && fs::metadata(&dest).map(|m| m.len() > 1024).unwrap_or(false) {
+        return Ok(dest);
+    }
+    let lock = inflight_lock_for(&PREVIEW_LOCKS, &cache_key);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     if dest.is_file() && fs::metadata(&dest).map(|m| m.len() > 1024).unwrap_or(false) {
         return Ok(dest);
     }
     if let Some(ffmpeg) = has_ffmpeg {
-        let tmp = dir.join(format!("{safe_id}_{}.part.mp4", generate_token()));
+        let tmp = dir.join(format!("{cache_key}_{}.part.mp4", generate_token()));
+        let mut tmp_guard = TempFileGuard::new(tmp.clone());
         let args = crate::process_runner::os_args([
             "-y",
             "-t",
@@ -2107,16 +3021,12 @@ fn ensure_lan_preview_video(entry: &CatalogEntry) -> Result<PathBuf, String> {
             Ok(true)
         ) {
             if tmp.is_file() && fs::metadata(&tmp).map(|m| m.len() > 1024).unwrap_or(false) {
-                if fs::rename(&tmp, &dest).is_err() {
-                    let _ = fs::copy(&tmp, &dest);
-                    let _ = fs::remove_file(&tmp);
-                }
-                if dest.is_file() {
+                if commit_temp_file_strict(&tmp, &dest).is_ok() && dest.is_file() {
+                    tmp_guard.disarm();
                     return Ok(dest);
                 }
             }
         }
-        let _ = fs::remove_file(&tmp);
     }
     if let Some(p) = existing_prev {
         return Ok(p.to_path_buf());
@@ -2228,11 +3138,13 @@ fn stream_body_to_file(
     leftover: &[u8],
     content_len: Option<u64>,
     is_chunked: bool,
+    max_bytes: u64,
     dest: &Path,
 ) -> Result<String, String> {
     let mut out = File::create(dest).map_err(|e| e.to_string())?;
     let mut hasher = Sha256::new();
     let mut reader = std::io::Read::chain(std::io::Cursor::new(leftover), stream);
+    let mut received: u64 = 0;
 
     if is_chunked {
         let mut buf_reader = BufReader::new(reader);
@@ -2245,6 +3157,9 @@ fn stream_body_to_file(
             if chunk_size == 0 {
                 break;
             }
+            if received.saturating_add(chunk_size as u64) > max_bytes {
+                return Err("Upload exceeds declared/maximum byte limit".to_string());
+            }
             let mut rem = chunk_size;
             let mut buf = [0u8; 64 * 1024];
             while rem > 0 {
@@ -2255,11 +3170,15 @@ fn stream_body_to_file(
                 hasher.update(&buf[..to_read]);
                 out.write_all(&buf[..to_read]).map_err(|e| e.to_string())?;
                 rem -= to_read;
+                received += to_read as u64;
             }
             let mut crlf = [0u8; 2];
             buf_reader.read_exact(&mut crlf).map_err(|e| e.to_string())?;
         }
     } else if let Some(mut remaining) = content_len {
+        if remaining > max_bytes {
+            return Err("Upload exceeds declared/maximum byte limit".to_string());
+        }
         let mut buf = [0u8; 64 * 1024];
         while remaining > 0 {
             let to_read = (remaining as usize).min(buf.len());
@@ -2270,18 +3189,12 @@ fn stream_body_to_file(
             hasher.update(&buf[..n]);
             out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
             remaining -= n as u64;
+            received += n as u64;
         }
     } else {
-        let mut buf = [0u8; 64 * 1024];
-        loop {
-            let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-            out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-        }
+        return Err("Content-Length required".to_string());
     }
+    let _ = received;
     out.flush().map_err(|e| e.to_string())?;
     Ok(hex::encode(hasher.finalize()))
 }
@@ -2432,6 +3345,7 @@ fn lan_http_post_json(
     port: u16,
     path: &str,
     json_body: &[u8],
+    auth_token: Option<&str>,
     timeout: Duration,
 ) -> Result<(u16, Vec<u8>), String> {
     let addr = SocketAddr::V4(SocketAddrV4::new(ip, port));
@@ -2439,8 +3353,12 @@ fn lan_http_post_json(
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
+    let tok_hdr = auth_token
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("X-WallPull-Token: {s}\r\n"))
+        .unwrap_or_default();
     let hdr = format!(
-        "POST {path} HTTP/1.1\r\nHost: {ip}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {path} HTTP/1.1\r\nHost: {ip}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{tok_hdr}Connection: close\r\n\r\n",
         json_body.len()
     );
     stream.write_all(hdr.as_bytes()).map_err(|e| e.to_string())?;
@@ -2456,6 +3374,7 @@ fn lan_http_upload_bytes(
     port: u16,
     path: &str,
     bytes: &[u8],
+    auth_token: Option<&str>,
     timeout: Duration,
 ) -> Result<(), String> {
     let addr = SocketAddr::V4(SocketAddrV4::new(ip, port));
@@ -2463,8 +3382,12 @@ fn lan_http_upload_bytes(
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
+    let tok_hdr = auth_token
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("X-WallPull-Token: {s}\r\n"))
+        .unwrap_or_default();
     let hdr = format!(
-        "POST {path} HTTP/1.1\r\nHost: {ip}:{port}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {path} HTTP/1.1\r\nHost: {ip}:{port}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n{tok_hdr}Connection: close\r\n\r\n",
         bytes.len()
     );
     stream.write_all(hdr.as_bytes()).map_err(|e| e.to_string())?;
@@ -2479,22 +3402,31 @@ fn lan_http_upload_bytes(
     Ok(())
 }
 
-fn lan_http_upload_file(
+fn lan_http_upload_file_with_progress<F>(
     ip: Ipv4Addr,
     port: u16,
     path: &str,
     file_path: &Path,
     size: u64,
+    auth_token: Option<&str>,
     timeout: Duration,
-) -> Result<(), String> {
+    mut on_delta: F,
+) -> Result<(), String>
+where
+    F: FnMut(u64),
+{
     let mut f = File::open(file_path).map_err(|e| format!("打开待发文件失败：{e}"))?;
     let addr = SocketAddr::V4(SocketAddrV4::new(ip, port));
     let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(|e| e.to_string())?;
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
+    let tok_hdr = auth_token
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("X-WallPull-Token: {s}\r\n"))
+        .unwrap_or_default();
     let hdr = format!(
-        "POST {path} HTTP/1.1\r\nHost: {ip}:{port}\r\nContent-Type: application/octet-stream\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n"
+        "POST {path} HTTP/1.1\r\nHost: {ip}:{port}\r\nContent-Type: application/octet-stream\r\nContent-Length: {size}\r\n{tok_hdr}Connection: close\r\n\r\n"
     );
     stream.write_all(hdr.as_bytes()).map_err(|e| e.to_string())?;
     let mut buf = [0u8; 64 * 1024];
@@ -2504,6 +3436,7 @@ fn lan_http_upload_file(
             break;
         }
         stream.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        on_delta(n as u64);
     }
     stream.flush().map_err(|e| e.to_string())?;
     let (status, _) = read_http_response(&mut stream)?;
@@ -2591,7 +3524,21 @@ fn write_binary_response(stream: &mut TcpStream, mime_type: &str, bytes: &[u8]) 
 }
 
 fn write_json_error(stream: &mut TcpStream, status: u16, message: &str) -> Result<(), String> {
-    let body = serde_json::to_vec(&serde_json::json!({ "message": message })).map_err(|e| e.to_string())?;
+    write_json_error_code(stream, status, "", message)
+}
+
+fn write_json_error_code(
+    stream: &mut TcpStream,
+    status: u16,
+    code: &str,
+    message: &str,
+) -> Result<(), String> {
+    let payload = if code.is_empty() {
+        serde_json::json!({ "message": message })
+    } else {
+        serde_json::json!({ "message": message, "code": code })
+    };
+    let body = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
     let hdr = format!(
         "HTTP/1.1 {status} Error\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -2599,6 +3546,52 @@ fn write_json_error(stream: &mut TcpStream, status: u16, message: &str) -> Resul
     stream.write_all(hdr.as_bytes()).map_err(|e| e.to_string())?;
     stream.write_all(&body).map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let len = a.len().max(b.len());
+    let mut diff: u8 = if a.len() == b.len() { 0 } else { 1 };
+    for i in 0..len {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn is_request_authorized(
+    state: &Arc<RwLock<HubRuntimeState>>,
+    headers: &HashMap<String, String>,
+    query: &HashMap<String, String>,
+) -> bool {
+    let token = headers
+        .get("x-wallpull-token")
+        .map(String::as_str)
+        .or_else(|| query.get("authToken").map(String::as_str))
+        .unwrap_or("")
+        .trim();
+    if token.len() < 16 {
+        return false;
+    }
+    let Ok(guard) = state.read() else {
+        return false;
+    };
+    guard.trusted_peers.values().any(|t| {
+        !t.incoming_token.is_empty() && constant_time_eq(t.incoming_token.as_bytes(), token.as_bytes())
+    })
+}
+
+fn generate_hex_token_32() -> String {
+    let seq = TOK_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut h = Sha256::new();
+    h.update(std::process::id().to_le_bytes());
+    h.update(seq.to_le_bytes());
+    h.update(nanos.to_le_bytes());
+    hex::encode(&h.finalize()[..16])
 }
 
 fn write_status_empty(stream: &mut TcpStream, status: u16, reason: &str) -> Result<(), String> {
@@ -2638,10 +3631,40 @@ fn sanitize_incoming_filename(raw: &str) -> String {
             c => c,
         })
         .collect();
-    if cleaned.trim().is_empty() {
-        "wallpull_item.bin".to_string()
-    } else {
-        cleaned
+    let trimmed = cleaned.trim().trim_end_matches(['.', ' ']);
+    if trimmed.is_empty() {
+        return "wallpull_item.bin".to_string();
+    }
+    let p = Path::new(trimmed);
+    let mut stem = p
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("wallpull_item")
+        .trim()
+        .trim_end_matches(['.', ' '])
+        .chars()
+        .take(64)
+        .collect::<String>();
+    if stem.is_empty() {
+        stem = "wallpull_item".to_string();
+    }
+    let upper = stem.to_ascii_uppercase();
+    if matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL"
+            | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
+            | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+    ) {
+        stem = format!("wp_{stem}");
+    }
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.trim().chars().take(12).collect::<String>())
+        .filter(|e| !e.is_empty());
+    match ext {
+        Some(e) => format!("{stem}.{e}"),
+        None => stem,
     }
 }
 
@@ -2683,21 +3706,12 @@ fn now_ms() -> u64 {
 }
 
 fn generate_token() -> String {
+    let seq = TOK_SEQ.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("{nanos:x}-{}", std::process::id())
-}
-
-fn generate_fingerprint() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut h = Sha256::new();
-    h.update(format!("wallpull-pc-{nanos}-{}", std::process::id()).as_bytes());
-    hex::encode(h.finalize())
+    format!("{nanos:x}-{seq}-{}", std::process::id())
 }
 
 #[cfg(test)]
@@ -2738,6 +3752,7 @@ mod tests {
         });
 
         let payload = vec![0x5Au8; 640 * 1024];
+        let receiver_pin = hub.state.read().unwrap().pair_pin.clone();
         let peer = LocalSendPeer {
             fingerprint: "receiver-fp".into(),
             alias: "TestReceiver".into(),
@@ -2766,10 +3781,31 @@ mod tests {
         }];
 
         let sender = LocalSendHub::start(true, "TestSender", tmp_dir.to_str().unwrap(), false, |_| {});
+        assert!(matches!(
+            sender.send_files_to_peer_with_progress(&peer, &files, |_| {}),
+            Err(SendTransferError::PairingRequired)
+        ));
+        sender.pair_with_peer(&peer, &receiver_pin).unwrap();
         let msg = sender.send_files_to_peer(&peer, &files).unwrap();
         assert!(msg.contains("WallPull"));
 
-        let received = fs::read(tmp_dir.join("LocalSend接收").join("hero.png")).unwrap();
+        assert!(!tmp_dir.join("LocalSend接收").exists());
+        let imported_root = tmp_dir.join("ImportedWallpapers");
+        let subdirs: Vec<PathBuf> = fs::read_dir(&imported_root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        assert_eq!(subdirs.len(), 1);
+        let project_dir = &subdirs[0];
+        let folder_name = project_dir.file_name().unwrap().to_string_lossy();
+        assert!(folder_name.starts_with("99") && folder_name.chars().all(|c| c.is_ascii_digit()));
+        let pj: serde_json::Value =
+            serde_json::from_slice(&fs::read(project_dir.join("project.json")).unwrap()).unwrap();
+        assert_eq!(pj["title"], "Hero");
+        assert_eq!(pj["file"], "hero.png");
+        let received = fs::read(project_dir.join("hero.png")).unwrap();
         assert_eq!(received.len(), payload.len());
         assert_eq!(received, payload);
 
@@ -2796,6 +3832,15 @@ mod tests {
         {
             let mut g = hub.state.write().unwrap();
             g.port = port;
+            g.trusted_peers.insert(
+                "client-fp".into(),
+                TrustedLanPeer {
+                    fingerprint: "client-fp".into(),
+                    alias: "Client".into(),
+                    incoming_token: "test-auth-token-1234567890".into(),
+                    outgoing_token: "test-out-token-1234567890".into(),
+                },
+            );
             let entry = CatalogEntry {
                 id: "item-1".into(),
                 workshop_id: "1".into(),
@@ -2812,6 +3857,7 @@ mod tests {
                 has_scene_layers: false,
                 asset_count: 1,
                 audio_tracks: Vec::new(),
+                is_favorite: false,
                 source_path: asset_path.to_string_lossy().into_owned(),
                 asset_paths: vec![asset_path.to_string_lossy().into_owned()],
                 preview_path: String::new(),
@@ -2826,7 +3872,11 @@ mod tests {
             run_http_accept_loop(hub_srv, listener);
         });
 
+        let unauth = ureq::get(&format!("http://127.0.0.1:{port}/api/localsend/v2/wallpull/asset?id=item-1")).call();
+        assert!(matches!(unauth, Err(ureq::Error::Status(401, _))));
+
         let resp = ureq::get(&format!("http://127.0.0.1:{port}/api/localsend/v2/wallpull/asset?id=item-1"))
+            .set("X-WallPull-Token", "test-auth-token-1234567890")
             .set("Range", "bytes=100000-499999")
             .call()
             .unwrap();
@@ -2837,6 +3887,7 @@ mod tests {
         assert_eq!(got, raw[100_000..500_000]);
 
         let prev_resp = ureq::get(&format!("http://127.0.0.1:{port}/api/localsend/v2/wallpull/preview-video?id=item-1"))
+            .set("X-WallPull-Token", "test-auth-token-1234567890")
             .call()
             .unwrap();
         assert_eq!(prev_resp.status(), 200);
@@ -2883,7 +3934,7 @@ mod tests {
             announce: None,
             wallpull_channel: None,
         };
-        assert!(!upsert_peer(&hub.state, generic_loca, "192.168.1.55".into(), None, None));
+        assert!(!upsert_peer(&hub.state, generic_loca, "192.168.1.55".into(), None, None, false));
         assert!(hub.peers_snapshot().is_empty());
 
         let wallpull_ipad = LocalSendDeviceInfo {
@@ -2898,7 +3949,26 @@ mod tests {
             announce: None,
             wallpull_channel: Some(WALLPULL_LAN_CHANNEL.into()),
         };
-        assert!(upsert_peer(&hub.state, wallpull_ipad, "192.168.1.88".into(), None, None));
+        assert!(upsert_peer(&hub.state, wallpull_ipad.clone(), "192.168.1.88".into(), None, None, false));
+        {
+            let mut g = hub.state.write().unwrap();
+            g.trusted_peers.insert(
+                "wp-ipad-fp".into(),
+                TrustedLanPeer {
+                    fingerprint: "wp-ipad-fp".into(),
+                    alias: "My iPad".into(),
+                    incoming_token: "in-tok".into(),
+                    outgoing_token: "out-tok".into(),
+                },
+            );
+        }
+        // Unauthenticated IP change for a trusted peer must be rejected to prevent token hijacking
+        assert!(!upsert_peer(&hub.state, wallpull_ipad.clone(), "192.168.1.250".into(), None, None, false));
+        assert_eq!(hub.state.read().unwrap().peers.get("wp-ipad-fp").unwrap().ip, "192.168.1.88");
+        assert!(upsert_peer(&hub.state, wallpull_ipad, "192.168.1.250".into(), None, None, true));
+        assert_eq!(hub.state.read().unwrap().peers.get("wp-ipad-fp").unwrap().ip, "192.168.1.250");
+        assert_ne!(generate_token(), generate_token());
+        assert_eq!(sanitize_incoming_filename("CON.png"), "wp_CON.png");
         let peers = hub.peers_snapshot();
         assert_eq!(peers.len(), 1);
         assert!(peers[0].is_wallpull_ipad);
@@ -2916,7 +3986,7 @@ mod tests {
             announce: None,
             wallpull_channel: Some(WALLPULL_LAN_CHANNEL.into()),
         };
-        assert!(upsert_peer(&hub.state, other_pc, "192.168.1.99".into(), None, None));
+        assert!(upsert_peer(&hub.state, other_pc, "192.168.1.99".into(), None, None, false));
         let pc_peer = hub.state.read().unwrap().peers.get("wp-pc2-fp").cloned().unwrap();
         assert!(!pc_peer.is_wallpull_ipad);
 

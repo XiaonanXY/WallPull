@@ -1,13 +1,48 @@
-use crate::models::{AppSettings, GpuAdapterInfo, default_export_directory};
+use crate::models::{AppSettings, GpuAdapterInfo, TrustedLanPeer, default_export_directory};
 use regex::Regex;
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use winreg::RegKey;
 use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
 use windows::core::PCWSTR;
+
+static SETTINGS_RAND_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn next_entropy_bytes() -> [u8; 32] {
+    let seq = SETTINGS_RAND_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut hasher = Sha256::new();
+    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(seq.to_le_bytes());
+    hasher.update(nanos.to_le_bytes());
+    let ptr_addr = (&seq as *const u64) as usize;
+    hasher.update(ptr_addr.to_le_bytes());
+    hasher.finalize().into()
+}
+
+pub fn generate_lan_device_id() -> String {
+    hex::encode(&next_entropy_bytes()[..16])
+}
+
+pub fn generate_lan_pair_pin() -> String {
+    let b = next_entropy_bytes();
+    let v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) % 10000;
+    format!("{v:04}")
+}
+
+pub fn is_valid_pair_pin(pin: &str) -> bool {
+    let t = pin.trim();
+    t.len() == 4 && t.bytes().all(|b| b.is_ascii_digit())
+}
 
 const WALLPAPER_ENGINE_APP_ID: &str = "431960";
 const DISPLAY_CLASS_KEY: &str =
@@ -28,17 +63,55 @@ pub fn cache_root() -> PathBuf {
     local_app_data_root().join("Cache")
 }
 
+pub fn imported_wallpapers_root() -> PathBuf {
+    local_app_data_root().join("ImportedWallpapers")
+}
+
+pub fn append_managed_roots(mut roots: Vec<String>) -> Vec<String> {
+    let managed = crate::models::clean_path_str(&imported_wallpapers_root());
+    let managed_norm = managed.trim_end_matches(['\\', '/']).to_ascii_lowercase();
+    if Path::new(&managed).is_dir()
+        && !roots.iter().any(|r| {
+            crate::models::clean_path_str(Path::new(r))
+                .trim_end_matches(['\\', '/'])
+                .eq_ignore_ascii_case(&managed_norm)
+        })
+    {
+        roots.push(managed);
+    }
+    roots
+}
+
 pub fn settings_file_path() -> PathBuf {
     local_app_data_root().join("settings.json")
 }
 
 pub fn load_settings_from(path: &Path) -> AppSettings {
     let Ok(bytes) = fs::read(path) else {
-        return AppSettings::default();
+        return sanitize_settings(AppSettings::default());
     };
-    serde_json::from_slice::<AppSettings>(&bytes)
-        .map(sanitize_settings)
-        .unwrap_or_default()
+    match serde_json::from_slice::<AppSettings>(&bytes) {
+        Ok(parsed) => sanitize_settings(parsed),
+        Err(_) => {
+            if !bytes.is_empty() {
+                if let Some(parent) = path.parent() {
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let fname = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("settings.json");
+                    let backup = parent.join(format!("{fname}.bad.{ts}"));
+                    if fs::rename(path, &backup).is_err() {
+                        let _ = fs::write(&backup, &bytes);
+                    }
+                }
+            }
+            sanitize_settings(AppSettings::default())
+        }
+    }
 }
 
 pub fn save_settings_to(path: &Path, settings: &AppSettings) -> Result<(), String> {
@@ -58,7 +131,15 @@ pub fn save_settings_to(path: &Path, settings: &AppSettings) -> Result<(), Strin
     let tmp_path = dir.join(tmp_name);
     let json = serde_json::to_vec_pretty(settings)
         .map_err(|e| format!("序列化设置失败：{e}"))?;
-    fs::write(&tmp_path, json).map_err(|e| format!("写入设置失败：{e}"))?;
+    {
+        let mut f = File::create(&tmp_path).map_err(|e| format!("创建临时设置文件失败：{e}"))?;
+        f.write_all(&json)
+            .and_then(|_| f.sync_all())
+            .map_err(|e| {
+                let _ = fs::remove_file(&tmp_path);
+                format!("写入设置失败：{e}")
+            })?;
+    }
     if let Err(err) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(path);
         if let Err(err2) = fs::rename(&tmp_path, path) {
@@ -172,6 +253,39 @@ pub fn sanitize_settings(updated: AppSettings) -> AppSettings {
         color_filter: updated.color_filter.filter(|c| {
             matches!(c.as_str(), "dark" | "light" | "blue" | "purple" | "green" | "warm")
         }),
+        localsend_device_id: {
+            let trimmed = updated.localsend_device_id.trim();
+            if trimmed.len() >= 16 && trimmed.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                trimmed.to_string()
+            } else {
+                generate_lan_device_id()
+            }
+        },
+        localsend_pair_pin: {
+            let trimmed = updated.localsend_pair_pin.trim();
+            if is_valid_pair_pin(trimmed) {
+                trimmed.to_string()
+            } else {
+                generate_lan_pair_pin()
+            }
+        },
+        localsend_trusted_peers: {
+            let mut seen_fp = HashSet::new();
+            let mut out = Vec::new();
+            for p in updated.localsend_trusted_peers {
+                let fp = p.fingerprint.trim().to_string();
+                if fp.is_empty() || p.incoming_token.trim().is_empty() || !seen_fp.insert(fp.clone()) {
+                    continue;
+                }
+                out.push(TrustedLanPeer {
+                    fingerprint: fp,
+                    alias: p.alias.trim().chars().take(48).collect(),
+                    incoming_token: p.incoming_token.trim().to_string(),
+                    outgoing_token: p.outgoing_token.trim().to_string(),
+                });
+            }
+            out
+        },
     }
 }
 
@@ -226,9 +340,15 @@ pub fn clear_media_cache() -> (f64, i64) {
         "frame-captures",
         "layer-studio",
         "drag-staging",
+        "clipboard-staging",
         "video-previews",
         "video-clips",
         "previews",
+        "lan_ios_mp4_v2",
+        "lan_preview_mp4_v3",
+        "lan-audio",
+        "lan-thumbs-v2",
+        "localsend-tmp",
     ] {
         let sub_dir = root.join(sub);
         if sub_dir.exists() && !crate::models::is_reparse_point(&sub_dir) {
@@ -556,5 +676,41 @@ mod tests {
         assert_eq!(loaded.media_filter, "image");
         assert_eq!(loaded.color_filter.as_deref(), Some("blue"));
         let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn corrupt_settings_json_is_backed_up_to_bad_file() {
+        let dir = std::env::temp_dir().join(format!("wp_settings_bad_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("settings.json");
+        fs::write(&cfg, b"{broken json").unwrap();
+
+        let loaded = load_settings_from(&cfg);
+        assert!(is_valid_pair_pin(&loaded.localsend_pair_pin));
+        let bad_files: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("settings.json.bad."))
+            .collect();
+        assert_eq!(bad_files.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_managed_roots_adds_directory_without_duplicates() {
+        let managed = imported_wallpapers_root();
+        let _ = fs::create_dir_all(&managed);
+        let first = append_managed_roots(vec![r"C:\Temp\Workshop".to_string()]);
+        let managed_str = crate::models::clean_path_str(&managed);
+        assert!(first.iter().any(|p| p.eq_ignore_ascii_case(&managed_str)));
+        let second = append_managed_roots(first.clone());
+        assert_eq!(
+            second
+                .iter()
+                .filter(|p| p.eq_ignore_ascii_case(&managed_str))
+                .count(),
+            1
+        );
     }
 }

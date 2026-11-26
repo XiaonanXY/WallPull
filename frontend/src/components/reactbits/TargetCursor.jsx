@@ -101,6 +101,8 @@ const TargetCursor = ({
     let lastLabel = '';
     let lastColor = '';
     let lastScope = null;
+    let alive = true;
+    let clickRaf = 0;
 
     const scopeOf = () => resolveElement(settingsRef.current.container);
 
@@ -313,8 +315,10 @@ const TargetCursor = ({
     };
 
     const syncTargetAfterEvent = () => {
-      requestAnimationFrame(() => {
-        if (!pointer.inside) return;
+      if (clickRaf) cancelAnimationFrame(clickRaf);
+      clickRaf = requestAnimationFrame(() => {
+        clickRaf = 0;
+        if (!alive || !pointer.inside) return;
         lockOn(findTarget(pointer.x, pointer.y));
         if (target && target.isConnected) {
           targetRect = target.getBoundingClientRect();
@@ -362,7 +366,9 @@ const TargetCursor = ({
     window.addEventListener('blur', onLeave);
 
     return () => {
+      alive = false;
       cancelAnimationFrame(raf);
+      if (clickRaf) cancelAnimationFrame(clickRaf);
       wakeRef.current = null;
       window.removeEventListener('pointermove', onPointerMove);
       window.removeEventListener('pointerdown', onPointerDown);
@@ -378,7 +384,24 @@ const TargetCursor = ({
 
   useEffect(() => {
     wakeRef.current?.();
-  });
+  }, [
+    targetSelector,
+    cursorColor,
+    cursorColorOnTarget,
+    spinDuration,
+    hoverDuration,
+    parallaxOn,
+    hideDefaultCursor,
+    size,
+    cornerSize,
+    thickness,
+    padding,
+    matchRadius,
+    dotSize,
+    showLabel,
+    clickEffect,
+    container,
+  ]);
 
   if (!host) return null;
 

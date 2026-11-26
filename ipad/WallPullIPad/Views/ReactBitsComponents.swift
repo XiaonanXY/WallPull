@@ -1,38 +1,145 @@
 import SwiftUI
 import UIKit
 
-// MARK: - 1. BorderGlow 多选默认环境流光边框 (1:1 port of BorderGlow.css: snake)
-struct BorderGlowOverlay: View {
+// MARK: - 1. BorderGlow 多选默认环境流光边框 (CoreAnimation Render-Server Layer — 0% main-thread overhead)
+final class HardwareGlowBorderView: UIView {
+    private let baseRingLayer = CAShapeLayer()
+    private let ringContainerLayer = CALayer()
+    private let snakeGradientLayer = CAGradientLayer()
+    private let snakeMaskLayer = CAShapeLayer()
+    private var cornerRadius: CGFloat = 16
+    private var borderLineWidth: CGFloat = 3.2
+    private var currentAccentColor: UIColor = .systemPurple
+    private var lastBoundsSize: CGSize = .zero
+
+    override var intrinsicContentSize: CGSize {
+        CGSize(width: UIView.noIntrinsicMetric, height: UIView.noIntrinsicMetric)
+    }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = false
+        backgroundColor = .clear
+        clipsToBounds = true
+
+        baseRingLayer.fillColor = nil
+        layer.addSublayer(baseRingLayer)
+
+        ringContainerLayer.masksToBounds = false
+        layer.addSublayer(ringContainerLayer)
+
+        snakeGradientLayer.type = .conic
+        snakeGradientLayer.startPoint = CGPoint(x: 0.5, y: 0.5)
+        snakeGradientLayer.endPoint = CGPoint(x: 0.5, y: 0.0)
+        snakeGradientLayer.colors = [
+            UIColor.clear.cgColor,
+            UIColor.clear.cgColor,
+            UIColor(red: 0.145, green: 0.388, blue: 0.922, alpha: 0.95).cgColor,
+            UIColor(red: 0.0, green: 0.749, blue: 0.910, alpha: 0.98).cgColor,
+            UIColor(red: 0.0, green: 0.851, blue: 0.494, alpha: 0.98).cgColor,
+            UIColor(red: 1.0, green: 0.835, blue: 0.0, alpha: 0.98).cgColor,
+            UIColor(red: 1.0, green: 0.090, blue: 0.267, alpha: 0.95).cgColor,
+            UIColor.clear.cgColor,
+        ]
+        snakeGradientLayer.locations = [0.0, 0.62, 0.70, 0.77, 0.84, 0.90, 0.96, 1.0]
+        ringContainerLayer.addSublayer(snakeGradientLayer)
+
+        snakeMaskLayer.fillColor = nil
+        snakeMaskLayer.strokeColor = UIColor.white.cgColor
+        ringContainerLayer.mask = snakeMaskLayer
+
+        startSpinIfNeeded()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func update(accentColor: UIColor, cornerRadius: CGFloat, lineWidth: CGFloat) {
+        let changedGeom = abs(self.cornerRadius - cornerRadius) > 0.01 || abs(self.borderLineWidth - lineWidth) > 0.01
+        self.cornerRadius = cornerRadius
+        self.borderLineWidth = lineWidth
+        self.currentAccentColor = accentColor
+        let reduceMotion = UIAccessibility.isReduceMotionEnabled
+        baseRingLayer.strokeColor = accentColor.withAlphaComponent(reduceMotion ? 1.0 : 0.42).cgColor
+        baseRingLayer.lineWidth = reduceMotion ? lineWidth : max(1.6, lineWidth * 0.6)
+        snakeMaskLayer.lineWidth = lineWidth
+        if changedGeom {
+            lastBoundsSize = .zero
+            setNeedsLayout()
+        }
+        startSpinIfNeeded()
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil {
+            startSpinIfNeeded()
+        }
+    }
+
+    private func startSpinIfNeeded() {
+        if UIAccessibility.isReduceMotionEnabled {
+            ringContainerLayer.isHidden = true
+            snakeGradientLayer.removeAnimation(forKey: "wp_glow_spin")
+            baseRingLayer.strokeColor = currentAccentColor.cgColor
+            baseRingLayer.lineWidth = borderLineWidth
+            return
+        }
+        ringContainerLayer.isHidden = false
+        baseRingLayer.strokeColor = currentAccentColor.withAlphaComponent(0.42).cgColor
+        baseRingLayer.lineWidth = max(1.6, borderLineWidth * 0.6)
+        if snakeGradientLayer.animation(forKey: "wp_glow_spin") == nil {
+            let anim = CABasicAnimation(keyPath: "transform.rotation.z")
+            anim.fromValue = 0.0
+            anim.toValue = Double.pi * 2.0
+            anim.duration = 2.8
+            anim.repeatCount = .infinity
+            anim.isRemovedOnCompletion = false
+            snakeGradientLayer.add(anim, forKey: "wp_glow_spin")
+        }
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard bounds.width > 1, bounds.height > 1 else { return }
+        if bounds.size == lastBoundsSize { return }
+        lastBoundsSize = bounds.size
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let inset = borderLineWidth * 0.5
+        let path = UIBezierPath(
+            roundedRect: bounds.insetBy(dx: inset, dy: inset),
+            cornerRadius: max(0, cornerRadius - inset)
+        ).cgPath
+        baseRingLayer.frame = bounds
+        baseRingLayer.path = path
+
+        ringContainerLayer.frame = bounds
+        snakeMaskLayer.frame = bounds
+        snakeMaskLayer.path = path
+
+        let diag = ceil(hypot(bounds.width, bounds.height)) + 16
+        snakeGradientLayer.bounds = CGRect(x: 0, y: 0, width: diag, height: diag)
+        snakeGradientLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        CATransaction.commit()
+    }
+}
+
+struct BorderGlowOverlay: UIViewRepresentable {
     let accentColor: Color
     var cornerRadius: CGFloat = 16
     var lineWidth: CGFloat = 3.2
 
-    var body: some View {
-        TimelineView(.animation) { timeline in
-            let t = timeline.date.timeIntervalSinceReferenceDate
-            let period = 2.8
-            let deg = (t.truncatingRemainder(dividingBy: period) / period) * 360.0
+    func makeUIView(context: Context) -> HardwareGlowBorderView {
+        let v = HardwareGlowBorderView()
+        v.update(accentColor: UIColor(accentColor), cornerRadius: cornerRadius, lineWidth: lineWidth)
+        return v
+    }
 
-            let gradient = AngularGradient(
-                stops: [
-                    .init(color: .clear, location: 0.0),
-                    .init(color: .clear, location: 0.65),
-                    .init(color: Color(hex: "#2563EB"), location: 0.72),
-                    .init(color: Color(hex: "#00BFE8"), location: 0.78),
-                    .init(color: Color(hex: "#00D97E"), location: 0.84),
-                    .init(color: Color(hex: "#FFD500"), location: 0.90),
-                    .init(color: Color(hex: "#FF1744"), location: 0.96),
-                    .init(color: .clear, location: 1.0),
-                ],
-                center: .center,
-                angle: .degrees(deg)
-            )
-
-            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                .strokeBorder(gradient, lineWidth: lineWidth)
-                .shadow(color: accentColor.opacity(0.28), radius: 7)
-        }
-        .allowsHitTesting(false)
+    func updateUIView(_ uiView: HardwareGlowBorderView, context: Context) {
+        uiView.update(accentColor: UIColor(accentColor), cornerRadius: cornerRadius, lineWidth: lineWidth)
     }
 }
 
@@ -153,6 +260,8 @@ struct ShinyTextTitle: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var sweepProgress: CGFloat = -0.5
 
+    @State private var didSweep: Bool = false
+
     var body: some View {
         let baseColor = colorScheme == .dark ? Color.white : Color(hex: "#18181B")
         let shineColor = colorScheme == .dark ? Color(hex: "#E0E7FF") : Color(hex: "#7C3AED")
@@ -161,27 +270,35 @@ struct ShinyTextTitle: View {
             .font(font)
             .foregroundColor(baseColor)
             .overlay(
-                GeometryReader { geo in
-                    let w = max(1, geo.size.width)
-                    LinearGradient(
-                        stops: [
-                            .init(color: .clear, location: 0.0),
-                            .init(color: shineColor.opacity(0.75), location: 0.5),
-                            .init(color: .clear, location: 1.0),
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                    .frame(width: w * 0.55)
-                    .offset(x: sweepProgress * w * 1.6)
+                Group {
+                    if !didSweep {
+                        GeometryReader { geo in
+                            let w = max(1, geo.size.width)
+                            LinearGradient(
+                                stops: [
+                                    .init(color: .clear, location: 0.0),
+                                    .init(color: shineColor.opacity(0.75), location: 0.5),
+                                    .init(color: .clear, location: 1.0),
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                            .frame(width: w * 0.55)
+                            .offset(x: sweepProgress * w * 1.6)
+                        }
+                        .mask(Text(text).font(font))
+                        .allowsHitTesting(false)
+                    }
                 }
-                .mask(Text(text).font(font))
-                .allowsHitTesting(false)
             )
             .onAppear {
+                guard !didSweep else { return }
                 sweepProgress = -0.6
-                withAnimation(.easeInOut(duration: 2.6).repeatForever(autoreverses: false).delay(1.2)) {
+                withAnimation(.easeInOut(duration: 2.0).delay(0.4)) {
                     sweepProgress = 1.2
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                    didSweep = true
                 }
             }
     }
@@ -379,16 +496,98 @@ struct CardAnchorView: UIViewRepresentable {
     let id: String
     let tracker: CardFrameTracker
 
+    final class Coordinator {
+        var lastID: String = ""
+        weak var lastView: UIView?
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
     func makeUIView(context: Context) -> UIView {
         let v = UIView()
         v.backgroundColor = .clear
         v.isUserInteractionEnabled = false
+        context.coordinator.lastID = id
+        context.coordinator.lastView = v
         tracker.register(id: id, view: v)
         return v
     }
 
     func updateUIView(_ uiView: UIView, context: Context) {
-        tracker.register(id: id, view: uiView)
+        if context.coordinator.lastID != id || context.coordinator.lastView !== uiView {
+            context.coordinator.lastID = id
+            context.coordinator.lastView = uiView
+            tracker.register(id: id, view: uiView)
+        }
+    }
+}
+
+private struct FlipModalStage<DetailContent: View>: View, Animatable {
+    var phase: CGFloat
+    let originRect: CGRect?
+    let coverImage: UIImage?
+    let showFullUI: Bool
+    let detailContent: () -> DetailContent
+
+    var animatableData: CGFloat {
+        get { phase }
+        set { phase = newValue }
+    }
+
+    var body: some View {
+        let p = max(0.0, min(1.0, phase))
+        GeometryReader { geo in
+            let targetRect = CGRect(origin: .zero, size: geo.size)
+            let startRect = (originRect != nil && originRect!.width > 10 && originRect!.height > 10)
+                ? originRect!
+                : CGRect(x: geo.size.width / 2 - 140, y: geo.size.height / 2 - 90, width: 280, height: 180)
+
+            let curW = startRect.width + (targetRect.width - startRect.width) * p
+            let curH = startRect.height + (targetRect.height - startRect.height) * p
+            let curMidX = startRect.midX + (targetRect.midX - startRect.midX) * p
+            let curMidY = startRect.midY + (targetRect.midY - startRect.midY) * p
+            let curRadius = 16.0 * (1.0 - p)
+            let isFrontHalf = p >= 0.5
+            let angleDeg = isFrontHalf ? Double(p - 1.0) * 180.0 : Double(p) * 180.0
+
+            ZStack {
+                if !isFrontHalf {
+                    Group {
+                        if let coverImage {
+                            Image(uiImage: coverImage)
+                                .resizable()
+                                .aspectRatio(contentMode: .fill)
+                        } else {
+                            Color(hex: "#14141B")
+                        }
+                    }
+                    .frame(width: curW, height: curH)
+                    .clipShape(RoundedRectangle(cornerRadius: curRadius, style: .continuous))
+                } else {
+                    detailContent()
+                        .frame(width: targetRect.width, height: targetRect.height)
+                        .opacity(showFullUI ? 1.0 : Double((p - 0.5) / 0.5))
+                        .allowsHitTesting(showFullUI)
+                }
+            }
+            .frame(
+                width: isFrontHalf && showFullUI ? targetRect.width : curW,
+                height: isFrontHalf && showFullUI ? targetRect.height : curH
+            )
+            .clipShape(RoundedRectangle(cornerRadius: showFullUI ? 0 : curRadius, style: .continuous))
+            .rotation3DEffect(
+                .degrees(angleDeg),
+                axis: (x: 0, y: 1, z: 0),
+                perspective: 0.42
+            )
+            .position(
+                x: showFullUI ? targetRect.midX : curMidX,
+                y: showFullUI ? targetRect.midY : curMidY
+            )
+        }
+        .ignoresSafeArea(.all)
     }
 }
 
@@ -401,83 +600,52 @@ struct DetailFlipModalContainer<DetailContent: View>: View {
 
     @State private var phase: CGFloat = 0.0 // 0 = at card origin, 1 = expanded full screen
     @State private var showFullUI: Bool = false
+    @State private var animTask: Task<Void, Never>? = nil
 
     var body: some View {
         ZStack {
             Color.black.opacity(0.96 * phase)
                 .ignoresSafeArea(.all)
 
-            GeometryReader { geo in
-                let targetRect = CGRect(origin: .zero, size: geo.size)
-                let startRect = (originRect != nil && originRect!.width > 10 && originRect!.height > 10)
-                    ? originRect!
-                    : CGRect(x: geo.size.width / 2 - 140, y: geo.size.height / 2 - 90, width: 280, height: 180)
-
-                let curW = startRect.width + (targetRect.width - startRect.width) * phase
-                let curH = startRect.height + (targetRect.height - startRect.height) * phase
-                let curMidX = startRect.midX + (targetRect.midX - startRect.midX) * phase
-                let curMidY = startRect.midY + (targetRect.midY - startRect.midY) * phase
-                let curRadius = 16.0 * (1.0 - phase)
-
-                let flipY = (1.0 - phase) * 180.0
-                let isShowingFrontHalf = phase >= 0.45
-
-                ZStack {
-                    if !isShowingFrontHalf {
-                        Group {
-                            if let coverImage {
-                                Image(uiImage: coverImage)
-                                    .resizable()
-                                    .aspectRatio(contentMode: .fill)
-                            } else {
-                                Color(hex: "#14141B")
-                            }
-                        }
-                        .frame(width: curW, height: curH)
-                        .clipShape(RoundedRectangle(cornerRadius: curRadius, style: .continuous))
-                    }
-
-                    detailContent()
-                        .frame(width: targetRect.width, height: targetRect.height)
-                        .opacity(isShowingFrontHalf ? (showFullUI ? 1.0 : Double((phase - 0.45) / 0.55)) : 0.0)
-                        .allowsHitTesting(showFullUI)
-                }
-                .frame(width: isShowingFrontHalf && showFullUI ? targetRect.width : curW,
-                       height: isShowingFrontHalf && showFullUI ? targetRect.height : curH)
-                .clipShape(RoundedRectangle(cornerRadius: showFullUI ? 0 : curRadius, style: .continuous))
-                .rotation3DEffect(
-                    .degrees(isShowingFrontHalf ? (1.0 - phase) * -140.0 : flipY),
-                    axis: (x: 0, y: 1, z: 0),
-                    perspective: 0.42
-                )
-                .position(
-                    x: showFullUI ? targetRect.midX : curMidX,
-                    y: showFullUI ? targetRect.midY : curMidY
-                )
-            }
-            .ignoresSafeArea(.all)
+            FlipModalStage(
+                phase: phase,
+                originRect: originRect,
+                coverImage: coverImage,
+                showFullUI: showFullUI,
+                detailContent: detailContent
+            )
         }
         .ignoresSafeArea(.all)
         .statusBar(hidden: phase > 0.45)
         .onAppear {
+            animTask?.cancel()
             phase = 0
             showFullUI = false
             withAnimation(.timingCurve(0.32, 0.08, 0.24, 1.0, duration: 0.56)) {
                 phase = 1.0
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.52) {
+            animTask = Task {
+                try? await Task.sleep(nanoseconds: 520_000_000)
+                guard !Task.isCancelled, !isClosing else { return }
                 showFullUI = true
             }
         }
         .onChange(of: isClosing) { closing in
             guard closing else { return }
+            animTask?.cancel()
             showFullUI = false
             withAnimation(.timingCurve(0.28, 0.0, 0.2, 1.0, duration: 0.40)) {
                 phase = 0.0
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.41) {
+            animTask = Task {
+                try? await Task.sleep(nanoseconds: 410_000_000)
+                guard !Task.isCancelled else { return }
                 onDismissAnimationComplete()
             }
+        }
+        .onDisappear {
+            animTask?.cancel()
+            animTask = nil
         }
     }
 }

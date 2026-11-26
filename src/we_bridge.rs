@@ -35,6 +35,17 @@ fn is_native_static_wallpaper_image(path: &Path) -> bool {
     matches!(ext.as_deref(), Some("png" | "jpg" | "jpeg" | "bmp"))
 }
 
+fn is_we_live_image_file(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    matches!(
+        ext.as_deref(),
+        Some("png" | "jpg" | "jpeg" | "bmp" | "webp" | "gif")
+    )
+}
+
 pub fn is_wallpaper_engine_running() -> bool {
     !find_we_process_ids().is_empty()
 }
@@ -43,10 +54,35 @@ pub fn try_find_install_directory(hint_workshop_dir: Option<&str>) -> Option<Pat
     if let Some(exe) = try_find_running_executable(hint_workshop_dir) {
         return exe.parent().map(Path::to_path_buf);
     }
+    if let Some(hint) = hint_workshop_dir.filter(|s| !s.trim().is_empty()) {
+        if let Some(dir) = resolve_we_dir_from_workshop_hint(hint) {
+            return Some(dir);
+        }
+    }
     for dir in enumerate_fallback_install_dirs(hint_workshop_dir) {
         if dir.join("wallpaper64.exe").is_file() || dir.join("wallpaper32.exe").is_file() {
             return Some(dir);
         }
+    }
+    None
+}
+
+fn resolve_we_dir_from_workshop_hint(hint: &str) -> Option<PathBuf> {
+    let mut cur = std::path::absolute(Path::new(hint)).ok();
+    while let Some(dir) = cur {
+        if dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.eq_ignore_ascii_case("steamapps"))
+            .unwrap_or(false)
+        {
+            let cand = dir.join("common").join("wallpaper_engine");
+            if cand.join("wallpaper64.exe").is_file() || cand.join("wallpaper32.exe").is_file() {
+                return Some(cand);
+            }
+            break;
+        }
+        cur = dir.parent().map(Path::to_path_buf);
     }
     None
 }
@@ -224,18 +260,22 @@ pub fn apply_wallpaper_item(
         find_or_launch_wallpaper_engine(Some(&wallpaper.workshop_directory), needs_we_for_dynamic)
     {
         if wallpaper.item_type == "image" {
-            let img_path = PathBuf::from(resolve_wallpaper_asset_path(wallpaper, asset_index));
-            if img_path.is_file() {
-                try_apply_windows_static_wallpaper(&img_path);
-            }
-            if asset_index.unwrap_or(0) == 0 && !wallpaper.workshop_directory.trim().is_empty() {
+            let is_dynamic_scene = asset_index.unwrap_or(0) == 0
+                && !wallpaper.workshop_directory.trim().is_empty()
+                && wallpaper.original_type != "image";
+            if is_dynamic_scene {
                 let project_json = Path::new(&wallpaper.workshop_directory).join("project.json");
                 if project_json.is_file() {
                     run_open_wallpaper(&we_exe, &project_json);
                     return Ok(true);
                 }
             }
-            if img_path.is_file() && is_native_static_wallpaper_image(&img_path) {
+
+            let img_path = PathBuf::from(resolve_wallpaper_asset_path(wallpaper, asset_index));
+            if img_path.is_file() {
+                try_apply_windows_static_wallpaper(&img_path);
+            }
+            if img_path.is_file() && is_we_live_image_file(&img_path) {
                 let wrapper_json = materialize_live_desktop_project(&img_path, &wallpaper.title)?;
                 run_open_wallpaper(&we_exe, &wrapper_json);
                 return Ok(true);
@@ -307,10 +347,25 @@ pub fn resolve_wallpaper_asset_path(item: &WallpaperItem, asset_index: Option<us
 }
 
 pub fn apply_desktop_wallpaper_path(target_path: &Path) -> Result<(), String> {
-    if !is_native_static_wallpaper_image(target_path) {
-        return Err("Windows 原生静态桌面壁纸仅支持 PNG / JPG / BMP 图片格式。".to_string());
-    }
-    let (w, h) = crate::media::read_image_dimensions(target_path);
+    let apply_path = if is_native_static_wallpaper_image(target_path) {
+        target_path.to_path_buf()
+    } else if target_path.is_file() {
+        let dir = local_app_data_root().join("AppliedDesktop");
+        let _ = fs::create_dir_all(&dir);
+        let conv = dir.join("static-converted.png");
+        let img = image::ImageReader::open(target_path)
+            .map_err(|e| format!("无法读取图片设为桌面：{e}"))?
+            .with_guessed_format()
+            .map_err(|e| format!("无法识别图片格式：{e}"))?
+            .decode()
+            .map_err(|e| format!("无法解码图片为静态桌面：{e}"))?;
+        img.save(&conv)
+            .map_err(|e| format!("转换桌面图片为 PNG 失败：{e}"))?;
+        conv
+    } else {
+        return Err("Windows 原生静态桌面壁纸仅支持常见图片格式。".to_string());
+    };
+    let (w, h) = crate::media::read_image_dimensions(&apply_path);
     if let Ok(desktop_key) =
         RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(r"Control Panel\Desktop", KEY_SET_VALUE)
     {
@@ -319,7 +374,7 @@ pub fn apply_desktop_wallpaper_path(target_path: &Path) -> Result<(), String> {
         let style = if w > 0 && h > w { "6" } else { "10" };
         let _ = desktop_key.set_value("WallpaperStyle", &style);
     }
-    let full = std::path::absolute(target_path).unwrap_or_else(|_| target_path.to_path_buf());
+    let full = std::path::absolute(&apply_path).unwrap_or(apply_path);
     let wide: Vec<u16> = full.as_os_str().encode_wide().chain(Some(0)).collect();
     let ok = unsafe {
         SystemParametersInfoW(
@@ -333,7 +388,7 @@ pub fn apply_desktop_wallpaper_path(target_path: &Path) -> Result<(), String> {
 }
 
 fn try_apply_windows_static_wallpaper(path: &Path) {
-    if !is_native_static_wallpaper_image(path) || !path.is_file() {
+    if !path.is_file() {
         return;
     }
     let _ = apply_desktop_wallpaper_path(path);
@@ -676,6 +731,5 @@ fn enumerate_fallback_install_dirs(hint_workshop_dir: Option<&str>) -> Vec<PathB
         }
     }
 
-    let _ = PCWSTR::null();
     out
 }

@@ -1,8 +1,9 @@
-import { useEffect, useId } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { AnimatePresence, motion } from 'motion/react'
-import { ArrowSquareOut, Trash, WarningCircle, X } from '@phosphor-icons/react'
+import { ArrowSquareOut, FilmStrip, Trash, WarningCircle, X } from '@phosphor-icons/react'
 import { formatBytes } from '../appConfig.js'
+import HoldToConfirmButton from './ui/HoldToConfirmButton.jsx'
 
 export default function DeleteConfirmDialog({
   items = [],
@@ -13,27 +14,44 @@ export default function DeleteConfirmDialog({
 }) {
   const open = Array.isArray(items) && items.length > 0
   const titleId = useId()
+  const cancelBtnRef = useRef(null)
+  const [alsoDeleteVault, setAlsoDeleteVault] = useState(false)
+  const hasArchivedTargets = open && items.some(item => item.isArchivedOffline)
 
   useEffect(() => {
     if (!open) return undefined
+    setAlsoDeleteVault(false)
+    const frame = globalThis.requestAnimationFrame(() => {
+      cancelBtnRef.current?.focus({ preventScroll: true })
+    })
     const onKeyDown = event => {
       if (event.key === 'Escape') {
         event.preventDefault()
         onCancel?.()
-      } else if (event.key === 'Enter' && isNative) {
-        event.preventDefault()
-        onConfirm?.()
       }
     }
     globalThis.addEventListener('keydown', onKeyDown)
-    return () => globalThis.removeEventListener('keydown', onKeyDown)
-  }, [isNative, onCancel, onConfirm, open])
+    return () => {
+      globalThis.cancelAnimationFrame(frame)
+      globalThis.removeEventListener('keydown', onKeyDown)
+    }
+  }, [onCancel, open])
 
   const single = open && items.length === 1 ? items[0] : null
   const totalBytes = open
-    ? items.reduce((sum, item) => sum + (item.folderSize || item.fileSize || 0), 0)
+    ? (() => {
+        const seen = new Map()
+        for (const item of items) {
+          const key = item.workshopId || item.id
+          const size = item.folderSize || item.fileSize || 0
+          seen.set(key, Math.max(seen.get(key) ?? 0, size))
+        }
+        let sum = 0
+        for (const val of seen.values()) sum += val
+        return sum
+      })()
     : 0
-  const thumb = single ? (single.previewUrl || single.mediaUrl) : ''
+  const thumb = single ? (single.previewUrl || (single.type !== 'video' ? single.mediaUrl : '')) : ''
 
   return createPortal(
     <AnimatePresence>
@@ -67,9 +85,6 @@ export default function DeleteConfirmDialog({
                   <h2 id={titleId} className="text-base font-semibold tracking-tight">
                     {single ? '删除此壁纸？' : `删除已选 ${items.length} 项壁纸？`}
                   </h2>
-                  <p className="mt-0.5 text-xs text-base-content/60">
-                    将创意工坊本地文件夹移入 Windows 回收站（可随时还原）
-                  </p>
                 </div>
               </div>
               <button
@@ -90,6 +105,10 @@ export default function DeleteConfirmDialog({
                     alt=""
                     className="h-14 w-14 shrink-0 rounded-xl object-cover"
                   />
+                ) : single.type === 'video' ? (
+                  <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-xl bg-base-300/60 text-base-content/55">
+                    <FilmStrip size={22} weight="duotone" />
+                  </div>
                 ) : null}
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-sm font-medium">
@@ -121,8 +140,20 @@ export default function DeleteConfirmDialog({
               </span>
             </div>
 
+            {hasArchivedTargets ? (
+              <label className="mt-3 flex cursor-pointer items-center gap-2 rounded-xl border border-base-300/75 bg-base-200/45 px-3 py-2 text-xs font-medium text-base-content/85">
+                <input
+                  type="checkbox"
+                  className="checkbox checkbox-xs checkbox-error"
+                  checked={alsoDeleteVault}
+                  onChange={event => setAlsoDeleteVault(event.target.checked)}
+                />
+                <span>同时移除「离线永久保险箱」备份</span>
+              </label>
+            ) : null}
+
             <div className="mt-5 flex flex-wrap items-center justify-between gap-2">
-              {single && single.workshopId ? (
+              {single && single.workshopId && !(String(single.workshopId || '').startsWith('99') && String(single.workshopId || '').length >= 15) ? (
                 <button
                   type="button"
                   className="btn btn-ghost btn-sm gap-1 text-xs"
@@ -135,21 +166,21 @@ export default function DeleteConfirmDialog({
               ) : <span />}
               <div className="flex items-center gap-2">
                 <button
+                  ref={cancelBtnRef}
                   type="button"
                   className="btn btn-ghost btn-sm"
                   onClick={onCancel}
                 >
                   取消
                 </button>
-                <button
-                  type="button"
-                  className="btn btn-error btn-sm gap-1.5 text-white"
+                <HoldToConfirmButton
+                  tone="danger"
+                  duration={800}
+                  label="按住移入回收站"
+                  confirmedLabel="已移入回收站"
                   disabled={!isNative}
-                  onClick={onConfirm}
-                >
-                  <Trash size={14} weight="bold" />
-                  移入回收站
-                </button>
+                  onConfirm={() => onConfirm?.(alsoDeleteVault)}
+                />
               </div>
             </div>
           </motion.div>

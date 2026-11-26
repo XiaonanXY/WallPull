@@ -26,8 +26,11 @@ struct WallPullIPadApp: App {
                     localSend.start()
                 }
                 .onChange(of: scenePhase) { phase in
+                    GalleryVideoPreviewCoordinator.shared.setGloballyPaused(phase != .active)
                     if phase == .active {
                         localSend.handleAppDidBecomeActive()
+                    } else {
+                        vault.flushCatalogSaveNow()
                     }
                 }
         }

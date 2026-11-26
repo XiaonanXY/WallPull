@@ -7,7 +7,6 @@ use crate::scene_studio::{PkgSlice, try_composite_2d_scene, try_read_pkg_header}
 use crate::settings::cache_root;
 use crate::tex::{is_sprite_sheet_tex, try_decode_to_png};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -772,9 +771,6 @@ fn is_audio_ext(path: &Path) -> bool {
         Some("mp3" | "ogg" | "wav" | "flac" | "m4a")
     )
 }
-
-#[allow(dead_code)]
-fn _keep(_: HashMap<String, PkgSlice>) {}
 
 #[cfg(test)]
 mod tests {

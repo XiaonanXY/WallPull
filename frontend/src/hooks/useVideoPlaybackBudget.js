@@ -34,7 +34,10 @@ export default function useVideoPlaybackBudget(surfaceRef, priority = 0, identit
 
   useEffect(() => {
     const element = surfaceRef.current
-    if (!element) return undefined
+    if (!element || !identity) {
+      setAllowed(false)
+      return undefined
+    }
     const entry = {
       order: sequence++,
       priority,

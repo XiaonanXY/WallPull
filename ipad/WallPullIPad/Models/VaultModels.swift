@@ -114,8 +114,16 @@ struct DuplicateCandidateItem: Identifiable, Hashable {
     var id: String { item.id }
     let item: VaultItem
     let isRecommendedKeep: Bool
+    let isExactMatch: Bool
     let similarityPercent: Int
     let reason: String
+}
+
+struct TrustedLanPeerRecord: Codable, Hashable {
+    let fingerprint: String
+    var alias: String
+    var incomingToken: String
+    var outgoingToken: String
 }
 
 struct DuplicateGroup: Identifiable, Hashable {
@@ -177,6 +185,7 @@ struct VaultItem: Identifiable, Codable, Hashable {
     var additionalFiles: [String]?
     var hasSceneLayers: Bool?
     var hasOfflineStudioBundle: Bool?
+    var hasEmbeddedAudio: Bool? = nil
     var visualFingerprint: CachedVisualFingerprint?
 
     var resolutionText: String? {
@@ -212,7 +221,9 @@ struct VaultItem: Identifiable, Codable, Hashable {
     }
 
     var hasMusic: Bool {
-        !(audioTracks ?? []).isEmpty
+        if !(audioTracks ?? []).isEmpty { return true }
+        if mediaType == .video { return hasEmbeddedAudio == true }
+        return false
     }
 
     var supportsLayerStudio: Bool {
@@ -272,6 +283,7 @@ struct CatalogAudioTrackDTO: Codable, Hashable, Identifiable {
     let fileName: String
     let mimeType: String
     let size: Int64
+    let isEmbedded: Bool?
 
     var id: Int { index }
 }
@@ -292,16 +304,18 @@ struct PCCatalogItem: Identifiable, Codable, Hashable {
     let hasSceneLayers: Bool?
     let assetCount: Int?
     let audioTracks: [CatalogAudioTrackDTO]?
+    let isFavorite: Bool?
 
     enum CodingKeys: String, CodingKey {
         case id, workshopId, title, resolution, duration, fileSize, colorBucket, fileName, mimeType
-        case contentRating, hasPreviewVideo, hasSceneLayers, assetCount, audioTracks
+        case contentRating, hasPreviewVideo, hasSceneLayers, assetCount, audioTracks, isFavorite
         case mediaType = "type"
     }
 
     var isVideo: Bool { mediaType == "video" }
     var hasMusic: Bool { !(audioTracks ?? []).isEmpty }
     var supportsStudio: Bool { hasSceneLayers == true }
+    var isPCFavorite: Bool { isFavorite == true }
 }
 
 struct StudioLayerDTO: Codable, Hashable, Identifiable {
@@ -353,6 +367,10 @@ struct TransferProgressState: Equatable {
     var currentFileIndex: Int
     var totalFiles: Int
     var fraction: Double
+    var bytesTransferred: Int64 = 0
+    var totalBytes: Int64 = 0
+    var bytesPerSecond: Double = 0
+    var stageHint: String? = nil
 }
 
 struct ToastBannerState: Equatable {
@@ -362,7 +380,7 @@ struct ToastBannerState: Equatable {
 }
 
 enum AppInfoConstants {
-    static let version = "1.0.2"
+    static let version = "1.0.3"
     static let author = "Xiaonan"
     static let license = "GNU GPL-3.0"
     static let repoURL = URL(string: "https://github.com/XiaonanXY/WallPull")!
@@ -410,7 +428,7 @@ func normalizeHexColor(_ raw: String) -> String? {
 }
 
 func formatFileSize(_ bytes: Int64) -> String {
-    guard bytes > 0 else { return "未知" }
+    guard bytes > 0 else { return "0 MB" }
     let f = ByteCountFormatter()
     f.allowedUnits = [.useKB, .useMB, .useGB]
     f.countStyle = .file

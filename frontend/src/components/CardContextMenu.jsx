@@ -78,6 +78,11 @@ export default function CardContextMenu({
       ? `删除已选 (${selectedCount} 项)`
       : '删除壁纸'
 
+  const batchSendTabletLabel =
+    isSelected && selectedCount > 1
+      ? `发送到 iPad (${selectedCount} 项)`
+      : '发送到 iPad'
+
   return createPortal(
     <AnimatePresence>
       {state ? (
@@ -174,7 +179,7 @@ export default function CardContextMenu({
             }}
           >
             <PaperPlaneTilt size={15} weight="bold" className="shrink-0" />
-            <span>发送到 iPad</span>
+            <span>{batchSendTabletLabel}</span>
           </button>
           {state?.item?.type === 'image' ? (
             <button
@@ -220,19 +225,21 @@ export default function CardContextMenu({
             <FolderOpen size={15} className="shrink-0" />
             <span>打开原文件位置</span>
           </button>
-          <button
-            type="button"
-            role="menuitem"
-            disabled={!isNative}
-            className="flex h-8 w-full items-center gap-2.5 rounded-xl px-3 text-left font-medium whitespace-nowrap hover:bg-base-content/7 disabled:opacity-45"
-            onClick={() => {
-              onOpenWorkshop?.(state.item)
-              onClose?.()
-            }}
-          >
-            <Compass size={15} className="shrink-0" />
-            <span>Steam 创意工坊</span>
-          </button>
+          {!(String(state.item.workshopId || '').startsWith('99') && String(state.item.workshopId || '').length >= 15) && state.item.workshopId ? (
+            <button
+              type="button"
+              role="menuitem"
+              disabled={!isNative}
+              className="flex h-8 w-full items-center gap-2.5 rounded-xl px-3 text-left font-medium whitespace-nowrap hover:bg-base-content/7 disabled:opacity-45"
+              onClick={() => {
+                onOpenWorkshop?.(state.item)
+                onClose?.()
+              }}
+            >
+              <Compass size={15} className="shrink-0" />
+              <span>Steam 创意工坊</span>
+            </button>
+          ) : null}
           <div className="my-0.5 h-px bg-base-300/70" />
           <button
             type="button"

@@ -140,7 +140,7 @@
 }
 
 .lattice-loader__timer {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-sans);
   font-size: calc(var(--ll-font) * 0.875);
   font-variant-numeric: tabular-nums;
   opacity: 0.6;

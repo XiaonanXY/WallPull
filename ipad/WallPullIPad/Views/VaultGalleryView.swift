@@ -26,6 +26,17 @@ struct VaultGalleryView: View {
     @State private var pendingSendItems: [VaultItem]? = nil
     @State private var showPeerActionSheet: Bool = false
     @State private var pinchBaselineColumns: Int? = nil
+    @State private var showBatchDeleteConfirm: Bool = false
+    @State private var pendingSingleDeleteItem: VaultItem? = nil
+    @State private var catalogFrameTracker = CardFrameTracker()
+    @State private var catalogPreviewSession: PCCatalogPreviewSession? = nil
+    @State private var catalogPreviewOriginRect: CGRect? = nil
+    @State private var catalogPreviewCover: UIImage? = nil
+    @State private var isClosingCatalogPreview: Bool = false
+
+    private var effectiveScheme: ColorScheme {
+        vault.appearanceMode.colorScheme ?? colorScheme
+    }
 
     private var squareMinTileWidth: CGFloat {
         switch vault.columnsCount {
@@ -39,9 +50,9 @@ struct VaultGalleryView: View {
 
     private var gridColumns: [GridItem] {
         if vault.cardAspectMode == .square {
-            return [GridItem(.adaptive(minimum: squareMinTileWidth, maximum: squareMinTileWidth + 60), spacing: 16, alignment: .top)]
+            return [GridItem(.adaptive(minimum: squareMinTileWidth, maximum: squareMinTileWidth + 60), spacing: 18, alignment: .top)]
         }
-        return Array(repeating: GridItem(.flexible(), spacing: 22, alignment: .top), count: vault.columnsCount)
+        return Array(repeating: GridItem(.flexible(), spacing: 18, alignment: .top), count: vault.columnsCount)
     }
 
     private var filtered: [VaultItem] {
@@ -49,7 +60,13 @@ struct VaultGalleryView: View {
     }
 
     private var isFullscreenModalOpen: Bool {
-        selectedItemForDetail != nil || studioItem != nil
+        selectedItemForDetail != nil || studioItem != nil || catalogPreviewSession != nil
+    }
+
+    private var feedbackBottomPadding: CGFloat {
+        let hasBatch = isSelecting && !selectedIDs.isEmpty
+        if hasBatch && !showLocalSendSheet && !showSettingsSheet { return 86 }
+        return 20
     }
 
     private var selectedTotalBytes: Int64 {
@@ -84,13 +101,9 @@ struct VaultGalleryView: View {
                     galleryGrid
                 }
             }
+            .ignoresSafeArea(.keyboard, edges: .bottom)
 
             VStack(spacing: 10) {
-                if musicPlayer.activeTrack != nil && !(isSelecting && !selectedIDs.isEmpty) {
-                    FloatingMusicCapsule(musicPlayer: musicPlayer, vault: vault)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                }
-
                 if isSelecting && !selectedIDs.isEmpty {
                     batchActionDock
                         .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -99,23 +112,41 @@ struct VaultGalleryView: View {
             .padding(.bottom, 18)
 
             if showLocalSendSheet {
-                WallPullCenteredModal(maxWidth: 960, maxHeight: 720, onDismiss: {
+                WallPullCenteredModal(maxWidth: 960, maxHeight: 748, onDismiss: {
                     withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
                         showLocalSendSheet = false
                     }
                 }) {
-                    LocalSendSheetView(vault: vault, localSend: localSend, onClose: {
-                        withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-                            showLocalSendSheet = false
+                    LocalSendSheetView(
+                        vault: vault,
+                        localSend: localSend,
+                        catalogFrameTracker: catalogFrameTracker,
+                        onOpenCatalogPreview: { item, list, peer, rect, cover in
+                            if item.isVideo && musicPlayer.isPlaying {
+                                musicPlayer.pausePlayback()
+                            }
+                            catalogPreviewOriginRect = rect
+                            catalogPreviewCover = cover
+                            isClosingCatalogPreview = false
+                            catalogPreviewSession = PCCatalogPreviewSession(
+                                id: item.id,
+                                catalogList: list,
+                                peer: peer
+                            )
+                        },
+                        onClose: {
+                            withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                                showLocalSendSheet = false
+                            }
                         }
-                    })
+                    )
                 }
                 .transition(.opacity.combined(with: .scale(scale: 0.96)))
                 .zIndex(40)
             }
 
             if showSettingsSheet {
-                WallPullCenteredModal(maxWidth: 740, maxHeight: 720, onDismiss: {
+                WallPullCenteredModal(maxWidth: 740, maxHeight: 696, hugContentHeight: false, onDismiss: {
                     withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
                         showSettingsSheet = false
                     }
@@ -186,7 +217,7 @@ struct VaultGalleryView: View {
                             onCurrentIDChanged: { newID in
                                 if let matched = filtered.first(where: { $0.id == newID }) {
                                     let thumb = vault.thumbURL(for: matched) ?? vault.mediaURL(for: matched)
-                                    let key = "\(thumb.path)#\(vault.thumbRevision)"
+                                    let key = RetinaThumbnailCache.cacheKey(url: thumb, revision: vault.thumbRevision, maxPixelSize: 720)
                                     detailCoverImage = RetinaThumbnailCache.shared.image(forKey: key)
                                     detailOriginRect = frameTracker.rect(for: newID)
                                 }
@@ -199,18 +230,63 @@ struct VaultGalleryView: View {
                     .ignoresSafeArea(.all)
                     .zIndex(80)
                 }
+                if let pcSession = catalogPreviewSession {
+                    DetailFlipModalContainer(
+                        originRect: catalogPreviewOriginRect,
+                        coverImage: catalogPreviewCover,
+                        isClosing: isClosingCatalogPreview,
+                        onDismissAnimationComplete: {
+                            catalogPreviewSession = nil
+                            isClosingCatalogPreview = false
+                            catalogPreviewCover = nil
+                        }
+                    ) {
+                        PCCatalogPreviewView(
+                            vault: vault,
+                            localSend: localSend,
+                            musicPlayer: musicPlayer,
+                            peer: pcSession.peer,
+                            catalogList: pcSession.catalogList,
+                            currentID: pcSession.id,
+                            isClosing: isClosingCatalogPreview,
+                            onCurrentIDChanged: { newID in
+                                catalogPreviewOriginRect = catalogFrameTracker.rect(for: "cat_\(newID)")
+                                if let matched = pcSession.catalogList.first(where: { $0.id == newID }) {
+                                    catalogPreviewCover = localSend.cachedThumbImage(for: matched, peer: pcSession.peer)
+                                }
+                            },
+                            onClose: {
+                                isClosingCatalogPreview = true
+                            }
+                        )
+                    }
+                    .ignoresSafeArea(.all)
+                    .zIndex(90)
+                }
             }
         )
         .onChange(of: isFullscreenModalOpen) { paused in
             GalleryVideoPreviewCoordinator.shared.setGloballyPaused(paused)
         }
+        .onChange(of: localSend.pairingRequiredPeer?.fingerprint) { fp in
+            if fp != nil && !showLocalSendSheet {
+                if !isFullscreenModalOpen {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                        showLocalSendSheet = true
+                    }
+                } else {
+                    vault.showToast("电脑端连接需要重新配对，请关闭当前预览后在「跨端互联」完成配对", isError: true)
+                }
+            }
+        }
         .wallPullFeedbackOverlay(
             vault: vault,
             localSend: localSend,
-            bottomPadding: ((isSelecting && !selectedIDs.isEmpty) || musicPlayer.activeTrack != nil) && !showLocalSendSheet ? 82 : 22
+            musicPlayer: musicPlayer,
+            bottomPadding: feedbackBottomPadding,
+            hideFloatingOverlap: showSettingsSheet || isFullscreenModalOpen || showLocalSendSheet
         )
-        .animation(.spring(response: 0.3, dampingFraction: 0.86), value: isSelecting)
-        .animation(.spring(response: 0.28, dampingFraction: 0.86), value: musicPlayer.activeTrack != nil)
+        .animation(.spring(response: 0.28, dampingFraction: 0.86), value: isSelecting)
         .preferredColorScheme(vault.appearanceMode.colorScheme)
         .sheet(isPresented: $showPhotosPicker) {
             PhotoLibraryPicker { urls, names in
@@ -218,7 +294,13 @@ struct VaultGalleryView: View {
                     var imported = 0
                     for (idx, u) in urls.enumerated() {
                         let name = idx < names.count ? names[idx] : u.lastPathComponent
-                        if await vault.importFile(from: u, suggestedFileName: name, sourceDevice: "系统相册") != nil {
+                        if await vault.importFile(
+                            from: u,
+                            suggestedFileName: name,
+                            sourceDevice: "系统相册",
+                            batchIndex: idx,
+                            batchTotal: urls.count
+                        ) != nil {
                             imported += 1
                         }
                         try? FileManager.default.removeItem(at: u)
@@ -277,11 +359,39 @@ struct VaultGalleryView: View {
             }
             Button("取消", role: .cancel) {}
         }
+        .alert("确认删除所选壁纸", isPresented: $showBatchDeleteConfirm) {
+            Button("取消", role: .cancel) {}
+            Button("删除 (\(selectedIDs.count) 项)", role: .destructive) {
+                vault.deleteItems(ids: selectedIDs)
+                selectedIDs.removeAll()
+                isSelecting = false
+            }
+        } message: {
+            Text("确定从 iPad 本地离线库中移除选中的 \(selectedIDs.count) 项壁纸吗？该操作无法撤销（不会影响电脑原库）。")
+        }
+        .alert("确认删除此壁纸？", isPresented: Binding(
+            get: { pendingSingleDeleteItem != nil },
+            set: { if !$0 { pendingSingleDeleteItem = nil } }
+        ), presenting: pendingSingleDeleteItem) { target in
+            Button("取消", role: .cancel) {
+                pendingSingleDeleteItem = nil
+            }
+            Button("确认删除", role: .destructive) {
+                selectedIDs.remove(target.id)
+                vault.deleteItems(ids: [target.id])
+                pendingSingleDeleteItem = nil
+            }
+        } message: { target in
+            Text("将从 iPad 本地离线库中移除「\(target.title)」，该操作无法撤销。")
+        }
     }
 
     private func openItemWithFlip(_ item: VaultItem) {
+        if item.mediaType == .video && musicPlayer.isPlaying {
+            musicPlayer.pausePlayback()
+        }
         let thumb = vault.thumbURL(for: item) ?? vault.mediaURL(for: item)
-        let key = "\(thumb.path)#\(vault.thumbRevision)"
+        let key = RetinaThumbnailCache.cacheKey(url: thumb, revision: vault.thumbRevision, maxPixelSize: 720)
         detailCoverImage = RetinaThumbnailCache.shared.image(forKey: key)
         detailOriginRect = frameTracker.rect(for: item.id)
         isClosingDetail = false
@@ -333,7 +443,10 @@ struct VaultGalleryView: View {
                             if musicPlayer.activeTrack != nil {
                                 musicPlayer.togglePlayPause()
                             } else {
-                                musicPlayer.playAllAvailable(from: filtered, vault: vault)
+                                let pool = filtered.contains(where: \.hasMusic)
+                                    ? filtered
+                                    : (vault.categoryFilter == .all ? vault.items : filtered)
+                                musicPlayer.playAllAvailable(from: pool, vault: vault)
                             }
                         } label: {
                             Image(systemName: musicPlayer.isPlaying ? "waveform" : "music.note")
@@ -390,6 +503,7 @@ struct VaultGalleryView: View {
                     .buttonStyle(StickerPressButtonStyle())
                     .popover(isPresented: $showFilterPopover, arrowEdge: .top) {
                         filterPopoverContent
+                            .preferredColorScheme(vault.appearanceMode.colorScheme)
                     }
 
                     Button {
@@ -469,254 +583,307 @@ struct VaultGalleryView: View {
     // Windows-parity structured Filter & Sort Popover (A1-A4)
     private var filterPopoverContent: some View {
         let colorCounts = vault.colorBucketCounts()
-        return ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+        let scheme = effectiveScheme
+        let primaryText = scheme == .dark ? Color.white : Color(hex: "#18181B")
+        let secondaryText = scheme == .dark ? Color.white.opacity(0.62) : Color(hex: "#71717A")
+
+        let contentBody = VStack(alignment: .leading, spacing: 11) {
+            HStack {
+                Text("筛选与排序")
+                    .font(.system(size: 16, weight: .bold, design: .rounded))
+                    .foregroundColor(primaryText)
+                Spacer()
+                if vault.activeFilterCount > 0 {
+                    Button {
+                        vault.resetAllFilters()
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    } label: {
+                        Label("重置全部筛选", systemImage: "arrow.counterclockwise")
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundColor(vault.accentColor)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass").foregroundColor(secondaryText)
+                TextField("搜索壁纸名称或文件名…", text: $vault.searchText)
+                    .foregroundColor(primaryText)
+                if !vault.searchText.isEmpty {
+                    Button { vault.searchText = "" } label: {
+                        Image(systemName: "xmark.circle.fill").foregroundColor(secondaryText)
+                    }
+                }
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 34)
+            .background(WallPullPalette.cardSurface(scheme), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).strokeBorder(WallPullPalette.hairline(scheme), lineWidth: 1))
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("排序方式")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundColor(secondaryText)
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 7) {
+                    ForEach(VaultSortMode.allCases) { mode in
+                        filterChip(title: mode.rawValue, active: vault.sortMode == mode) {
+                            vault.sortMode = mode
+                        }
+                    }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("内容年龄分级")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundColor(secondaryText)
+                HStack(spacing: 7) {
+                    ForEach(ContentRatingFilter.allCases) { opt in
+                        filterChip(title: opt.rawValue, active: vault.ratingFilter == opt) {
+                            vault.ratingFilter = opt
+                        }
+                    }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("规格与特性筛选")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundColor(secondaryText)
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 7) {
+                    ForEach(SpecFilter.allCases) { spec in
+                        filterChip(title: spec.rawValue, active: vault.specFilter == spec) {
+                            vault.specFilter = spec
+                        }
+                    }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    Text("筛选与排序")
-                        .font(.system(size: 16, weight: .bold, design: .rounded))
+                    Text("主色调色板")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundColor(secondaryText)
                     Spacer()
-                    if vault.activeFilterCount > 0 {
+                    if let activeColor = vault.colorFilter {
+                        Text("\(activeColor.label) · \(colorCounts[activeColor] ?? 0) 项")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(vault.accentColor)
+                    }
+                }
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 7) {
+                    ForEach(ColorBucketKind.allCases) { bucket in
+                        let count = colorCounts[bucket] ?? 0
+                        let active = vault.colorFilter == bucket
                         Button {
-                            vault.resetAllFilters()
+                            vault.colorFilter = active ? nil : bucket
                             UIImpactFeedbackGenerator(style: .light).impactOccurred()
                         } label: {
-                            Label("重置全部筛选", systemImage: "arrow.counterclockwise")
-                                .font(.system(size: 12.5, weight: .semibold))
-                                .foregroundColor(vault.accentColor)
+                            HStack(spacing: 8) {
+                                Circle()
+                                    .fill(bucket.swatchColor)
+                                    .frame(width: 13, height: 13)
+                                    .overlay(Circle().strokeBorder(primaryText.opacity(0.22), lineWidth: 0.8))
+                                Text(bucket.label)
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundColor(primaryText)
+                                    .lineLimit(1)
+                                Spacer()
+                                Text("\(count)")
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundColor(secondaryText)
+                            }
+                            .padding(.horizontal, 10)
+                            .frame(height: 31)
+                            .background(
+                                active ? vault.accentColor.opacity(0.16) : WallPullPalette.cardSurface(scheme),
+                                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .strokeBorder(active ? vault.accentColor : WallPullPalette.hairline(scheme), lineWidth: active ? 1.5 : 1)
+                            )
                         }
                         .buttonStyle(.plain)
                     }
                 }
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text("卡片画幅与网格列数")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundColor(secondaryText)
+                WallPullSegmentedPill(
+                    options: CardAspectMode.allCases,
+                    selection: cardAspectBinding,
+                    label: { $0.rawValue },
+                    height: 32
+                )
 
                 HStack(spacing: 8) {
-                    Image(systemName: "magnifyingglass").foregroundColor(.secondary)
-                    TextField("搜索壁纸名称或文件名…", text: $vault.searchText)
-                    if !vault.searchText.isEmpty {
-                        Button { vault.searchText = "" } label: {
-                            Image(systemName: "xmark.circle.fill").foregroundColor(.secondary)
-                        }
-                    }
-                }
-                .padding(.horizontal, 12)
-                .frame(height: 36)
-                .background(WallPullPalette.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(WallPullPalette.hairline(colorScheme), lineWidth: 1))
-
-                VStack(alignment: .leading, spacing: 7) {
-                    Text("排序方式")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(.secondary)
-                    LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
-                        ForEach(VaultSortMode.allCases) { mode in
-                            filterChip(title: mode.rawValue, active: vault.sortMode == mode) {
-                                vault.sortMode = mode
-                            }
-                        }
-                    }
-                }
-
-                VStack(alignment: .leading, spacing: 7) {
-                    Text("内容年龄分级")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(.secondary)
-                    HStack(spacing: 8) {
-                        ForEach(ContentRatingFilter.allCases) { opt in
-                            filterChip(title: opt.rawValue, active: vault.ratingFilter == opt) {
-                                vault.ratingFilter = opt
-                            }
-                        }
-                    }
-                }
-
-                VStack(alignment: .leading, spacing: 7) {
-                    Text("规格与特性筛选")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(.secondary)
-                    LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
-                        ForEach(SpecFilter.allCases) { spec in
-                            filterChip(title: spec.rawValue, active: vault.specFilter == spec) {
-                                vault.specFilter = spec
-                            }
-                        }
-                    }
-                }
-
-                VStack(alignment: .leading, spacing: 7) {
-                    HStack {
-                        Text("主色调色板")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundColor(.secondary)
-                        Spacer()
-                        if let activeColor = vault.colorFilter {
-                            Text("\(activeColor.label) · \(colorCounts[activeColor] ?? 0) 项")
-                                .font(.system(size: 11.5, weight: .semibold))
-                                .foregroundColor(vault.accentColor)
-                        }
-                    }
-                    LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
-                        ForEach(ColorBucketKind.allCases) { bucket in
-                            let count = colorCounts[bucket] ?? 0
-                            let active = vault.colorFilter == bucket
+                    Text(vault.cardAspectMode == .square ? "方块密度" : "每行显示列数")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(primaryText)
+                    Spacer()
+                    HStack(spacing: 5) {
+                        ForEach(2...6, id: \.self) { cols in
+                            let active = vault.columnsCount == cols
                             Button {
-                                vault.colorFilter = active ? nil : bucket
+                                withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                                    vault.columnsCount = cols
+                                }
                                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
                             } label: {
-                                HStack(spacing: 8) {
-                                    Circle()
-                                        .fill(bucket.swatchColor)
-                                        .frame(width: 14, height: 14)
-                                        .overlay(Circle().strokeBorder(Color.primary.opacity(0.2), lineWidth: 0.8))
-                                    Text(bucket.label)
-                                        .font(.system(size: 12.5, weight: .medium))
-                                        .lineLimit(1)
-                                    Spacer()
-                                    Text("\(count)")
-                                        .font(.system(size: 11, design: .monospaced))
-                                        .foregroundColor(.secondary)
-                                }
-                                .padding(.horizontal, 10)
-                                .frame(height: 34)
-                                .background(
-                                    active ? vault.accentColor.opacity(0.14) : WallPullPalette.cardSurface(colorScheme),
-                                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                )
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                        .strokeBorder(active ? vault.accentColor : WallPullPalette.hairline(colorScheme), lineWidth: active ? 1.5 : 1)
-                                )
+                                Text(vault.cardAspectMode == .square ? "\(cols - 1)档" : "\(cols)列")
+                                    .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                                    .foregroundColor(active ? .white : primaryText)
+                                    .padding(.horizontal, 9)
+                                    .frame(height: 28)
+                                    .background(
+                                        active ? vault.accentColor : WallPullPalette.cardSurface(scheme),
+                                        in: Capsule()
+                                    )
+                                    .overlay(
+                                        Capsule().strokeBorder(
+                                            active ? vault.accentColor : WallPullPalette.hairline(scheme),
+                                            lineWidth: 1
+                                        )
+                                    )
                             }
                             .buttonStyle(.plain)
                         }
                     }
                 }
-
-                VStack(alignment: .leading, spacing: 7) {
-                    Text("卡片画幅与网格列数")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(.secondary)
-                    WallPullSegmentedPill(
-                        options: CardAspectMode.allCases,
-                        selection: cardAspectBinding,
-                        label: { $0.rawValue },
-                        height: 34
-                    )
-
-                    HStack(spacing: 10) {
-                        Text(vault.cardAspectMode == .square ? "方块密度（自动适配每行列数）" : "每行显示列数")
-                            .font(.system(size: 13, weight: .medium))
-                        Spacer()
-                        HStack(spacing: 8) {
-                            Button {
-                                if vault.columnsCount > 2 {
-                                    withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) { vault.columnsCount -= 1 }
-                                }
-                            } label: {
-                                Image(systemName: "minus").frame(width: 28, height: 28)
-                            }
-                            Text(vault.cardAspectMode == .square ? "第 \(vault.columnsCount - 1) 档" : "\(vault.columnsCount) 列")
-                                .font(.system(size: 13.5, weight: .bold, design: .rounded))
-                            Button {
-                                if vault.columnsCount < 6 {
-                                    withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) { vault.columnsCount += 1 }
-                                }
-                            } label: {
-                                Image(systemName: "plus").frame(width: 28, height: 28)
-                            }
-                        }
-                        .padding(.horizontal, 8)
-                        .frame(height: 32)
-                        .background(WallPullPalette.cardSurface(colorScheme), in: Capsule())
-                        .overlay(Capsule().strokeBorder(WallPullPalette.hairline(colorScheme), lineWidth: 1))
-                    }
-                    .padding(.top, 4)
-                }
-                .padding(.top, 16)
             }
-            .padding(18)
+        }
+        .padding(16)
+
+        return Group {
+            if #available(iOS 16.0, *) {
+                ViewThatFits(in: .vertical) {
+                    contentBody
+                    ScrollView(.vertical, showsIndicators: true) {
+                        contentBody
+                    }
+                    .frame(maxHeight: 620)
+                }
+            } else {
+                ScrollView(.vertical, showsIndicators: true) {
+                    contentBody
+                }
+                .frame(maxHeight: 620)
+            }
         }
         .frame(width: 420)
-        .frame(height: 550)
+        .background(WallPullPalette.canvas(scheme))
     }
 
     private func filterChip(title: String, active: Bool, action: @escaping () -> Void) -> some View {
-        Button {
+        let scheme = effectiveScheme
+        let primaryText = scheme == .dark ? Color.white : Color(hex: "#18181B")
+        return Button {
             action()
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
         } label: {
             Text(title)
-                .font(.system(size: 12.5, weight: .semibold, design: .rounded))
-                .foregroundColor(active ? .white : .primary)
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundColor(active ? .white : primaryText)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity)
-                .frame(height: 32)
-                .background(active ? vault.accentColor : WallPullPalette.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .frame(height: 30)
+                .background(active ? vault.accentColor : WallPullPalette.cardSurface(scheme), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 .overlay(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .strokeBorder(active ? vault.accentColor : WallPullPalette.hairline(colorScheme), lineWidth: 1)
+                        .strokeBorder(active ? vault.accentColor : WallPullPalette.hairline(scheme), lineWidth: 1)
                 )
         }
         .buttonStyle(.plain)
     }
 
+    @ViewBuilder
+    private func galleryCardCell(for item: VaultItem) -> some View {
+        WallpaperCardView(
+            item: item,
+            thumbURL: vault.thumbURL(for: item),
+            mediaURL: vault.mediaURL(for: item),
+            previewVideoURL: vault.galleryPreviewVideoURL(for: item),
+            accentColor: vault.accentColor,
+            aspectMode: vault.cardAspectMode,
+            showCaption: vault.showCardCaptions,
+            showFileSizeInSubtitle: vault.sortMode == .size,
+            autoPlayVideo: vault.autoPlayGalleryVideos,
+            isGalleryPaused: isFullscreenModalOpen,
+            thumbRevision: vault.thumbRevision,
+            frameTracker: frameTracker,
+            isSelecting: isSelecting,
+            isSelected: selectedIDs.contains(item.id),
+            isNewlyLanded: vault.newlyLandedIDs.contains(item.id),
+            colorScheme: colorScheme,
+            onSettledLanding: { vault.markLandedCompleted(item.id) },
+            onTap: {
+                if isSelecting {
+                    if selectedIDs.contains(item.id) { selectedIDs.remove(item.id) }
+                    else { selectedIDs.insert(item.id) }
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                } else {
+                    openItemWithFlip(item)
+                }
+            },
+            onToggleSelectItem: {
+                if !isSelecting { isSelecting = true }
+                if selectedIDs.contains(item.id) { selectedIDs.remove(item.id) }
+                else { selectedIDs.insert(item.id) }
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            },
+            onCopyClipboard: { vault.copyLosslessToClipboard(item: item) },
+            onSavePhotos: { Task { await vault.saveToPhotos(items: [item]) } },
+            onOpenStudio: { studioItem = item },
+            onPlayMusic: { musicPlayer.play(item: item, trackIndex: 0, pool: filtered, vault: vault) },
+            onSendLocalSend: {
+                pendingSendItems = [item]
+                if localSend.peers.isEmpty {
+                    Task { await localSend.scanNetwork() }
+                }
+                showPeerActionSheet = true
+            },
+            onToggleFavorite: { vault.toggleFavorite(item) },
+            onDelete: {
+                pendingSingleDeleteItem = item
+            }
+        )
+        .equatable()
+    }
+
     private var galleryGrid: some View {
-        ZStack(alignment: .top) {
+        let gap: CGFloat = 18
+        let bottomPad: CGFloat = (musicPlayer.activeTrack != nil && isSelecting && !selectedIDs.isEmpty) ? 162 : ((isSelecting || musicPlayer.activeTrack != nil) ? 102 : 34)
+        return ZStack(alignment: .top) {
             ScrollView {
-                LazyVGrid(columns: gridColumns, spacing: vault.cardAspectMode == .square ? 18 : 24) {
-                    ForEach(filtered) { item in
-                        WallpaperCardView(
-                            item: item,
-                            thumbURL: vault.thumbURL(for: item),
-                            mediaURL: vault.mediaURL(for: item),
-                            previewVideoURL: vault.galleryPreviewVideoURL(for: item),
-                            accentColor: vault.accentColor,
-                            aspectMode: vault.cardAspectMode,
-                            showCaption: vault.showCardCaptions,
-                            showFileSizeInSubtitle: vault.sortMode == .size,
-                            autoPlayVideo: vault.autoPlayGalleryVideos,
-                            isGalleryPaused: isFullscreenModalOpen,
-                            thumbRevision: vault.thumbRevision,
-                            frameTracker: frameTracker,
-                            isSelecting: isSelecting,
-                            isSelected: selectedIDs.contains(item.id),
-                            isNewlyLanded: vault.newlyLandedIDs.contains(item.id),
-                            onSettledLanding: { vault.markLandedCompleted(item.id) },
-                            onTap: {
-                                if isSelecting {
-                                    if selectedIDs.contains(item.id) { selectedIDs.remove(item.id) }
-                                    else { selectedIDs.insert(item.id) }
-                                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                } else {
-                                    openItemWithFlip(item)
+                Group {
+                    if vault.cardAspectMode == .adaptive {
+                        let cols = vault.cachedWaterfallColumns
+                        HStack(alignment: .top, spacing: gap) {
+                            ForEach(Array(cols.enumerated()), id: \.offset) { _, colItems in
+                                LazyVStack(spacing: gap) {
+                                    ForEach(colItems) { item in
+                                        galleryCardCell(for: item)
+                                    }
                                 }
-                            },
-                            onToggleSelectItem: {
-                                if !isSelecting { isSelecting = true }
-                                if selectedIDs.contains(item.id) { selectedIDs.remove(item.id) }
-                                else { selectedIDs.insert(item.id) }
-                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                            },
-                            onCopyClipboard: { vault.copyLosslessToClipboard(item: item) },
-                            onSavePhotos: { Task { await vault.saveToPhotos(items: [item]) } },
-                            onOpenStudio: { studioItem = item },
-                            onPlayMusic: { musicPlayer.play(item: item, trackIndex: 0, pool: filtered, vault: vault) },
-                            onSendLocalSend: {
-                                pendingSendItems = [item]
-                                if localSend.peers.isEmpty {
-                                    Task { await localSend.scanNetwork() }
-                                }
-                                showPeerActionSheet = true
-                            },
-                            onToggleFavorite: { vault.toggleFavorite(item) },
-                            onDelete: {
-                                selectedIDs.remove(item.id)
-                                vault.deleteItems(ids: [item.id])
+                                .frame(maxWidth: .infinity, alignment: .top)
                             }
-                        )
+                        }
+                    } else {
+                        LazyVGrid(columns: gridColumns, spacing: gap) {
+                            ForEach(filtered) { item in
+                                galleryCardCell(for: item)
+                            }
+                        }
                     }
                 }
-                .padding(.horizontal, 22)
+                .padding(.horizontal, gap)
                 .padding(.top, 10)
-                .padding(.bottom, isSelecting || musicPlayer.activeTrack != nil ? 102 : 34)
+                .padding(.bottom, bottomPad)
             }
             .simultaneousGesture(
                 MagnificationGesture(minimumScaleDelta: 0.08)
@@ -809,13 +976,15 @@ struct VaultGalleryView: View {
                     .fixedSize(horizontal: true, vertical: false)
             }
 
-            Button(role: .destructive) {
+            HoldToConfirmCapsule(
+                title: "按住删除",
+                icon: "trash.fill",
+                duration: 0.85,
+                tint: .red
+            ) {
                 vault.deleteItems(ids: selectedIDs)
                 selectedIDs.removeAll()
                 isSelecting = false
-            } label: {
-                Image(systemName: "trash")
-                    .foregroundColor(.red)
             }
         }
         .padding(.horizontal, 18)

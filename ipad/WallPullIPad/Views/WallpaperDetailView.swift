@@ -1,3 +1,4 @@
+import AVFoundation
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
@@ -23,7 +24,8 @@ struct WallpaperDetailView: View {
     @State private var backdrop: StudioBackdrop = .checker
     @State private var isCleanImmersive: Bool = false
     @State private var fillMode: Bool = false
-    @State private var isMuted: Bool = true
+    @State private var isMuted: Bool = false
+    @State private var isExtractingBGM: Bool = false
     @State private var videoPlaying: Bool = true
     @State private var videoSpeed: Float = 1.0
     @State private var videoCurrentSec: Double = 0
@@ -34,11 +36,23 @@ struct WallpaperDetailView: View {
     @State private var dragDismissOffset: CGFloat = 0
     @State private var showPeerPicker: Bool = false
     @State private var showInfoSheet: Bool = false
+    @State private var showSingleDeleteConfirm: Bool = false
+    @Environment(\.horizontalSizeClass) private var hSizeClass
     @State private var selectedTrackIdx: Int = 0
     @State private var selectedVariantIdx: Int = 0
+    @State private var sessionItemIDs: [String] = []
+    @State private var bgmExtractTask: Task<Void, Never>? = nil
+
+    private var resolvedItems: [VaultItem] {
+        guard !sessionItemIDs.isEmpty else { return allItems }
+        let liveByID = Dictionary(uniqueKeysWithValues: vault.items.map { ($0.id, $0) })
+        let fallbackByID = Dictionary(uniqueKeysWithValues: allItems.map { ($0.id, $0) })
+        let mapped = sessionItemIDs.compactMap { liveByID[$0] ?? fallbackByID[$0] }
+        return mapped.isEmpty ? allItems : mapped
+    }
 
     private var currentItem: VaultItem? {
-        allItems.first(where: { $0.id == currentID }) ?? allItems.first
+        resolvedItems.first(where: { $0.id == currentID }) ?? resolvedItems.first
     }
 
     private var usesLightBackdropChrome: Bool {
@@ -79,7 +93,7 @@ struct WallpaperDetailView: View {
                 .ignoresSafeArea(.all)
 
             TabView(selection: $currentID) {
-                ForEach(allItems) { item in
+                ForEach(resolvedItems) { item in
                     ZoomableMediaPage(
                         item: item,
                         mediaURL: activeMediaURL(for: item),
@@ -146,6 +160,9 @@ struct WallpaperDetailView: View {
                 videoPlaying = true
                 selectedTrackIdx = 0
                 selectedVariantIdx = 0
+                if !isMuted && currentItem?.mediaType == .video && musicPlayer.isPlaying {
+                    musicPlayer.pausePlayback()
+                }
                 onCurrentIDChanged?(currentID)
             }
 
@@ -159,7 +176,7 @@ struct WallpaperDetailView: View {
                         if item.mediaType == .video {
                             videoControlsBar(item: item)
                         }
-                        if item.hasMusic {
+                        if !(item.audioTracks ?? []).isEmpty {
                             musicStripBar(item: item)
                         }
                         if item.allMediaFileNames.count > 1 {
@@ -174,6 +191,21 @@ struct WallpaperDetailView: View {
             }
         }
         .statusBar(hidden: fillMode || isCleanImmersive)
+        .onAppear {
+            if sessionItemIDs.isEmpty {
+                sessionItemIDs = allItems.map(\.id)
+            }
+            if videoDurationSec <= 0 {
+                videoDurationSec = currentItem?.durationSeconds ?? 0
+            }
+            if !isMuted && currentItem?.mediaType == .video && musicPlayer.isPlaying {
+                musicPlayer.pausePlayback()
+            }
+        }
+        .onDisappear {
+            bgmExtractTask?.cancel()
+            bgmExtractTask = nil
+        }
         .sheet(isPresented: $showInfoSheet) {
             if let item = currentItem {
                 DetailInfoSheet(item: item)
@@ -186,13 +218,28 @@ struct WallpaperDetailView: View {
             titleVisibility: .visible
         ) {
             if let item = currentItem {
+                let chosenURL = activeMediaURL(for: item)
                 ForEach(localSend.peers) { peer in
                     Button("发送原文件到「\(peer.alias)」(\(peer.ip))") {
-                        Task { await localSend.sendVaultItems([item], to: peer, targetMode: "vault") }
+                        Task {
+                            await localSend.sendVaultItems(
+                                [item],
+                                to: peer,
+                                targetMode: "vault",
+                                overrideMediaURLs: [item.id: chosenURL]
+                            )
+                        }
                     }
                     if item.mediaType == .image {
                         Button("推至「\(peer.alias)」剪贴板") {
-                            Task { await localSend.sendVaultItems([item], to: peer, targetMode: "clipboard") }
+                            Task {
+                                await localSend.sendVaultItems(
+                                    [item],
+                                    to: peer,
+                                    targetMode: "clipboard",
+                                    overrideMediaURLs: [item.id: chosenURL]
+                                )
+                            }
                         }
                     }
                 }
@@ -365,6 +412,9 @@ struct WallpaperDetailView: View {
 
             Button {
                 isMuted.toggle()
+                if !isMuted && musicPlayer.isPlaying {
+                    musicPlayer.pausePlayback()
+                }
             } label: {
                 Image(systemName: isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
                     .font(.system(size: 13.5, weight: .semibold))
@@ -373,6 +423,32 @@ struct WallpaperDetailView: View {
                     .background(chromePillFill, in: Circle())
             }
             .buttonStyle(StickerPressButtonStyle())
+
+            if item.hasEmbeddedAudio == true {
+                Button {
+                    bgmExtractTask?.cancel()
+                    bgmExtractTask = Task { await extractAndShareVideoBGM(for: item) }
+                } label: {
+                    HStack(spacing: 4) {
+                        if isExtractingBGM {
+                            ProgressView()
+                                .controlSize(.small)
+                                .tint(chromeForeground)
+                        } else {
+                            Image(systemName: "music.note")
+                                .font(.system(size: 11.5, weight: .bold))
+                        }
+                        Text("提取 BGM")
+                            .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                    }
+                    .foregroundColor(chromeForeground)
+                    .padding(.horizontal, 10)
+                    .frame(height: 28)
+                    .background(chromePillFill, in: Capsule())
+                }
+                .disabled(isExtractingBGM)
+                .buttonStyle(StickerPressButtonStyle())
+            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
@@ -380,20 +456,112 @@ struct WallpaperDetailView: View {
         .overlay(Capsule().strokeBorder(chromeForeground.opacity(0.12), lineWidth: 1))
     }
 
+    private func extractAndShareVideoBGM(for item: VaultItem) async {
+        guard !isExtractingBGM else { return }
+        let srcURL = activeMediaURL(for: item)
+        guard FileManager.default.fileExists(atPath: srcURL.path) else {
+            vault.showToast("视频原文件不存在", isError: true)
+            return
+        }
+        isExtractingBGM = true
+        defer { isExtractingBGM = false }
+
+        let baseTitle = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let safeTitle = (baseTitle.isEmpty ? "WallPull" : baseTitle)
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+        let shareDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WallPullShare", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try? FileManager.default.createDirectory(at: shareDir, withIntermediateDirectories: true)
+        let outURL = shareDir.appendingPathComponent("\(safeTitle) - BGM.m4a")
+
+        let exportPrep = await Task.detached(priority: .userInitiated) { () -> (AVAssetExportSession?, String?) in
+            let asset = AVURLAsset(url: srcURL)
+            let audioTracks = asset.tracks(withMediaType: .audio)
+            guard let srcTrack = audioTracks.first else {
+                return (nil, "该视频未检测到可提取的音轨")
+            }
+            let composition = AVMutableComposition()
+            guard let compTrack = composition.addMutableTrack(
+                withMediaType: .audio,
+                preferredTrackID: kCMPersistentTrackID_Invalid
+            ) else {
+                return (nil, "无法初始化音频导出轨道")
+            }
+            let validTrackDur = srcTrack.timeRange.duration.isValid && srcTrack.timeRange.duration.seconds > 0
+            let range = validTrackDur
+                ? srcTrack.timeRange
+                : CMTimeRange(start: .zero, duration: asset.duration)
+            do {
+                try compTrack.insertTimeRange(range, of: srcTrack, at: .zero)
+            } catch {
+                return (nil, "读取视频音轨失败：\(error.localizedDescription)")
+            }
+            guard let session = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetAppleM4A) else {
+                return (nil, "当前设备不支持 M4A 音频导出")
+            }
+            session.outputURL = outURL
+            session.outputFileType = .m4a
+            session.shouldOptimizeForNetworkUse = true
+            return (session, nil)
+        }.value
+
+        if Task.isCancelled {
+            try? FileManager.default.removeItem(at: shareDir)
+            return
+        }
+        guard let exporter = exportPrep.0 else {
+            try? FileManager.default.removeItem(at: shareDir)
+            vault.showToast(exportPrep.1 ?? "提取 BGM 失败", isError: true)
+            return
+        }
+
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                exporter.exportAsynchronously {
+                    cont.resume()
+                }
+            }
+        } onCancel: {
+            exporter.cancelExport()
+        }
+
+        guard !Task.isCancelled else {
+            try? FileManager.default.removeItem(at: shareDir)
+            return
+        }
+        if exporter.status == .completed && FileManager.default.fileExists(atPath: outURL.path) {
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            WallPullShareHelper.presentShareSheet(items: [outURL])
+        } else {
+            try? FileManager.default.removeItem(at: shareDir)
+            let msg = exporter.error?.localizedDescription ?? "导出被取消"
+            vault.showToast("提取 BGM 失败：\(msg)", isError: true)
+        }
+    }
+
+    @ViewBuilder
     private func musicStripBar(item: VaultItem) -> some View {
         let tracks = item.audioTracks ?? []
         let safeIdx = max(0, min(selectedTrackIdx, max(0, tracks.count - 1)))
-        let currentTrack = tracks[safeIdx]
-        let isThisPlaying = musicPlayer.activeItem?.id == item.id
-            && musicPlayer.activeTrack?.id == currentTrack.id
-            && musicPlayer.isPlaying
+        if let currentTrack = tracks.indices.contains(safeIdx) ? tracks[safeIdx] : tracks.first {
+            let isThisPlaying = musicPlayer.activeItem?.id == item.id
+                && musicPlayer.activeTrack?.id == currentTrack.id
+                && musicPlayer.isPlaying
 
-        return HStack(spacing: 10) {
+            HStack(spacing: 10) {
             Button {
                 if musicPlayer.activeItem?.id == item.id && musicPlayer.activeTrack?.id == currentTrack.id {
+                    if !isThisPlaying && item.mediaType == .video {
+                        isMuted = true
+                    }
                     musicPlayer.togglePlayPause()
                 } else {
-                    musicPlayer.play(item: item, trackIndex: safeIdx, pool: allItems, vault: vault)
+                    if item.mediaType == .video {
+                        isMuted = true
+                    }
+                    musicPlayer.play(item: item, trackIndex: safeIdx, pool: resolvedItems, vault: vault)
                 }
             } label: {
                 Image(systemName: isThisPlaying ? "pause.fill" : "play.fill")
@@ -417,7 +585,10 @@ struct WallpaperDetailView: View {
             if tracks.count > 1 {
                 Button {
                     selectedTrackIdx = (safeIdx + 1) % tracks.count
-                    musicPlayer.play(item: item, trackIndex: selectedTrackIdx, pool: allItems, vault: vault)
+                    if item.mediaType == .video {
+                        isMuted = true
+                    }
+                    musicPlayer.play(item: item, trackIndex: selectedTrackIdx, pool: resolvedItems, vault: vault)
                 } label: {
                     Text("曲目 \(safeIdx + 1)/\(tracks.count)")
                         .font(.system(size: 11, weight: .semibold))
@@ -430,10 +601,21 @@ struct WallpaperDetailView: View {
             }
 
             if musicPlayer.activeItem?.id == item.id && musicPlayer.activeTrack?.id == currentTrack.id {
-                Text("\(fmtClock(musicPlayer.currentTime)) / \(fmtClock(musicPlayer.duration))")
+                MusicClockText(clock: musicPlayer.clock)
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundColor(chromeForeground.opacity(0.75))
             }
+
+            Button {
+                musicPlayer.toggleLoopMode()
+            } label: {
+                Image(systemName: musicPlayer.isLoopingSingle ? "repeat.1" : "repeat")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundColor(musicPlayer.isLoopingSingle ? vault.accentColor : chromeForeground)
+                    .frame(width: 28, height: 28)
+                    .background(chromePillFill, in: Circle())
+            }
+            .buttonStyle(.plain)
 
             UIKitSharePopoverButton(buildShareItems: {
                 let pairs = tracks.map { track in
@@ -453,6 +635,7 @@ struct WallpaperDetailView: View {
         .padding(.vertical, 7)
         .background(.ultraThinMaterial, in: Capsule())
         .overlay(Capsule().strokeBorder(chromeForeground.opacity(0.12), lineWidth: 1))
+        }
     }
 
     private func variantSwitcherBar(item: VaultItem) -> some View {
@@ -580,20 +763,7 @@ struct WallpaperDetailView: View {
                     .buttonStyle(StickerPressButtonStyle())
 
                     Button(role: .destructive) {
-                        let curIdx = allItems.firstIndex(where: { $0.id == item.id })
-                        let remaining = allItems.filter { $0.id != item.id }
-                        let nextID: String?
-                        if let curIdx, !remaining.isEmpty {
-                            nextID = remaining[min(curIdx, remaining.count - 1)].id
-                        } else {
-                            nextID = remaining.first?.id
-                        }
-                        vault.deleteItems(ids: [item.id])
-                        if let nextID {
-                            currentID = nextID
-                        } else {
-                            onClose()
-                        }
+                        showSingleDeleteConfirm = true
                     } label: {
                         Image(systemName: "trash")
                             .font(.system(size: 14, weight: .semibold))
@@ -602,12 +772,35 @@ struct WallpaperDetailView: View {
                             .background(chromePillFill, in: Circle())
                     }
                     .buttonStyle(StickerPressButtonStyle())
+                    .alert("确认删除此壁纸？", isPresented: $showSingleDeleteConfirm) {
+                        Button("取消", role: .cancel) {}
+                        Button("确认删除", role: .destructive) {
+                            let list = resolvedItems
+                            let curIdx = list.firstIndex(where: { $0.id == item.id })
+                            let remaining = list.filter { $0.id != item.id }
+                            let nextID: String?
+                            if let curIdx, !remaining.isEmpty {
+                                nextID = remaining[min(curIdx, remaining.count - 1)].id
+                            } else {
+                                nextID = remaining.first?.id
+                            }
+                            sessionItemIDs.removeAll { $0 == item.id }
+                            vault.deleteItems(ids: [item.id])
+                            if let nextID {
+                                currentID = nextID
+                            } else {
+                                onClose()
+                            }
+                        }
+                    } message: {
+                        Text("将从 iPad 本地离线库中移除「\(item.title)」，该操作无法撤销。")
+                    }
                 }
                 .padding(8)
                 .background(.ultraThinMaterial, in: Capsule())
                 .overlay(Capsule().strokeBorder(chromeForeground.opacity(0.14), lineWidth: 1))
             }
-            .fixedSize(horizontal: true, vertical: false)
+            .frame(maxWidth: hSizeClass == .regular ? nil : .infinity)
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 16)
@@ -653,7 +846,12 @@ private struct DetailInfoSheet: View {
                     infoRow("来源设备", item.sourceDevice)
                     infoRow("入库时间", item.addedAt.formatted(date: .abbreviated, time: .shortened))
                     infoRow("2D 透视拆图", item.supportsLayerStudio ? "已支持（可离线拆图）" : "未检测到")
-                    infoRow("背景配乐", item.hasMusic ? "\(item.audioTracks?.count ?? 0) 首" : "无")
+                    infoRow(
+                        "背景配乐",
+                        item.hasMusic
+                            ? ((item.audioTracks?.count ?? 0) > 0 ? "\(item.audioTracks!.count) 首独立音轨" : "视频内嵌原声")
+                            : "无"
+                    )
                 }
             }
             .navigationTitle("壁纸详情")
@@ -722,20 +920,39 @@ private struct ZoomableMediaPage: View {
         .task(id: "\(mediaURL.path)#\(thumbRevision)") {
             if item.mediaType == .video {
                 guard let posterURL = thumbURL else { return }
-                let key = "\(posterURL.path)#\(thumbRevision)"
-                if let cached = RetinaThumbnailCache.shared.image(forKey: key) {
-                    self.posterImage = cached
+                let hdKey = RetinaThumbnailCache.cacheKey(url: posterURL, revision: thumbRevision, maxPixelSize: 2048)
+                if let cachedHD = RetinaThumbnailCache.shared.image(forKey: hdKey) {
+                    self.posterImage = cachedHD
                     return
+                }
+                let cardKey = RetinaThumbnailCache.cacheKey(url: posterURL, revision: thumbRevision, maxPixelSize: 720)
+                if self.posterImage == nil, let quickPreview = RetinaThumbnailCache.shared.image(forKey: cardKey) {
+                    self.posterImage = quickPreview
                 }
                 let loaded: UIImage? = await Task.detached(priority: .userInitiated) {
                     UIImage(contentsOfFile: posterURL.path)
                 }.value
-                await MainActor.run {
-                    self.posterImage = loaded
+                guard !Task.isCancelled else { return }
+                if let loaded {
+                    RetinaThumbnailCache.shared.setImage(loaded, forKey: hdKey)
+                    await MainActor.run {
+                        self.posterImage = loaded
+                    }
                 }
             } else {
                 let loaded: UIImage? = await Task.detached(priority: .userInitiated) {
-                    UIImage(contentsOfFile: mediaURL.path)
+                    let opts: [CFString: Any] = [
+                        kCGImageSourceThumbnailMaxPixelSize: 4096,
+                        kCGImageSourceCreateThumbnailFromImageAlways: true,
+                        kCGImageSourceCreateThumbnailWithTransform: true,
+                    ]
+                    if let src = CGImageSourceCreateWithURL(mediaURL as CFURL, nil),
+                       let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) {
+                        let img = UIImage(cgImage: cg)
+                        return img.preparingForDisplay() ?? img
+                    }
+                    guard let fallback = UIImage(contentsOfFile: mediaURL.path) else { return nil }
+                    return fallback.preparingForDisplay() ?? fallback
                 }.value
                 await MainActor.run {
                     self.fullImage = loaded

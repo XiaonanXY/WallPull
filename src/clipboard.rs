@@ -51,7 +51,7 @@ pub fn copy_media_to_clipboard(target_path: &Path, is_image: bool) -> Result<(),
 
     let hdrop = build_cf_hdrop(&full_path)?;
     let image_payload = if is_image {
-        prepare_image_clipboard_buffers(&full_path).ok()
+        Some(prepare_image_clipboard_buffers(&full_path)?)
     } else {
         None
     };
@@ -85,6 +85,8 @@ pub fn copy_media_to_clipboard(target_path: &Path, is_image: bool) -> Result<(),
 
         if SetClipboardData(CF_HDROP_ID, Some(HANDLE(hdrop.0))).is_err() {
             let _ = GlobalFree(Some(hdrop));
+            let _ = CloseClipboard();
+            return Err("写入 Windows 剪贴板失败，请稍后重试。".to_string());
         }
 
         let _ = CloseClipboard();
@@ -140,7 +142,12 @@ fn alloc_hglobal_bytes(data: &[u8]) -> Result<HGLOBAL, String> {
 }
 
 fn prepare_image_clipboard_buffers(path: &Path) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let rgba_img = image::open(path)
+    let reader = image::ImageReader::open(path)
+        .map_err(|e| format!("无法打开剪贴板图片文件：{e}"))?
+        .with_guessed_format()
+        .map_err(|e| format!("无法识别剪贴板图片格式：{e}"))?;
+    let rgba_img = reader
+        .decode()
         .map_err(|e| format!("无法解码图片到剪贴板：{e}"))?
         .to_rgba8();
     let w = rgba_img.width();

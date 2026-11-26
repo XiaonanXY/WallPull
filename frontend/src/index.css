@@ -91,6 +91,7 @@
 
 :root {
   --font-sans: "MiSans VF", "Segoe UI Variable Text", "Microsoft YaHei UI", system-ui, sans-serif;
+  --font-mono: var(--font-sans);
 }
 
 html,
@@ -754,4 +755,23 @@ input[type="text"] {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
   }
+}
+
+@keyframes wp-level-bar {
+  0%, 100% {
+    transform: scaleY(0.28);
+  }
+  50% {
+    transform: scaleY(0.98);
+  }
+}
+
+.wp-level-bar {
+  transform-origin: center bottom;
+  transform: scaleY(0.26);
+  transition: transform 160ms ease-out;
+}
+
+.wp-level-bar.is-playing {
+  animation: wp-level-bar var(--wp-dur, 0.55s) ease-in-out var(--wp-delay, 0s) infinite;
 }

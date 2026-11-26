@@ -1,4 +1,6 @@
-use crate::media::{find_executable, pack_multi_size_ico_pure_rust, probe_or_fallback};
+use crate::media::{
+    detect_media_type, find_executable, pack_multi_size_ico_pure_rust, probe_or_fallback,
+};
 use crate::models::{
     AppSettings, ToolboxProgressPayload, WallpaperItem, is_reparse_point, strip_verbatim_prefix,
 };
@@ -30,8 +32,8 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::UI::Shell::{
-    FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FO_DELETE, SHFILEOPSTRUCTW,
-    SHFileOperationW, ShellExecuteW,
+    FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_SILENT, FOF_WANTNUKEWARNING, FO_DELETE,
+    SHFILEOPSTRUCTW, SHFileOperationW, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::PCWSTR;
@@ -443,6 +445,29 @@ where
     Ok((exported_count, export_root.to_string_lossy().into_owned()))
 }
 
+fn flatten_to_rgb8(img: &image::DynamicImage) -> image::DynamicImage {
+    let rgba = img.to_rgba8();
+    let has_alpha = rgba.pixels().any(|p| p.0[3] < 255);
+    if !has_alpha {
+        return image::DynamicImage::ImageRgb8(img.to_rgb8());
+    }
+    let mut rgb = image::RgbImage::new(rgba.width(), rgba.height());
+    for (x, y, px) in rgba.enumerate_pixels() {
+        let [r, g, b, a] = px.0;
+        if a == 255 {
+            rgb.put_pixel(x, y, image::Rgb([r, g, b]));
+        } else {
+            let a16 = a as u16;
+            let inv = 255 - a16;
+            let rr = ((r as u16 * a16 + 255 * inv + 127) / 255) as u8;
+            let gg = ((g as u16 * a16 + 255 * inv + 127) / 255) as u8;
+            let bb = ((b as u16 * a16 + 255 * inv + 127) / 255) as u8;
+            rgb.put_pixel(x, y, image::Rgb([rr, gg, bb]));
+        }
+    }
+    image::DynamicImage::ImageRgb8(rgb)
+}
+
 fn convert_export_file(
     src: &Path,
     dest: &Path,
@@ -450,14 +475,25 @@ fn convert_export_file(
     cancel: Option<&AtomicBool>,
 ) -> Result<(), String> {
     if matches!(target_fmt, "png" | "jpg" | "jpeg" | "webp" | "bmp") {
-        let img = image::open(src).map_err(|e| format!("解码原图片失败：{e}"))?;
+        let img = image::ImageReader::open(src)
+            .map_err(|e| format!("打开原图片失败：{e}"))?
+            .with_guessed_format()
+            .map_err(|e| format!("识别原图片格式失败：{e}"))?
+            .decode()
+            .map_err(|e| format!("解码原图片失败：{e}"))?;
         let fmt = match target_fmt {
             "jpg" | "jpeg" => ImageFormat::Jpeg,
             "webp" => ImageFormat::WebP,
             "bmp" => ImageFormat::Bmp,
             _ => ImageFormat::Png,
         };
-        img.save_with_format(dest, fmt)
+        let out_img = if matches!(fmt, ImageFormat::Jpeg | ImageFormat::Bmp) {
+            flatten_to_rgb8(&img)
+        } else {
+            img
+        };
+        out_img
+            .save_with_format(dest, fmt)
             .map_err(|e| format!("保存转换图片失败：{e}"))?;
         return Ok(());
     }
@@ -516,17 +552,28 @@ pub fn export_wallpaper_audio(
     track_index: Option<usize>,
     export_directory: &str,
 ) -> Result<(usize, Option<String>), String> {
-    let tracks: Vec<&String> = wallpaper
+    let mut tracks: Vec<String> = wallpaper
         .audio_paths
         .as_ref()
-        .map(|list| list.iter().filter(|p| Path::new(p).is_file()).collect())
+        .map(|list| {
+            list.iter()
+                .filter(|p| Path::new(p).is_file())
+                .cloned()
+                .collect()
+        })
         .unwrap_or_default();
+    if tracks.is_empty()
+        && wallpaper.item_type == "video"
+        && Path::new(&wallpaper.source_path).is_file()
+    {
+        tracks.push(wallpaper.source_path.clone());
+    }
     if tracks.is_empty() {
         return Err("当前壁纸包内未检测到可导出的音频文件。".to_string());
     }
 
-    let selected: Vec<&String> = match track_index {
-        Some(idx) if idx < tracks.len() => vec![tracks[idx]],
+    let selected: Vec<String> = match track_index {
+        Some(idx) if idx < tracks.len() => vec![tracks[idx].clone()],
         _ => tracks,
     };
 
@@ -541,6 +588,66 @@ pub fn export_wallpaper_audio(
 
     for track_path in &selected {
         let src = Path::new(track_path);
+        if detect_media_type(src) == Some("video") {
+            let ffmpeg = find_executable("ffmpeg.exe")
+                .ok_or_else(|| "未找到 ffmpeg，无法从视频提取音频。".to_string())?;
+            let mp3_dest = get_unique_destination_path(&audio_dir, &format!("{safe_title} - BGM.mp3"));
+            let mp3_args = os_args([
+                "-y",
+                "-i",
+                &src.to_string_lossy(),
+                "-vn",
+                "-c:a",
+                "libmp3lame",
+                "-q:a",
+                "2",
+                &mp3_dest.to_string_lossy(),
+            ]);
+            let mp3_ok = run_output(&ffmpeg, &mp3_args, None, Duration::from_secs(180), None)
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+                && mp3_dest.is_file()
+                && fs::metadata(&mp3_dest).map(|m| m.len() > 256).unwrap_or(false);
+
+            let final_dest = if mp3_ok {
+                mp3_dest
+            } else {
+                let _ = fs::remove_file(&mp3_dest);
+                let m4a_dest =
+                    get_unique_destination_path(&audio_dir, &format!("{safe_title} - BGM.m4a"));
+                let m4a_args = os_args([
+                    "-y",
+                    "-i",
+                    &src.to_string_lossy(),
+                    "-vn",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-movflags",
+                    "+faststart",
+                    &m4a_dest.to_string_lossy(),
+                ]);
+                let m4a_ok = run_output(&ffmpeg, &m4a_args, None, Duration::from_secs(180), None)
+                    .map(|o| o.status.success())
+                    .unwrap_or(false)
+                    && m4a_dest.is_file()
+                    && fs::metadata(&m4a_dest).map(|m| m.len() > 256).unwrap_or(false);
+                if !m4a_ok {
+                    let _ = fs::remove_file(&m4a_dest);
+                    return Err("该视频不包含可提取的背景音乐音轨。".to_string());
+                }
+                m4a_dest
+            };
+
+            last_name = final_dest
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(ToString::to_string);
+            exported += 1;
+            continue;
+        }
+
         let ext = src
             .extension()
             .and_then(|e| e.to_str())
@@ -554,46 +661,65 @@ pub fn export_wallpaper_audio(
         };
         let dest = get_unique_destination_path(&audio_dir, &format!("{base_name}{ext}"));
         fs::copy(src, &dest).map_err(|e| format!("导出音频失败：{e}"))?;
-        last_name = dest.file_name().and_then(|n| n.to_str()).map(ToString::to_string);
+        last_name = dest
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(ToString::to_string);
         exported += 1;
     }
 
     Ok((exported, last_name))
 }
 
-pub fn is_archived_offline(item: &WallpaperItem, export_directory: &str) -> bool {
-    if let Some(we_dir) = try_find_install_directory(Some(&item.workshop_directory)) {
+pub fn collect_archived_workshop_ids(
+    hint_workshop_dir: Option<&str>,
+    export_directory: &str,
+) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    if let Some(we_dir) = try_find_install_directory(hint_workshop_dir) {
         let my_projects = we_dir.join("projects").join("myprojects");
-        let prefix = format!("WallPull_{}_", item.workshop_id);
         if let Ok(entries) = fs::read_dir(&my_projects) {
             for e in entries.flatten() {
-                if e.path().is_dir()
-                    && e.file_name()
-                        .to_str()
-                        .map(|n| n.starts_with(&prefix))
-                        .unwrap_or(false)
-                {
-                    return true;
+                if !e.path().is_dir() {
+                    continue;
+                }
+                if let Some(name) = e.file_name().to_str() {
+                    if let Some(rest) = name.strip_prefix("WallPull_") {
+                        if let Some((ws_id, _)) = rest.split_once('_') {
+                            if !ws_id.is_empty() {
+                                ids.insert(ws_id.to_string());
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
     let vault_dir = Path::new(export_directory).join("离线永久保险箱");
-    let needle = format!("[{}]", item.workshop_id);
     if let Ok(entries) = fs::read_dir(&vault_dir) {
         for e in entries.flatten() {
-            if e.path().is_dir()
-                && e.file_name()
-                    .to_str()
-                    .map(|n| n.contains(&needle))
-                    .unwrap_or(false)
-            {
-                return true;
+            if !e.path().is_dir() {
+                continue;
+            }
+            if let Some(name) = e.file_name().to_str() {
+                if let Some(start) = name.rfind('[') {
+                    if let Some(rel_end) = name[start + 1..].find(']') {
+                        let ws_id = name[start + 1..start + 1 + rel_end].trim();
+                        if !ws_id.is_empty() {
+                            ids.insert(ws_id.to_string());
+                        }
+                    }
+                }
             }
         }
     }
-    false
+    ids
+}
+
+pub fn is_archived_offline(item: &WallpaperItem, export_directory: &str) -> bool {
+    collect_archived_workshop_ids(Some(&item.workshop_directory), export_directory)
+        .contains(&item.workshop_id)
 }
 
 pub fn resolve_archive_directory(
@@ -705,13 +831,27 @@ where
         } else {
             format!("{safe_title} [{}]", item.workshop_id)
         };
-        let dest_dir = archive_base.join(folder_name);
+        let dest_dir = archive_base.join(&folder_name);
         if !dest_dir.exists() {
-            copy_dir_recursive(src_dir, &dest_dir)?;
+            let partial_dir = archive_base.join(format!(".{folder_name}.partial_{}", std::process::id()));
+            if partial_dir.exists() {
+                let _ = fs::remove_dir_all(&partial_dir);
+            }
+            if let Err(e) = copy_dir_recursive(src_dir, &partial_dir) {
+                let _ = fs::remove_dir_all(&partial_dir);
+                return Err(e);
+            }
             let src_pj = src_dir.join("project.json");
-            let dst_pj = dest_dir.join("project.json");
+            let dst_pj = partial_dir.join("project.json");
             if src_pj.is_file() {
-                rewrite_as_offline_project_json(&src_pj, &dst_pj, Some("[离线典藏] "))?;
+                if let Err(e) = rewrite_as_offline_project_json(&src_pj, &dst_pj, Some("[离线典藏] ")) {
+                    let _ = fs::remove_dir_all(&partial_dir);
+                    return Err(e);
+                }
+            }
+            if let Err(e) = fs::rename(&partial_dir, &dest_dir) {
+                let _ = fs::remove_dir_all(&partial_dir);
+                return Err(format!("写入离线典藏目录失败：{e}"));
             }
         }
         archived_ids.push(item.id.clone());
@@ -731,6 +871,7 @@ pub fn recycle_workshop_wallpapers(
     targets: &[WallpaperItem],
     allowed_roots: &[String],
     export_directory: &str,
+    also_delete_vault: bool,
 ) -> Result<(HashSet<String>, usize, usize, i64), String> {
     if targets.is_empty() {
         return Err("找不到可清理的创意工坊壁纸文件夹。".to_string());
@@ -738,6 +879,7 @@ pub fn recycle_workshop_wallpapers(
 
     let mut seen_dirs = HashSet::new();
     let mut validated: Vec<(PathBuf, String, i64)> = Vec::new();
+    let mut rejected_invalid = 0usize;
     for item in targets {
         if item.workshop_directory.trim().is_empty() {
             continue;
@@ -752,7 +894,8 @@ pub fn recycle_workshop_wallpapers(
             continue;
         }
         if !is_direct_child_of_allowed_root(&abs, allowed_roots) {
-            return Err(format!("拒绝删除非创意工坊根目录下的路径：{}", abs.display()));
+            rejected_invalid += 1;
+            continue;
         }
         let size = if item.folder_size > 0 {
             item.folder_size
@@ -763,6 +906,9 @@ pub fn recycle_workshop_wallpapers(
     }
 
     if validated.is_empty() {
+        if rejected_invalid > 0 {
+            return Err("拒绝删除非创意工坊根目录下的路径。".to_string());
+        }
         return Err("找不到可清理的创意工坊壁纸文件夹。".to_string());
     }
 
@@ -806,9 +952,14 @@ pub fn recycle_workshop_wallpapers(
         return Err("未能将所选壁纸移入回收站，请确认文件未被 Wallpaper Engine 或其他程序占用后重试。".to_string());
     }
 
-    cleanup_deleted_artifacts(&deleted_ws_ids, we_install.as_deref(), export_directory);
+    cleanup_deleted_artifacts(
+        &deleted_ws_ids,
+        we_install.as_deref(),
+        export_directory,
+        also_delete_vault,
+    );
 
-    let total_targets = validated.len();
+    let total_targets = validated.len() + rejected_invalid;
     let recycled_count = deleted_dirs.len();
     Ok((deleted_dirs, recycled_count, total_targets, freed_bytes))
 }
@@ -817,37 +968,40 @@ fn cleanup_deleted_artifacts(
     deleted_ws_ids: &HashSet<String>,
     we_install: Option<&Path>,
     export_directory: &str,
+    also_delete_vault: bool,
 ) {
     if deleted_ws_ids.is_empty() {
         return;
     }
-    if let Some(we_dir) = we_install {
-        let my_proj = we_dir.join("projects").join("myprojects");
-        if let Ok(entries) = fs::read_dir(&my_proj) {
+    if also_delete_vault {
+        if let Some(we_dir) = we_install {
+            let my_proj = we_dir.join("projects").join("myprojects");
+            if let Ok(entries) = fs::read_dir(&my_proj) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                        if deleted_ws_ids
+                            .iter()
+                            .any(|id| name.starts_with(&format!("WallPull_{id}_")))
+                        {
+                            let _ = try_send_to_recycle_bin(&p);
+                        }
+                    }
+                }
+            }
+        }
+
+        let vault_dir = Path::new(export_directory).join("离线永久保险箱");
+        if let Ok(entries) = fs::read_dir(&vault_dir) {
             for e in entries.flatten() {
                 let p = e.path();
                 if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
                     if deleted_ws_ids
                         .iter()
-                        .any(|id| name.starts_with(&format!("WallPull_{id}_")))
+                        .any(|id| name.contains(&format!("[{id}]")))
                     {
                         let _ = try_send_to_recycle_bin(&p);
                     }
-                }
-            }
-        }
-    }
-
-    let vault_dir = Path::new(export_directory).join("离线永久保险箱");
-    if let Ok(entries) = fs::read_dir(&vault_dir) {
-        for e in entries.flatten() {
-            let p = e.path();
-            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                if deleted_ws_ids
-                    .iter()
-                    .any(|id| name.contains(&format!("[{id}]")))
-                {
-                    let _ = try_send_to_recycle_bin(&p);
                 }
             }
         }
@@ -925,7 +1079,7 @@ pub fn try_send_to_recycle_bin(path: &Path) -> bool {
         wFunc: FO_DELETE,
         pFrom: PCWSTR(from_wide.as_ptr()),
         pTo: PCWSTR::null(),
-        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI).0 as u16,
+        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_WANTNUKEWARNING).0 as u16,
         fAnyOperationsAborted: false.into(),
         hNameMappings: std::ptr::null_mut(),
         lpszProgressTitle: PCWSTR::null(),
@@ -1001,7 +1155,7 @@ pub fn migrate_workshop_with_junction<FProgress>(
     primary_root: &str,
     picked_dest_base: &Path,
     mut on_progress: FProgress,
-) -> Result<(String, u64), String>
+) -> Result<(String, u64, bool, Option<String>), String>
 where
     FProgress: FnMut(&str),
 {
@@ -1081,9 +1235,18 @@ where
     }
 
     on_progress(&format!("正在复制工坊文件到 {}…", target_ws_dir.display()));
-    if let Err(e) = copy_dir_recursive(&src, &target_ws_dir) {
+    let (copied_files, copied_bytes) = match copy_dir_recursive_strict(&src, &target_ws_dir) {
+        Ok(counts) => counts,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&target_ws_dir);
+            return Err(e);
+        }
+    };
+    if copied_bytes < needed || (needed > 0 && copied_files == 0) {
         let _ = fs::remove_dir_all(&target_ws_dir);
-        return Err(e);
+        return Err(format!(
+            "复制校验未通过（期望至少 {needed} 字节，实际仅复制 {copied_bytes} 字节），已中止迁移并保护原目录。"
+        ));
     }
 
     let clean_src = strip_verbatim_prefix(&src.to_string_lossy());
@@ -1111,8 +1274,18 @@ where
         return Err(err);
     }
 
-    let _ = try_send_to_recycle_bin(&backup_orig);
-    Ok((target_ws_dir.to_string_lossy().into_owned(), needed))
+    let recycled_backup = try_send_to_recycle_bin(&backup_orig);
+    let kept_backup_path = if recycled_backup {
+        None
+    } else {
+        Some(backup_orig.to_string_lossy().into_owned())
+    };
+    Ok((
+        target_ws_dir.to_string_lossy().into_owned(),
+        copied_bytes,
+        recycled_backup,
+        kept_backup_path,
+    ))
 }
 
 pub fn create_ntfs_junction(junction_path: &Path, target_dir: &Path) -> Result<(), String> {
@@ -1349,7 +1522,8 @@ where
             continue;
         }
         if !try_send_to_recycle_bin(&bak) {
-            remove_file_with_retry(&bak);
+            // Keep backup file untouched if OS recycle bin failed or declined, instead of permanent delete
+            let _ = std::fs::File::open(&bak);
         }
         saved += old_bytes - new_bytes;
         slimmed += 1;
@@ -1467,16 +1641,25 @@ where
         }
 
         if matches!(fmt.as_str(), "png" | "jpg" | "webp") && !trim_transparency {
-            if let Ok(img) = image::open(src) {
-                let (ext, img_fmt) = match fmt.as_str() {
-                    "jpg" => ("jpg", ImageFormat::Jpeg),
-                    "webp" => ("webp", ImageFormat::WebP),
-                    _ => ("png", ImageFormat::Png),
-                };
-                let dest = get_unique_destination_path(&out_folder, &format!("{base_name}.{ext}"));
-                if img.save_with_format(&dest, img_fmt).is_ok() {
-                    success_count += 1;
-                    continue;
+            if let Ok(reader) = image::ImageReader::open(src) {
+                if let Ok(guessed) = reader.with_guessed_format() {
+                    if let Ok(img) = guessed.decode() {
+                        let (ext, img_fmt) = match fmt.as_str() {
+                            "jpg" => ("jpg", ImageFormat::Jpeg),
+                            "webp" => ("webp", ImageFormat::WebP),
+                            _ => ("png", ImageFormat::Png),
+                        };
+                        let dest = get_unique_destination_path(&out_folder, &format!("{base_name}.{ext}"));
+                        let out_img = if matches!(img_fmt, ImageFormat::Jpeg) {
+                            flatten_to_rgb8(&img)
+                        } else {
+                            img
+                        };
+                        if out_img.save_with_format(&dest, img_fmt).is_ok() {
+                            success_count += 1;
+                            continue;
+                        }
+                    }
                 }
             }
         }
@@ -1756,32 +1939,54 @@ where
     )))
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
-    copy_dir_recursive_inner(src, dst, 0)
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(usize, u64), String> {
+    copy_dir_recursive_inner(src, dst, 0, false)
 }
 
-fn copy_dir_recursive_inner(src: &Path, dst: &Path, depth: u32) -> Result<(), String> {
+fn copy_dir_recursive_strict(src: &Path, dst: &Path) -> Result<(usize, u64), String> {
+    copy_dir_recursive_inner(src, dst, 0, true)
+}
+
+fn copy_dir_recursive_inner(
+    src: &Path,
+    dst: &Path,
+    depth: u32,
+    fail_on_reparse: bool,
+) -> Result<(usize, u64), String> {
     if depth > 16 {
         return Err("目录嵌套层级过深，已中止复制以防止无限递归。".to_string());
     }
     fs::create_dir_all(dst).map_err(|e| format!("创建目录失败：{e}"))?;
     let entries = fs::read_dir(src).map_err(|e| format!("读取目录失败：{e}"))?;
-    for entry in entries.flatten() {
+    let mut file_count = 0usize;
+    let mut byte_count = 0u64;
+    for entry_res in entries {
+        let entry = entry_res.map_err(|e| format!("遍历目录项失败：{e}"))?;
         let p = entry.path();
         if is_reparse_point(&p) {
+            if fail_on_reparse {
+                return Err(format!(
+                    "目录中包含重解析点/符号链接 {}，已中止以防迁移遗漏或循环。",
+                    p.display()
+                ));
+            }
             continue;
         }
-        let Ok(meta) = fs::symlink_metadata(&p) else {
-            continue;
-        };
+        let meta = fs::symlink_metadata(&p)
+            .map_err(|e| format!("读取文件属性失败 {}：{e}", p.display()))?;
         let target = dst.join(entry.file_name());
         if meta.is_dir() {
-            copy_dir_recursive_inner(&p, &target, depth + 1)?;
+            let (c, b) = copy_dir_recursive_inner(&p, &target, depth + 1, fail_on_reparse)?;
+            file_count += c;
+            byte_count += b;
         } else if meta.is_file() {
-            fs::copy(&p, &target).map_err(|e| format!("复制文件失败：{e}"))?;
+            let copied = fs::copy(&p, &target)
+                .map_err(|e| format!("复制文件失败 {}：{e}", p.display()))?;
+            file_count += 1;
+            byte_count += copied;
         }
     }
-    Ok(())
+    Ok((file_count, byte_count))
 }
 
 pub fn resolve_target_items(

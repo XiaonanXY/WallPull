@@ -223,11 +223,29 @@ WallPull 独有的纯 Rust **2D 透视拆解台**（直接解析 `scene.pkg` 图
 
 在设置中把「顶栏与设置样式」切换为 **「分立按钮 + 右侧抽屉」** 后，右侧无遮罩抽屉常驻打开，左边画廊会自动避让重排——你可以一边调主题色、改 3D 倾斜手感，一边直接对着左边的壁纸实时看变化，所见即所得。
 
+### 19 · 全新毛玻璃视频悬浮 HUD（v1.0.3）
+
+<p align="center">
+  <img src="./docs/showcase/34-win-video-player-hud.png" alt="WallPull Windows 新版悬浮毛玻璃视频播放器与独立音量滑块" width="100%" />
+</p>
+
+v1.0.3 重写了详情页视频播放器控件：悬浮式 `rgba(15,15,20,0.72)` 磨砂深色胶囊内置高对比进度条、倍速切换（`0.5x`–`2x`）、单键全屏与**鼠标悬停上方垂直展开的静音/音量滑块**，支持滚轮、键盘方向键快进与 `Space` 暂停，全程不遮挡画面边缘。
+
 ---
 
-## WallPull iPad 随身端实机界面全览（21–33）
+### 20 · 2D 透视拆解台 · 左右拖动原图对比（v1.0.3）
 
-> 以下画面全部截取自 **WallPull iPad v1.0.2 实机运行效果**（支持 `iPadOS 15.4+`），覆盖画廊三套画幅布局、独立频段挑图、配乐电台、全屏详情分享与设置中心：
+<p align="center">
+  <img src="./docs/showcase/35-win-studio-compare.png" alt="WallPull Windows 2D 透视拆解台左右分隔原图对比滑块" width="100%" />
+</p>
+
+Windows 与 iPad 双端 **2D 透视拆解台** 同步新增 **「原图对比 / 退出对比」** 可拖动分界滑块，左侧实时对照工坊原图、右侧直观检视当前保留的透明立绘或隐藏开关效果；开启「导出透明立绘时自动裁切周围空白」后仍可一键导出纯净无白边立绘 PNG。
+
+---
+
+## WallPull iPad 随身端实机界面全览（21–41）
+
+> 以下画面全部截取自 **WallPull iPad v1.0.3 实机运行效果**（支持 `iPadOS 15.4+`），覆盖画廊三套画幅布局、4 位配对码跨端鉴权、配乐电台、全屏视频 BGM 提取、2D 透视拆解原图对比与设置中心：
 
 ### 21 · iPad 画廊总览（`16:10` 横屏卡片与 `WallPull PC` 实时连接态）
 
@@ -305,6 +323,42 @@ WallPull 独有的纯 Rust **2D 透视拆解台**（直接解析 `scene.pkg` 图
 
 <p align="center">
   <img src="./docs/showcase/33-ipad-settings-storage-about.png" alt="WallPull iPad 设置中心离线存储与 GPL-3.0 关于卡片" width="100%" />
+</p>
+
+### 34 · 跨端互联 · 4 位随机配对码安全鉴权（v1.0.3）
+
+<p align="center">
+  <img src="./docs/showcase/36-ipad-lan-pin-pairing.png" alt="WallPull iPad 4 位数字配对码弹窗与局域网双向令牌配对" width="100%" />
+</p>
+
+### 35 · 全屏视频播放器 · 内嵌音轨无损提取 BGM（v1.0.3）
+
+<p align="center">
+  <img src="./docs/showcase/37-ipad-video-player-bgm.png" alt="WallPull iPad 全屏视频播放器与一键提取视频内嵌 BGM 分享" width="100%" />
+</p>
+
+### 36 · iPad 2D 透视拆解台 · 双指缩放与原图实时对比（v1.0.3）
+
+<p align="center">
+  <img src="./docs/showcase/38-ipad-studio-compare.png" alt="WallPull iPad 2D 透视拆解台实时原图对比滑块" width="100%" />
+</p>
+
+### 37 · 多维筛选与排序浮层（v1.0.3）
+
+<p align="center">
+  <img src="./docs/showcase/39-ipad-filter-and-sort-v103.png" alt="WallPull iPad v1.0.3 多维规格与主色调筛选浮层" width="100%" />
+</p>
+
+### 38 · 设置中心与 `v1.0.3` 版本信息（v1.0.3）
+
+<p align="center">
+  <img src="./docs/showcase/40-ipad-settings-v103.png" alt="WallPull iPad v1.0.3 设置中心与版本号信息" width="100%" />
+</p>
+
+### 39 · 从电脑挑图入库 · 真瀑布流与差分量级同步（v1.0.3）
+
+<p align="center">
+  <img src="./docs/showcase/41-ipad-pc-catalog-v103.png" alt="WallPull iPad v1.0.3 从电脑挑图与同步状态角标" width="100%" />
 </p>
 
 ---

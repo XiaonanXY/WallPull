@@ -1247,13 +1247,21 @@ fn blit_puppet_mesh(
     let mut screen_y_fp = Vec::with_capacity(verts.len());
 
     for v in verts {
+        if !v.x.is_finite() || !v.y.is_finite() || !v.u.is_finite() || !v.v.is_finite() {
+            return;
+        }
         let sx = v.x * world.scale_x;
         let sy = v.y * world.scale_y;
         let wx = (world.x + sx * cos - sy * sin) * scale_factor;
         let wy = (world.y + sx * sin + sy * cos) * scale_factor;
         let py = (canvas_h as f32) - wy;
-        screen_x_fp.push((wx * 16.0).round() as i32);
-        screen_y_fp.push((py * 16.0).round() as i32);
+        if !wx.is_finite() || !py.is_finite() {
+            return;
+        }
+        let clamped_x = (wx * 16.0).round().clamp(-1_000_000.0, 1_000_000.0) as i32;
+        let clamped_y = (py * 16.0).round().clamp(-1_000_000.0, 1_000_000.0) as i32;
+        screen_x_fp.push(clamped_x);
+        screen_y_fp.push(clamped_y);
     }
 
     let src_max_x = tex.width - 1;
@@ -1263,12 +1271,13 @@ fn blit_puppet_mesh(
 
     for tri in mesh.indices.chunks_exact(3) {
         let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
-        let (x0, y0) = (screen_x_fp[i0], screen_y_fp[i0]);
-        let (mut x1, mut y1) = (screen_x_fp[i1], screen_y_fp[i1]);
-        let (mut x2, mut y2) = (screen_x_fp[i2], screen_y_fp[i2]);
+        let (x0, y0) = (screen_x_fp[i0] as i64, screen_y_fp[i0] as i64);
+        let (mut x1, mut y1) = (screen_x_fp[i1] as i64, screen_y_fp[i1] as i64);
+        let (mut x2, mut y2) = (screen_x_fp[i2] as i64, screen_y_fp[i2] as i64);
 
-        let mut area = ((x1 - x0) as i64) * ((y2 - y0) as i64)
-            - ((y1 - y0) as i64) * ((x2 - x0) as i64);
+        let mut area = (x1 - x0)
+            .saturating_mul(y2 - y0)
+            .saturating_sub((y1 - y0).saturating_mul(x2 - x0));
         if area == 0 {
             continue;
         }
@@ -1282,13 +1291,13 @@ fn blit_puppet_mesh(
             std::mem::swap(&mut y1, &mut y2);
             std::mem::swap(&mut u1, &mut u2);
             std::mem::swap(&mut v1, &mut v2);
-            area = -area;
+            area = area.saturating_neg();
         }
 
-        let min_px = ((x0.min(x1).min(x2) - 8) >> 4).max(0);
-        let max_px = ((x0.max(x1).max(x2) + 8) >> 4).min(canvas_w - 1);
-        let min_py = ((y0.min(y1).min(y2) - 8) >> 4).max(0);
-        let max_py = ((y0.max(y1).max(y2) + 8) >> 4).min(canvas_h - 1);
+        let min_px = (((x0.min(x1).min(x2) - 8) >> 4).max(0) as i32).min(canvas_w);
+        let max_px = (((x0.max(x1).max(x2) + 8) >> 4).min((canvas_w - 1) as i64)) as i32;
+        let min_py = (((y0.min(y1).min(y2) - 8) >> 4).max(0) as i32).min(canvas_h);
+        let max_py = (((y0.max(y1).max(y2) + 8) >> 4).min((canvas_h - 1) as i64)) as i32;
         if min_px > max_px || min_py > max_py {
             continue;
         }
@@ -1297,19 +1306,19 @@ fn blit_puppet_mesh(
         let (dx12, dy12) = (x2 - x1, y2 - y1);
         let (dx20, dy20) = (x0 - x2, y0 - y2);
 
-        let bias0 = if dy01 < 0 || (dy01 == 0 && dx01 > 0) { 0 } else { -1 };
-        let bias1 = if dy12 < 0 || (dy12 == 0 && dx12 > 0) { 0 } else { -1 };
-        let bias2 = if dy20 < 0 || (dy20 == 0 && dx20 > 0) { 0 } else { -1 };
+        let bias0: i64 = if dy01 < 0 || (dy01 == 0 && dx01 > 0) { 0 } else { -1 };
+        let bias1: i64 = if dy12 < 0 || (dy12 == 0 && dx12 > 0) { 0 } else { -1 };
+        let bias2: i64 = if dy20 < 0 || (dy20 == 0 && dx20 > 0) { 0 } else { -1 };
         let inv_area = 1.0f32 / (area as f32);
 
         for py in min_py..=max_py {
-            let sy = (py << 4) + 8;
+            let sy = ((py as i64) << 4) + 8;
             let row_off = (py as usize) * (canvas_w as usize) * 4;
             for px in min_px..=max_px {
-                let sx = (px << 4) + 8;
-                let e0 = (dx01 as i64) * ((sy - y0) as i64) - (dy01 as i64) * ((sx - x0) as i64);
-                let e1 = (dx12 as i64) * ((sy - y1) as i64) - (dy12 as i64) * ((sx - x1) as i64);
-                let e2 = (dx20 as i64) * ((sy - y2) as i64) - (dy20 as i64) * ((sx - x2) as i64);
+                let sx = ((px as i64) << 4) + 8;
+                let e0 = dx01.saturating_mul(sy - y0).saturating_sub(dy01.saturating_mul(sx - x0));
+                let e1 = dx12.saturating_mul(sy - y1).saturating_sub(dy12.saturating_mul(sx - x1));
+                let e2 = dx20.saturating_mul(sy - y2).saturating_sub(dy20.saturating_mul(sx - x2));
                 if e0 + bias0 < 0 || e1 + bias1 < 0 || e2 + bias2 < 0 {
                     continue;
                 }
@@ -1501,14 +1510,18 @@ fn try_parse_puppet_mesh(mdl: &[u8]) -> Option<PuppetMesh> {
 
     let v_flags_off = pos + 28;
     let v_flags = u32::from_le_bytes(mdl[v_flags_off..v_flags_off + 4].try_into().ok()?);
-    let v_byte_len = i32::from_le_bytes(mdl[v_flags_off + 4..v_flags_off + 8].try_into().ok()?) as usize;
+    let v_byte_len_raw = i32::from_le_bytes(mdl[v_flags_off + 4..v_flags_off + 8].try_into().ok()?);
+    if v_byte_len_raw <= 0 {
+        return None;
+    }
+    let v_byte_len = v_byte_len_raw as usize;
     let v_data_off = v_flags_off + 8;
 
     let (stride, uv_offset) = resolve_mdl_vertex_layout(v_flags, v_byte_len);
+    let v_end_plus_4 = v_data_off.checked_add(v_byte_len)?.checked_add(4)?;
     if stride == 0
-        || v_byte_len == 0
         || v_byte_len % stride != 0
-        || v_data_off + v_byte_len + 4 > mdl.len()
+        || v_end_plus_4 > mdl.len()
     {
         return None;
     }
@@ -1517,13 +1530,19 @@ fn try_parse_puppet_mesh(mdl: &[u8]) -> Option<PuppetMesh> {
         return None;
     }
 
-    let idx_byte_len = i32::from_le_bytes(
-        mdl[v_data_off + v_byte_len..v_data_off + v_byte_len + 4]
+    let idx_len_off = v_data_off + v_byte_len;
+    let idx_byte_len_raw = i32::from_le_bytes(
+        mdl[idx_len_off..idx_len_off + 4]
             .try_into()
             .ok()?,
-    ) as usize;
-    let idx_data_off = v_data_off + v_byte_len + 4;
-    if idx_byte_len < 6 || idx_byte_len % 6 != 0 || idx_data_off + idx_byte_len > mdl.len() {
+    );
+    if idx_byte_len_raw < 6 {
+        return None;
+    }
+    let idx_byte_len = idx_byte_len_raw as usize;
+    let idx_data_off = v_end_plus_4;
+    let idx_end = idx_data_off.checked_add(idx_byte_len)?;
+    if idx_byte_len % 6 != 0 || idx_end > mdl.len() {
         return None;
     }
 
@@ -1534,10 +1553,16 @@ fn try_parse_puppet_mesh(mdl: &[u8]) -> Option<PuppetMesh> {
         let y = f32::from_le_bytes(mdl[vo + 4..vo + 8].try_into().ok()?);
         let u = f32::from_le_bytes(mdl[vo + uv_offset..vo + uv_offset + 4].try_into().ok()?);
         let v = f32::from_le_bytes(mdl[vo + uv_offset + 4..vo + uv_offset + 8].try_into().ok()?);
+        if !x.is_finite() || !y.is_finite() || !u.is_finite() || !v.is_finite() {
+            return None;
+        }
         verts.push(PuppetVertex { x, y, u, v });
     }
 
     let index_count = idx_byte_len / 2;
+    if index_count > 3 * 65535 * 4 {
+        return None;
+    }
     let mut indices = Vec::with_capacity(index_count);
     for i in 0..index_count {
         let idx = u16::from_le_bytes(mdl[idx_data_off + i * 2..idx_data_off + i * 2 + 2].try_into().ok()?);
@@ -1805,5 +1830,22 @@ mod tests {
         let (_, tw, th) =
             try_trim_transparent_canvas(&rgba, 64, 64, 4).expect("non-empty crop");
         assert_eq!((tw, th), (18, 18));
+    }
+
+    #[test]
+    fn try_parse_puppet_mesh_rejects_negative_lengths_without_panicking() {
+        // Header: "MDLV0016\0" (9 bytes) + 8 bytes + mat_count=1 (4 bytes) + "m\0" (2 bytes) + 28 bytes mdl header
+        let mut mdl = Vec::new();
+        mdl.extend_from_slice(b"MDLV0016\0");
+        mdl.extend_from_slice(&[0u8; 8]);
+        mdl.extend_from_slice(&1i32.to_le_bytes());
+        mdl.extend_from_slice(b"m\0");
+        mdl.extend_from_slice(&[0u8; 28]); // pos + 28 = v_flags_off
+        mdl.extend_from_slice(&0u32.to_le_bytes()); // v_flags = 0 -> stride = 20
+        mdl.extend_from_slice(&60i32.to_le_bytes()); // v_byte_len = 60 (3 verts)
+        mdl.extend_from_slice(&[0u8; 60]);
+        mdl.extend_from_slice(&(-6i32).to_le_bytes()); // negative idx_byte_len
+        mdl.extend_from_slice(&[0u8; 16]);
+        assert!(try_parse_puppet_mesh(&mdl).is_none());
     }
 }

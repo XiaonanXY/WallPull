@@ -4,13 +4,16 @@ import { motion } from 'motion/react'
 import {
   ArrowsClockwise,
   Check,
+  Columns,
   Compass,
   Eye,
   MagnifyingGlass,
-  Trash,
   X,
 } from '@phosphor-icons/react'
 import { formatBytes } from '../appConfig.js'
+import HoldToConfirmButton from './ui/HoldToConfirmButton.jsx'
+import ImageCompareSlider from './ui/ImageCompareSlider.jsx'
+import RollingDigits from './ui/RollingDigits.jsx'
 
 export default function DuplicateInspectorDialog({
   open,
@@ -24,7 +27,7 @@ export default function DuplicateInspectorDialog({
   onClose,
 }) {
   const [selectedIds, setSelectedIds] = useState(() => new Set())
-  const [confirmStep, setConfirmStep] = useState(false)
+  const [compareState, setCompareState] = useState(null)
 
   const groups = useMemo(() => result?.groups ?? [], [result])
 
@@ -42,7 +45,7 @@ export default function DuplicateInspectorDialog({
 
   useEffect(() => {
     if (!open) {
-      setConfirmStep(false)
+      setCompareState(null)
       return undefined
     }
 
@@ -58,7 +61,7 @@ export default function DuplicateInspectorDialog({
 
   useEffect(() => {
     setSelectedIds(new Set(suggestedIds))
-    setConfirmStep(false)
+    setCompareState(null)
   }, [suggestedIds])
 
   const selectedBytes = useMemo(() => {
@@ -79,7 +82,6 @@ export default function DuplicateInspectorDialog({
   if (!open) return null
 
   const toggleId = id => {
-    setConfirmStep(false)
     setSelectedIds(prev => {
       const next = new Set(prev)
       if (next.has(id)) next.delete(id)
@@ -111,13 +113,13 @@ export default function DuplicateInspectorDialog({
             </div>
             <div>
               <h2 className="text-base font-semibold tracking-tight">相似与重复壁纸体检</h2>
-              <p className="text-xs text-base-content/60">
-                {loading
-                  ? '正在用感知视觉指纹比对全库壁纸…'
-                  : result
-                    ? `共检测 ${result.scannedCount} 个工坊壁纸 · 发现 ${groups.length} 组近似/重复项 · 预计可释放 ${formatBytes(result.totalReclaimableBytes)}`
-                    : '自动识别重传、低清晰度副本与同画面不同版本'}
-              </p>
+              {(loading || result) ? (
+                <p className="text-xs text-base-content/60">
+                  {loading
+                    ? '正在比对全库壁纸…'
+                    : `共检测 ${result.scannedCount} 个 · 发现 ${groups.length} 组重复 · 可释放 ${formatBytes(result.totalReclaimableBytes)}`}
+                </p>
+              ) : null}
             </div>
           </div>
 
@@ -151,13 +153,19 @@ export default function DuplicateInspectorDialog({
           ) : groups.length === 0 ? (
             <div className="flex flex-col items-center justify-center gap-2 rounded-2xl border border-base-300/70 bg-base-200/35 py-14 text-center">
               <Check size={34} weight="bold" className="text-success" />
-              <p className="text-base font-semibold">壁纸库非常干净，未发现重复或高度相似壁纸</p>
-              <p className="text-sm text-base-content/60">
-                当前 {result?.scannedCount ?? 0} 个壁纸包均无明显画面重复。
-              </p>
+              <p className="text-base font-semibold">壁纸库非常干净，未发现重复壁纸</p>
             </div>
           ) : (
-            groups.map((group, groupIdx) => (
+            groups.map((group, groupIdx) => {
+              const imageMembers = group.members.filter(m => m.item?.type !== 'video' && (m.item?.mediaUrl || m.item?.previewUrl))
+              const keepMember = imageMembers.find(m => m.recommendedKeep) || imageMembers[0]
+              const candidateMembers = imageMembers.filter(m => m.item?.id !== keepMember?.item?.id)
+              const canCompare = Boolean(keepMember && candidateMembers.length > 0)
+              const isComparing = compareState?.groupId === group.groupId && canCompare
+              const candIdx = isComparing ? Math.min(compareState.candidateIdx ?? 0, candidateMembers.length - 1) : 0
+              const activeCand = isComparing ? candidateMembers[candIdx] : null
+
+              return (
               <section
                 key={group.groupId}
                 className="rounded-2xl border border-base-300/80 bg-base-200/30 p-4"
@@ -166,18 +174,57 @@ export default function DuplicateInspectorDialog({
                   <div className="flex items-center gap-2">
                     <span className="badge badge-sm badge-neutral">第 {groupIdx + 1} 组</span>
                     <span className="text-sm font-semibold">{group.members.length} 项画面相似</span>
+                    {canCompare ? (
+                      <button
+                        type="button"
+                        className={`btn btn-xs rounded-full ${isComparing ? 'btn-primary' : 'btn-ghost'}`}
+                        onClick={() => setCompareState(isComparing ? null : { groupId: group.groupId, candidateIdx: 0 })}
+                      >
+                        <Columns size={13} weight="bold" />
+                        <span>{isComparing ? '收起对比' : '像素对比'}</span>
+                      </button>
+                    ) : null}
                   </div>
                   <span className="text-xs font-medium text-base-content/65">
-                    清理可节省约 {formatBytes(group.reclaimableBytes)}
+                    清理可节省约 <RollingDigits value={formatBytes(group.reclaimableBytes)} />
                   </span>
                 </div>
+
+                {isComparing && keepMember && activeCand ? (
+                  <div className="mb-4 rounded-2xl border border-base-300/70 bg-base-100/80 p-3">
+                    {candidateMembers.length > 1 ? (
+                      <div className="mb-2.5 flex flex-wrap items-center gap-1.5">
+                        <span className="text-[11px] font-medium text-base-content/60">对比目标：</span>
+                        {candidateMembers.map((cm, cIdx) => (
+                          <button
+                            key={cm.item.id}
+                            type="button"
+                            onClick={() => setCompareState({ groupId: group.groupId, candidateIdx: cIdx })}
+                            className={`btn btn-xs rounded-full ${cIdx === candIdx ? 'btn-primary' : 'btn-ghost'}`}
+                          >
+                            {cm.item.title}
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
+                    <ImageCompareSlider
+                      beforeSrc={keepMember.item.mediaUrl || keepMember.item.previewUrl}
+                      afterSrc={activeCand.item.mediaUrl || activeCand.item.previewUrl}
+                      beforeLabel={`保留最优 · ${keepMember.item.resolution || ''}`}
+                      afterLabel={`候选 · ${activeCand.item.resolution || ''}`}
+                      aspectRatio="16 / 9"
+                      className="max-h-72"
+                    />
+                  </div>
+                ) : null}
 
                 <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-3">
                   {group.members.map(member => {
                     const item = member.item
                     const checked = selectedIds.has(item.id)
-                    const thumb = item.previewUrl || item.mediaUrl
+                    const thumb = item.previewUrl || (item.type !== 'video' ? item.mediaUrl : '')
                     const diskBytes = item.folderSize || item.fileSize || 0
+                    const isLocalImported = String(item.workshopId || '').startsWith('99') && String(item.workshopId || '').length >= 15
 
                     return (
                       <div
@@ -192,7 +239,13 @@ export default function DuplicateInspectorDialog({
                       >
                         <div>
                           <div className="relative aspect-video w-full overflow-hidden rounded-xl bg-base-300/40">
-                            <img src={thumb} alt={item.title} className="h-full w-full object-cover" />
+                            {thumb ? (
+                              <img src={thumb} alt={item.title} className="h-full w-full object-cover" />
+                            ) : (
+                              <div className="flex h-full w-full items-center justify-center text-xs text-base-content/45">
+                                视频壁纸
+                              </div>
+                            )}
                             <span
                               className={`absolute top-2 left-2 rounded-full px-2 py-0.5 text-[11px] font-semibold backdrop-blur-md ${
                                 member.recommendedKeep
@@ -220,7 +273,7 @@ export default function DuplicateInspectorDialog({
                             {item.type === 'video' ? '视频' : '图片'} · {item.resolution || '未知分辨率'} · {formatBytes(diskBytes)}
                           </p>
                           <p className="text-[11px] text-base-content/45">
-                            工坊 ID: {item.workshopId}
+                            {isLocalImported ? '本地跨端入库' : `工坊 ID: ${item.workshopId}`}
                           </p>
                         </div>
 
@@ -233,15 +286,17 @@ export default function DuplicateInspectorDialog({
                             <Eye size={13} weight="bold" />
                             对比大图
                           </button>
-                          <button
-                            type="button"
-                            className="btn btn-xs btn-ghost"
-                            disabled={!isNative}
-                            onClick={() => onOpenWorkshop?.(item)}
-                          >
-                            <Compass size={13} weight="bold" />
-                            工坊退订
-                          </button>
+                          {!isLocalImported ? (
+                            <button
+                              type="button"
+                              className="btn btn-xs btn-ghost"
+                              disabled={!isNative}
+                              onClick={() => onOpenWorkshop?.(item)}
+                            >
+                              <Compass size={13} weight="bold" />
+                              工坊退订
+                            </button>
+                          ) : null}
                           {!member.recommendedKeep ? (
                             <button
                               type="button"
@@ -261,7 +316,8 @@ export default function DuplicateInspectorDialog({
                   })}
                 </div>
               </section>
-            ))
+              )
+            })
           )}
         </div>
 
@@ -273,7 +329,6 @@ export default function DuplicateInspectorDialog({
                   type="button"
                   className="btn btn-xs btn-ghost"
                   onClick={() => {
-                    setConfirmStep(false)
                     setSelectedIds(new Set(suggestedIds))
                   }}
                 >
@@ -283,7 +338,6 @@ export default function DuplicateInspectorDialog({
                   type="button"
                   className="btn btn-xs btn-ghost"
                   onClick={() => {
-                    setConfirmStep(false)
                     setSelectedIds(new Set())
                   }}
                 >
@@ -295,39 +349,16 @@ export default function DuplicateInspectorDialog({
           </div>
 
           <div className="flex items-center gap-2">
-            {confirmStep ? (
-              <>
-                <button
-                  type="button"
-                  className="btn btn-sm btn-ghost"
-                  onClick={() => setConfirmStep(false)}
-                >
-                  再想想
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-sm btn-error"
-                  disabled={!isNative || selectedIds.size === 0}
-                  onClick={() => {
-                    setConfirmStep(false)
-                    onRecycleIds?.([...selectedIds])
-                  }}
-                >
-                  <Trash size={14} weight="bold" />
-                  确认移入回收站 ({selectedIds.size} 项 · 省 {formatBytes(selectedBytes)})
-                </button>
-              </>
-            ) : (
-              <button
-                type="button"
-                className="btn btn-sm btn-error"
-                disabled={!isNative || selectedIds.size === 0 || loading}
-                onClick={() => setConfirmStep(true)}
-              >
-                <Trash size={14} weight="bold" />
-                清理选中冗余 ({selectedIds.size} 项 · {formatBytes(selectedBytes)})
-              </button>
-            )}
+            <HoldToConfirmButton
+              tone="danger"
+              duration={850}
+              disabled={!isNative || selectedIds.size === 0 || loading}
+              label={`按住移入回收站 (${selectedIds.size} 项 · ${formatBytes(selectedBytes)})`}
+              confirmedLabel="已移入回收站"
+              onConfirm={() => {
+                onRecycleIds?.([...selectedIds])
+              }}
+            />
           </div>
         </footer>
       </motion.div>

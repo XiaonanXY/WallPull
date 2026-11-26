@@ -110,11 +110,13 @@ struct WallPullSectionCard<Content: View>: View {
     let title: String
     var icon: String? = nil
     var badge: String? = nil
+    var contentPadding: CGFloat = 20
+    var contentSpacing: CGFloat = 14
     @ViewBuilder let content: () -> Content
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: contentSpacing) {
             HStack(spacing: 6) {
                 if let icon {
                     Image(systemName: icon)
@@ -137,7 +139,7 @@ struct WallPullSectionCard<Content: View>: View {
             }
             content()
         }
-        .padding(20)
+        .padding(contentPadding)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
@@ -152,7 +154,7 @@ struct WallPullSectionCard<Content: View>: View {
 
 struct WallPullSwitchRow: View {
     let title: String
-    let subtitle: String
+    var subtitle: String? = nil
     @Binding var isOn: Bool
     let accentColor: Color
 
@@ -161,9 +163,11 @@ struct WallPullSwitchRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(title)
                     .font(.system(size: 15, weight: .semibold))
-                Text(subtitle)
-                    .font(.system(size: 12.5))
-                    .foregroundColor(.secondary)
+                if let subtitle, !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.system(size: 12.5))
+                        .foregroundColor(.secondary)
+                }
             }
             Spacer(minLength: 10)
             Toggle("", isOn: $isOn)
@@ -239,6 +243,7 @@ struct WallPullColorSwatchRow: View {
 struct WallPullCenteredModal<Content: View>: View {
     var maxWidth: CGFloat = 960
     var maxHeight: CGFloat = 720
+    var hugContentHeight: Bool = false
     let onDismiss: () -> Void
     @ViewBuilder let content: () -> Content
     @Environment(\.colorScheme) private var colorScheme
@@ -246,21 +251,29 @@ struct WallPullCenteredModal<Content: View>: View {
     var body: some View {
         GeometryReader { geo in
             let w = min(maxWidth, max(320, geo.size.width - 44))
-            let h = min(maxHeight, max(360, geo.size.height - 48))
+            let h = min(maxHeight, max(240, geo.size.height - 28))
             ZStack {
                 Color.black.opacity(colorScheme == .dark ? 0.56 : 0.34)
                     .ignoresSafeArea()
                     .onTapGesture { onDismiss() }
 
-                content()
-                    .frame(width: w, height: h)
-                    .background(WallPullPalette.canvas(colorScheme))
-                    .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 24, style: .continuous)
-                            .strokeBorder(WallPullPalette.hairline(colorScheme), lineWidth: 1)
-                    )
-                    .shadow(color: .black.opacity(0.28), radius: 34, y: 14)
+                Group {
+                    if hugContentHeight {
+                        content()
+                            .frame(width: w)
+                            .frame(maxHeight: h)
+                    } else {
+                        content()
+                            .frame(width: w, height: h)
+                    }
+                }
+                .background(WallPullPalette.canvas(colorScheme))
+                .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .strokeBorder(WallPullPalette.hairline(colorScheme), lineWidth: 1)
+                )
+                .shadow(color: .black.opacity(0.28), radius: 34, y: 14)
             }
             .frame(width: geo.size.width, height: geo.size.height)
         }
@@ -295,21 +308,38 @@ struct WallPullTransferProgressCapsule: View {
     let onCancel: () -> Void
     @Environment(\.colorScheme) private var colorScheme
 
+    private var subtitleText: String? {
+        if let hint = progress.stageHint, !hint.isEmpty {
+            return progress.totalFiles > 0 ? "\(progress.currentFileIndex)/\(progress.totalFiles) · \(hint)" : hint
+        }
+        guard progress.totalFiles > 0 else { return nil }
+        if progress.totalBytes > 0 {
+            let sent = formatFileSize(progress.bytesTransferred)
+            let total = formatFileSize(progress.totalBytes)
+            let speed = progress.bytesPerSecond >= 102_400
+                ? String(format: " · %.1f MB/s", progress.bytesPerSecond / 1_048_576.0)
+                : ""
+            return "\(progress.currentFileIndex)/\(progress.totalFiles) · \(sent)/\(total)\(speed)"
+        }
+        return "\(progress.currentFileIndex)/\(progress.totalFiles) · \(Int((progress.fraction * 100).rounded()))%"
+    }
+
     var body: some View {
         HStack(spacing: 12) {
             ProgressView(value: min(1.0, max(0.03, progress.fraction)))
                 .progressViewStyle(.linear)
                 .tint(accentColor)
-                .frame(width: 90)
+                .frame(width: 110)
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(progress.title)
                     .font(.system(size: 12.5, weight: .semibold, design: .rounded))
                     .lineLimit(1)
-                if progress.totalFiles > 0 {
-                    Text("\(progress.currentFileIndex) / \(progress.totalFiles) · \(Int((progress.fraction * 100).rounded()))%")
+                if let sub = subtitleText {
+                    Text(sub)
                         .font(.system(size: 11, weight: .medium, design: .monospaced))
                         .foregroundColor(.secondary)
+                        .lineLimit(1)
                 }
             }
 
@@ -333,16 +363,25 @@ struct WallPullTransferProgressCapsule: View {
     }
 }
 
-struct FloatingMusicCapsule: View {
-    @ObservedObject var musicPlayer: MusicPlayerManager
-    @ObservedObject var vault: LocalVaultStore
-    @Environment(\.colorScheme) private var colorScheme
+struct MusicClockText: View {
+    @ObservedObject var clock: MusicPlaybackClock
 
     private func fmtClock(_ s: Double) -> String {
         guard s.isFinite && s > 0 else { return "0:00" }
         let t = Int(s)
         return String(format: "%d:%02d", t / 60, t % 60)
     }
+
+    var body: some View {
+        Text("\(fmtClock(clock.currentTime)) / \(fmtClock(clock.duration))")
+            .monospacedDigit()
+    }
+}
+
+struct FloatingMusicCapsule: View {
+    @ObservedObject var musicPlayer: MusicPlayerManager
+    @ObservedObject var vault: LocalVaultStore
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         if let track = musicPlayer.activeTrack {
@@ -363,8 +402,7 @@ struct FloatingMusicCapsule: View {
                                 .lineLimit(1)
                         }
                         Text("·")
-                        Text("\(fmtClock(musicPlayer.currentTime)) / \(fmtClock(musicPlayer.duration))")
-                            .monospacedDigit()
+                        MusicClockText(clock: musicPlayer.clock)
                     }
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
@@ -372,6 +410,12 @@ struct FloatingMusicCapsule: View {
                 .frame(maxWidth: 210, alignment: .leading)
 
                 HStack(spacing: 4) {
+                    Button { musicPlayer.toggleLoopMode() } label: {
+                        Image(systemName: musicPlayer.isLoopingSingle ? "repeat.1" : "repeat")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundColor(musicPlayer.isLoopingSingle ? vault.accentColor : .secondary)
+                            .frame(width: 28, height: 28)
+                    }
                     Button { musicPlayer.prevTrack() } label: {
                         Image(systemName: "backward.fill")
                             .font(.system(size: 12, weight: .bold))
@@ -411,37 +455,60 @@ struct FloatingMusicCapsule: View {
     }
 }
 
+private struct ObservedFeedbackFloatingLayer: View {
+    @ObservedObject var vault: LocalVaultStore
+    @ObservedObject var localSend: LocalSendService
+    @ObservedObject var musicPlayer: MusicPlayerManager
+    var bottomPadding: CGFloat
+    var hideFloatingOverlap: Bool
+
+    var body: some View {
+        let hasActiveMusic = musicPlayer.activeTrack != nil
+        let showCapsule = localSend.transferProgress != nil || (hasActiveMusic && !hideFloatingOverlap)
+        VStack(spacing: 8) {
+            if showCapsule {
+                UnifiedFloatingActivityCapsule(
+                    localSend: localSend,
+                    musicPlayer: musicPlayer,
+                    accentColor: vault.accentColor,
+                    hideMusicWhenObscured: hideFloatingOverlap
+                )
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+            if let toast = vault.toast {
+                WallPullToastCapsule(toast: toast)
+                    .allowsHitTesting(false)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.bottom, bottomPadding)
+        .zIndex(999)
+        .animation(.spring(response: 0.24, dampingFraction: 0.88), value: vault.toast)
+        .animation(.spring(response: 0.24, dampingFraction: 0.88), value: localSend.transferProgress != nil)
+        .animation(.spring(response: 0.22, dampingFraction: 0.9), value: showCapsule)
+    }
+}
+
 struct WallPullFeedbackOverlayModifier: ViewModifier {
     @ObservedObject var vault: LocalVaultStore
     @ObservedObject var localSend: LocalSendService
+    var musicPlayer: MusicPlayerManager? = nil
     var bottomPadding: CGFloat
+    var hideFloatingOverlap: Bool = false
 
     func body(content: Content) -> some View {
         ZStack(alignment: .bottom) {
             content
 
-            VStack(spacing: 8) {
-                if let progress = localSend.transferProgress {
-                    WallPullTransferProgressCapsule(
-                        progress: progress,
-                        accentColor: vault.accentColor,
-                        canCancel: localSend.canCancelTransfer,
-                        onCancel: { localSend.cancelActiveTransfer() }
-                    )
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-                }
-                if let toast = vault.toast {
-                    WallPullToastCapsule(toast: toast)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                }
-            }
-            .padding(.horizontal, 20)
-            .padding(.bottom, bottomPadding)
-            .allowsHitTesting(localSend.canCancelTransfer && localSend.transferProgress != nil)
-            .zIndex(999)
+            ObservedFeedbackFloatingLayer(
+                vault: vault,
+                localSend: localSend,
+                musicPlayer: musicPlayer ?? MusicPlayerManager.idlePlaceholder,
+                bottomPadding: bottomPadding,
+                hideFloatingOverlap: hideFloatingOverlap
+            )
         }
-        .animation(.spring(response: 0.28, dampingFraction: 0.86), value: vault.toast)
-        .animation(.spring(response: 0.28, dampingFraction: 0.86), value: localSend.transferProgress != nil)
     }
 }
 
@@ -449,12 +516,16 @@ extension View {
     func wallPullFeedbackOverlay(
         vault: LocalVaultStore,
         localSend: LocalSendService,
-        bottomPadding: CGFloat = 22
+        musicPlayer: MusicPlayerManager? = nil,
+        bottomPadding: CGFloat = 22,
+        hideFloatingOverlap: Bool = false
     ) -> some View {
         modifier(WallPullFeedbackOverlayModifier(
             vault: vault,
             localSend: localSend,
-            bottomPadding: bottomPadding
+            musicPlayer: musicPlayer,
+            bottomPadding: bottomPadding,
+            hideFloatingOverlap: hideFloatingOverlap
         ))
     }
 }
