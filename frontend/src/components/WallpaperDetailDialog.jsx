@@ -3,11 +3,13 @@ import { createPortal } from 'react-dom'
 import { AnimatePresence, animate, motion, useMotionValue, useTransform } from 'motion/react'
 import {
   ArrowSquareOut,
+  Camera,
   CaretDown,
   CaretLeft,
   CaretRight,
   Check,
   Copy,
+  Crop,
   Desktop,
   DeviceTablet,
   DownloadSimple,
@@ -31,16 +33,21 @@ import {
   formatBytes,
 } from '../appConfig.js'
 
-function parseResolutionRatio(resolution) {
+function parseResolutionDimensions(resolution) {
   if (typeof resolution === 'string') {
     const match = resolution.match(/(\d+)\s*[×xX]\s*(\d+)/)
     if (match) {
       const w = Number(match[1])
       const h = Number(match[2])
-      if (w > 0 && h > 0) return w / h
+      if (w > 0 && h > 0) return { w, h }
     }
   }
-  return 16 / 9
+  return null
+}
+
+function parseResolutionRatio(resolution) {
+  const dims = parseResolutionDimensions(resolution)
+  return dims ? dims.w / dims.h : 16 / 9
 }
 
 export default function WallpaperDetailDialog({
@@ -63,6 +70,8 @@ export default function WallpaperDetailDialog({
   onSendToTablet,
   onPushClipboardToTablet,
   onOpenLayerStudio,
+  onCaptureFrame,
+  onOpenCrop,
   onDelete,
   suppressHotkeys = false,
   onClose,
@@ -605,6 +614,7 @@ export default function WallpaperDetailDialog({
               videoElementRef={detailVideoRef}
               overrideImageSrc={activeImageSrc}
               onIntrinsicSize={handleIntrinsicSize}
+              onCaptureFrame={item.type === 'video' && onCaptureFrame ? (el => onCaptureFrame(el, item)) : null}
             />
           </div>
 
@@ -971,6 +981,34 @@ export default function WallpaperDetailDialog({
                 <Desktop size={15} weight="bold" />
                 设为桌面
               </button>
+              {item.type === 'video' && onCaptureFrame ? (
+                <button
+                  className="btn btn-ghost btn-sm gap-1"
+                  type="button"
+                  onClick={() => onCaptureFrame(detailVideoRef.current, item)}
+                >
+                  <Camera size={14} weight="bold" />
+                  截当前帧
+                </button>
+              ) : null}
+              {item.type !== 'video' && onOpenCrop ? (
+                <button
+                  className="btn btn-ghost btn-sm gap-1"
+                  type="button"
+                  onClick={() => onOpenCrop({
+                    src: activeImageSrc || item.mediaUrl || item.previewUrl,
+                    heading: `${item.title || '壁纸'} · 智能比例裁切`,
+                    suggestedName: item.title || 'wallpull-crop',
+                    sourceKind: 'wallpaper',
+                    wallpaperId: item.id,
+                    assetIndex: assetUrls ? assetIndex : null,
+                    nativeSize: parseResolutionDimensions(item.resolution),
+                  })}
+                >
+                  <Crop size={14} weight="bold" />
+                  比例裁切
+                </button>
+              ) : null}
               {hasVideoBgm ? (
                 <button
                   className="btn btn-ghost btn-sm gap-1"

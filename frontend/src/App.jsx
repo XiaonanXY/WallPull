@@ -20,11 +20,6 @@ import {
   X,
 } from '@phosphor-icons/react'
 import { AnimatePresence, motion } from 'motion/react'
-import { formatColor } from '@appica/ui-react'
-import {
-  ColorSwatchPicker,
-  ColorSwatchPickerItem,
-} from '@appica/ui-react/color-swatch-picker'
 import FusionDemo from './components/FusionDemo.jsx'
 import CardContextMenu from './components/CardContextMenu.jsx'
 import ClickSpark from './components/ClickSpark.jsx'
@@ -32,6 +27,9 @@ import DeleteConfirmDialog from './components/DeleteConfirmDialog.jsx'
 import DuplicateInspectorDialog from './components/DuplicateInspectorDialog.jsx'
 import SceneLayerStudioDialog from './components/SceneLayerStudioDialog.jsx'
 import SuperToolboxDialog from './components/SuperToolboxDialog.jsx'
+import VideoFrameCaptureDialog from './components/VideoFrameCaptureDialog.jsx'
+import ImageCropDialog from './components/ImageCropDialog.jsx'
+import FilterPopover from './components/FilterPopover.jsx'
 import FloatingActivityIsland from './components/ui/FloatingActivityIsland.jsx'
 import OtpPinInput from './components/ui/OtpPinInput.jsx'
 import StackedToaster from './components/ui/StackedToaster.jsx'
@@ -43,15 +41,13 @@ import WallpaperDetailDialog from './components/WallpaperDetailDialog.jsx'
 import TargetCursor from './components/reactbits/TargetCursor.jsx'
 import { preloadWallpaperBatch, resetRevealedMedia } from './utils/mediaRevealState.js'
 import { getCachedColorBucket, resetColorCache, sniffWallpaperColors } from './utils/colorSniffer.js'
+import { captureVideoFrameToPng } from './utils/videoFrameCapture.js'
 import {
   APP_INFO,
   COLOR_BUCKETS,
   DEFAULT_CARD_SIZE,
   DEFAULT_SETTINGS,
   MOCK_WALLPAPERS,
-  RATING_FILTERS,
-  SORT_MODES,
-  SPEC_FILTERS,
   TYPE_FILTERS,
   createRequestId,
   formatBytes,
@@ -70,7 +66,6 @@ export default function App() {
   const [specFilter, setSpecFilter] = useState('all')
   const [ratingFilter, setRatingFilter] = useState('all')
   const [colorFilter, setColorFilter] = useState(null)
-  const [hoveredColorBucket, setHoveredColorBucket] = useState(null)
   const [colorVersion, setColorVersion] = useState(0)
   const [sortBy, setSortBy] = useState('default')
   const [filterPopoverOpen, setFilterPopoverOpen] = useState(false)
@@ -97,11 +92,15 @@ export default function App() {
   const toastHoveredRef = useRef(false)
   const nextToastIdRef = useRef(1)
   const [sparkSizeText, setSparkSizeText] = useState(String(DEFAULT_SETTINGS.sparkSizePercent))
-  const [gridLayout, setGridLayout] = useState({
-    columns: 3,
-    rows: 2,
-    cardSize: DEFAULT_CARD_SIZE,
+  const [stageBounds, setStageBounds] = useState({
+    width: 1280,
+    height: 720,
+    viewportWidth: 1440,
   })
+  const [ffmpegStatus, setFfmpegStatus] = useState(null)
+  const [frameCaptureState, setFrameCaptureState] = useState(null)
+  const [cropState, setCropState] = useState(null)
+  const [cropActionSeq, setCropActionSeq] = useState(0)
   const [detectedWorkshopRoots, setDetectedWorkshopRoots] = useState([])
   const [gpuAdapters, setGpuAdapters] = useState([])
   const [activeHardwareAccelerationMode, setActiveHardwareAccelerationMode] = useState('gpu')
@@ -128,6 +127,7 @@ export default function App() {
   const activeToolboxRequestId = useRef(null)
   const latestUpdateCheckReqIdRef = useRef(null)
   const latestWePropsReqIdRef = useRef(null)
+  const latestSettingsSaveReqIdRef = useRef(null)
   const pairingPromptRef = useRef(null)
   pairingPromptRef.current = pairingPromptState
   const lastSelectedIdRef = useRef(null)
@@ -164,6 +164,9 @@ export default function App() {
     }
     if (type === 'app.check-update.request') {
       latestUpdateCheckReqIdRef.current = requestId
+    }
+    if (type === 'settings.update.request') {
+      latestSettingsSaveReqIdRef.current = requestId
     }
     if (type === 'settings.clear-cache.request') {
       resetRevealedMedia()
@@ -211,16 +214,18 @@ export default function App() {
 
   const savedSettingsRef = useRef(savedSettings)
   savedSettingsRef.current = savedSettings
+  const settingsRef = useRef(settings)
+  settingsRef.current = settings
 
   const persistSettings = useCallback((patchOrFull, uiSettings = null) => {
     const base = savedSettingsRef.current
     const nextSaved = { ...base, ...patchOrFull }
     const isPatchOnly = uiSettings === null && Object.keys(patchOrFull || {}).length < Object.keys(base || {}).length
-    const nextUi = uiSettings ?? (isPatchOnly ? { ...settings, ...patchOrFull } : nextSaved)
+    const nextUi = uiSettings ?? (isPatchOnly ? { ...settingsRef.current, ...patchOrFull } : nextSaved)
     setSettings(nextUi)
     setSavedSettings(nextSaved)
     sendNativeMessage('settings.update.request', nextSaved)
-  }, [sendNativeMessage, settings])
+  }, [sendNativeMessage])
 
   const updateFilterPreferences = useCallback(patch => {
     const nextMedia = patch.mediaFilter !== undefined ? patch.mediaFilter : filter
@@ -234,6 +239,8 @@ export default function App() {
     if (patch.ratingFilter !== undefined) setRatingFilter(nextRating)
     if (patch.sortBy !== undefined) setSortBy(nextSort)
     if (patch.colorFilter !== undefined) setColorFilter(nextColor)
+    setCurrentPage(1)
+    setSelectedIds(prev => (prev.length ? [] : prev))
 
     persistSettings({
       mediaFilter: nextMedia,
@@ -433,7 +440,15 @@ export default function App() {
         if (typeof message.payload?.appVersion === 'string' && message.payload.appVersion.trim()) {
           setAppVersion(message.payload.appVersion.trim())
         }
+        if (message.payload?.ffmpegStatus) {
+          setFfmpegStatus(message.payload.ffmpegStatus)
+        }
         sendNativeMessage('localsend.status.request', {})
+      }
+      if (message.type === 'ffmpeg.status') {
+        if (message.payload) {
+          setFfmpegStatus(message.payload)
+        }
       }
       if (message.type === 'window.state') {
         if (typeof message.payload?.maximized === 'boolean') {
@@ -441,9 +456,41 @@ export default function App() {
         }
       }
       if (message.type === 'settings.value') {
-        setSettings(previous => ({ ...previous, ...message.payload }))
-        setSavedSettings(previous => ({ ...previous, ...message.payload }))
-        setSparkSizeText(String(message.payload?.sparkSizePercent ?? 0))
+        if (
+          latestSettingsSaveReqIdRef.current &&
+          message.requestId &&
+          message.requestId !== latestSettingsSaveReqIdRef.current
+        ) {
+          return
+        }
+        const incoming = message.payload || {}
+        const entries = Object.entries(incoming)
+        const sameValue = (a, b) => {
+          if (a === b) return true
+          if (Array.isArray(a) && Array.isArray(b)) {
+            return a.length === b.length && a.every((v, idx) => v === b[idx])
+          }
+          return false
+        }
+        setSavedSettings(previous => {
+          const changed = entries.some(([k, v]) => !sameValue(previous[k], v))
+          return changed ? { ...previous, ...incoming } : previous
+        })
+        setSettings(previous => {
+          let changed = false
+          const next = { ...previous }
+          for (const [k, v] of entries) {
+            if ((previous[k] ?? '') === (savedSettingsRef.current[k] ?? '') && !sameValue(previous[k], v)) {
+              next[k] = v
+              changed = true
+            }
+          }
+          return changed ? next : previous
+        })
+        if ((settingsRef.current.sparkSizePercent ?? '') === (savedSettingsRef.current.sparkSizePercent ?? '')) {
+          const nextSparkText = String(incoming.sparkSizePercent ?? 0)
+          setSparkSizeText(prev => (prev === nextSparkText ? prev : nextSparkText))
+        }
       }
       if (message.type === 'wallpapers.scan.status') {
         const msg = message.payload?.message ?? '正在扫描…'
@@ -585,7 +632,11 @@ export default function App() {
           })
         }
       }
+      if (message.type === 'media.crop-action.cancelled') {
+        setCropActionSeq(seq => seq + 1)
+      }
       if (message.type === 'wallpapers.action.result') {
+        setCropActionSeq(seq => seq + 1)
         if (activeToolboxRequestId.current && message.requestId === activeToolboxRequestId.current) {
           activeToolboxRequestId.current = null
           setToolboxBusy(false)
@@ -714,6 +765,7 @@ export default function App() {
         }
       }
       if (message.type === 'error') {
+        setCropActionSeq(seq => seq + 1)
         if (latestUpdateCheckReqIdRef.current && message.requestId === latestUpdateCheckReqIdRef.current) {
           latestUpdateCheckReqIdRef.current = null
           setCheckingUpdate(false)
@@ -876,6 +928,41 @@ export default function App() {
     return matched
   }, [colorFilter, colorVersion, contextFilteredWallpapers, sortBy])
 
+  const galleryCardLayout = settings.galleryCardLayout || 'square'
+
+  const gridLayout = useMemo(() => {
+    const availableHeight = Math.max(220, stageBounds.height - 74)
+    const availableWidth = Math.max(0, stageBounds.width - 16)
+
+    let cardSize = DEFAULT_CARD_SIZE
+    let cardHeight = DEFAULT_CARD_SIZE
+    let maxCols = 5
+
+    if (galleryCardLayout === 'widescreen' || galleryCardLayout === 'adaptive') {
+      cardSize = availableHeight >= 610 ? 300 : (availableHeight >= 496 ? 252 : 224)
+      cardHeight = Math.round(cardSize * 0.625)
+      maxCols = 4
+    } else {
+      cardSize = availableHeight >= 610
+        ? DEFAULT_CARD_SIZE
+        : (availableHeight >= 496
+          ? 186
+          : Math.max(176, Math.min(DEFAULT_CARD_SIZE, availableHeight - 72)))
+      cardHeight = cardSize
+      maxCols = 5
+    }
+
+    const rows = availableHeight >= 496 ? 2 : 1
+    const columnGap = Math.max(42, Math.min(stageBounds.viewportWidth * 0.05, 82))
+    const roundedGap = Math.round(columnGap)
+    const columns = Math.max(
+      2,
+      Math.min(maxCols, Math.floor((availableWidth + columnGap) / (cardSize + columnGap))),
+    )
+
+    return { columns, rows, cardSize, cardHeight, columnGap: roundedGap }
+  }, [galleryCardLayout, stageBounds.height, stageBounds.viewportWidth, stageBounds.width])
+
   const effectiveColumns = Math.max(2, gridLayout.columns)
   const pageSize = effectiveColumns * gridLayout.rows
   const pageCount = Math.max(1, Math.ceil(filteredWallpapers.length / pageSize))
@@ -888,8 +975,7 @@ export default function App() {
   useEffect(() => {
     if (filteredWallpapers.length === 0) return
     const nextStart = safePage * pageSize
-    preloadWallpaperBatch(filteredWallpapers, nextStart, pageSize * 2)
-    preloadWallpaperBatch(filteredWallpapers, 0, Math.min(filteredWallpapers.length, 48))
+    preloadWallpaperBatch(filteredWallpapers, nextStart, pageSize)
   }, [filteredWallpapers, pageSize, safePage])
 
   const paginationItems = useMemo(() => {
@@ -910,45 +996,75 @@ export default function App() {
     const element = stageSectionRef.current
     if (!element) return undefined
 
-    const updateLayout = () => {
+    const measure = () => {
       if (element.clientWidth <= 0 || element.clientHeight <= 0) return
-      const availableHeight = Math.max(220, element.clientHeight - 74)
-      let rows = 2
-      let cardSize = DEFAULT_CARD_SIZE
-      if (availableHeight >= 610) {
-        rows = 2
-        cardSize = DEFAULT_CARD_SIZE
-      } else if (availableHeight >= 496) {
-        rows = 2
-        cardSize = 186
-      } else {
-        rows = 1
-        cardSize = Math.max(176, Math.min(DEFAULT_CARD_SIZE, availableHeight - 72))
-      }
-
-      const availableWidth = Math.max(0, element.clientWidth - 16)
-      const columnGap = Math.max(42, Math.min(globalThis.innerWidth * 0.05, 82))
-      const columns = Math.max(
-        2,
-        Math.min(5, Math.floor((availableWidth + columnGap) / (cardSize + columnGap))),
-      )
-
-      setGridLayout(prev =>
-        prev.columns === columns && prev.rows === rows && prev.cardSize === cardSize
+      const nextWidth = element.clientWidth
+      const nextHeight = element.clientHeight
+      const nextViewportWidth = globalThis.innerWidth || nextWidth
+      setStageBounds(prev =>
+        prev.width === nextWidth &&
+        prev.height === nextHeight &&
+        prev.viewportWidth === nextViewportWidth
           ? prev
-          : { columns, rows, cardSize },
+          : { width: nextWidth, height: nextHeight, viewportWidth: nextViewportWidth },
       )
     }
 
-    updateLayout()
-    const observer = new ResizeObserver(updateLayout)
+    measure()
+    const observer = new ResizeObserver(measure)
     observer.observe(element)
-    return () => observer.disconnect()
+    globalThis.addEventListener('resize', measure, { passive: true })
+    return () => {
+      observer.disconnect()
+      globalThis.removeEventListener('resize', measure)
+    }
   }, [])
 
+  const prevPageSizeRef = useRef(pageSize)
   useEffect(() => {
-    setCurrentPage(1)
+    const prevSize = prevPageSizeRef.current
+    if (prevSize !== pageSize) {
+      prevPageSizeRef.current = pageSize
+      setCurrentPage(prevPage => {
+        const firstIdx = Math.max(0, (prevPage - 1) * prevSize)
+        return Math.floor(firstIdx / pageSize) + 1
+      })
+    }
   }, [pageSize])
+
+  const handleCaptureVideoFrame = useCallback((videoEl, item) => {
+    try {
+      const cap = captureVideoFrameToPng(videoEl)
+      setFrameCaptureState({
+        capture: cap,
+        heading: `${item?.title || '视频'} · 截帧`,
+        suggestedName: item?.title || 'wallpull-frame',
+      })
+    } catch (err) {
+      showToast(err?.message || '截取当前视频帧失败')
+    }
+  }, [showToast])
+
+  const handlePngAction = useCallback((mode, dataUrl, stem) => {
+    if (!isNative || !dataUrl) return
+    sendNativeMessage('media.png-action.request', { mode, dataUrl, stem })
+  }, [isNative, sendNativeMessage])
+
+  const handleCropAction = useCallback((mode, rect, stem) => {
+    if (!isNative || !cropState) return
+    sendNativeMessage('media.crop-action.request', {
+      sourceKind: cropState.sourceKind || 'dataUrl',
+      wallpaperId: cropState.wallpaperId ?? null,
+      assetIndex: cropState.assetIndex ?? null,
+      layerIndices: cropState.layerIndices ?? null,
+      trimBounds: Boolean(cropState.trimBounds),
+      includeBackground: Boolean(cropState.includeBackground),
+      dataUrl: cropState.dataUrl ?? null,
+      rect,
+      mode,
+      stem,
+    })
+  }, [cropState, isNative, sendNativeMessage])
 
   useEffect(() => {
     const hasBlockingModal = Boolean(
@@ -958,7 +1074,9 @@ export default function App() {
       toolboxOpen ||
       deleteTargets.length > 0 ||
       peerPickerState ||
-      pairingPromptState,
+      pairingPromptState ||
+      frameCaptureState ||
+      cropState,
     )
     const onKeyDown = event => {
       if (event.key === 'Escape') {
@@ -1044,7 +1162,7 @@ export default function App() {
     }
     globalThis.addEventListener('keydown', onKeyDown, true)
     return () => globalThis.removeEventListener('keydown', onKeyDown, true)
-  }, [contextMenu, deleteTargets.length, detailItem, dupState.open, filterPopoverOpen, filteredWallpapers, isNative, page, pageCount, pairingPromptState, peerPickerState, selectedIds, studioState.open, toolboxOpen, wallpapers])
+  }, [contextMenu, cropState, deleteTargets.length, detailItem, dupState.open, filterPopoverOpen, filteredWallpapers, frameCaptureState, isNative, page, pageCount, pairingPromptState, peerPickerState, selectedIds, studioState.open, toolboxOpen, wallpapers])
 
   useEffect(() => {
     const section = stageSectionRef.current
@@ -1063,7 +1181,9 @@ export default function App() {
         contextMenu ||
         deleteTargets.length > 0 ||
         peerPickerState ||
-        pairingPromptState
+        pairingPromptState ||
+        frameCaptureState ||
+        cropState
       ) return
 
       const scroller = section.querySelector('.fusion-stage')
@@ -1087,7 +1207,7 @@ export default function App() {
     }
     section.addEventListener('wheel', onWheel, { passive: true })
     return () => section.removeEventListener('wheel', onWheel)
-  }, [contextMenu, deleteTargets.length, detailItem, dupState.open, filterPopoverOpen, page, pageCount, pairingPromptState, peerPickerState, studioState.open, toolboxOpen])
+  }, [contextMenu, cropState, deleteTargets.length, detailItem, dupState.open, filterPopoverOpen, frameCaptureState, page, pageCount, pairingPromptState, peerPickerState, studioState.open, toolboxOpen])
 
   const detailIndex = useMemo(
     () => (detailItem ? filteredWallpapers.findIndex(item => item.id === detailItem.id) : -1),
@@ -1374,7 +1494,15 @@ export default function App() {
     })
   }, [deleteTargets, isNative, sendNativeMessage])
 
-  const hasActiveFilter = sortBy !== 'default' || specFilter !== 'all' || ratingFilter !== 'all' || Boolean(colorFilter)
+  const activeFilterCount =
+    (sortBy !== 'default' ? 1 : 0) +
+    (specFilter !== 'all' ? 1 : 0) +
+    (ratingFilter !== 'all' ? 1 : 0) +
+    (colorFilter ? 1 : 0)
+  const hasActiveFilter = activeFilterCount > 0
+  const activeColorBucket = colorFilter
+    ? COLOR_BUCKETS.find(b => b.value === colorFilter) ?? null
+    : null
 
   const isSettingsDirty = useMemo(() => {
     const keys = Object.keys(DEFAULT_SETTINGS)
@@ -1400,6 +1528,17 @@ export default function App() {
     root.setAttribute('data-theme', isDark ? 'wallpaper-vault-dark' : 'wallpaper-vault')
     root.classList.toggle('dark', isDark)
     root.style.setProperty('--color-primary', sparkColor)
+    root.style.setProperty('--primary', sparkColor)
+    root.style.setProperty('--primary-strong', sparkColor)
+    root.style.setProperty('--ring', sparkColor)
+    root.style.setProperty(
+      '--primary-subtle',
+      `color-mix(in oklab, ${sparkColor} ${isDark ? 18 : 10}%, transparent)`,
+    )
+    root.style.setProperty(
+      '--primary-soft',
+      `color-mix(in oklab, ${sparkColor} ${isDark ? 26 : 16}%, transparent)`,
+    )
     root.style.setProperty('--color-secondary', sparkColor)
     root.style.setProperty('--color-accent', sparkColor)
     root.style.setProperty('--selection-accent', sparkColor)
@@ -1409,6 +1548,7 @@ export default function App() {
     )
     const contentColor = readableTextColor(sparkColor)
     root.style.setProperty('--color-primary-content', contentColor)
+    root.style.setProperty('--primary-foreground', contentColor)
     root.style.setProperty('--color-secondary-content', contentColor)
     root.style.setProperty('--color-accent-content', contentColor)
   }, [isDark, sparkColor])
@@ -1678,11 +1818,30 @@ export default function App() {
                     </button>
                   ) : null}
                 </div>
+                {activeColorBucket ? (
+                  <button
+                    type="button"
+                    aria-label={`清除主色调筛选：${activeColorBucket.label}`}
+                    onClick={() => updateFilterPreferences({ colorFilter: null })}
+                    className="inline-flex h-8 items-center gap-1.5 rounded-full border border-base-300/80 bg-base-200/75 px-2.5 text-xs font-medium text-base-content/85 transition-colors hover:bg-base-200"
+                  >
+                    <span
+                      className="h-2.5 w-2.5 shrink-0 rounded-full ring-1 ring-black/15"
+                      style={{ backgroundColor: activeColorBucket.swatch }}
+                    />
+                    <span>{activeColorBucket.label}</span>
+                    <X size={12} weight="bold" className="text-base-content/55" />
+                  </button>
+                ) : null}
                 <div ref={filterPopoverRef} className="relative">
                   <button
                     type="button"
                     className={`btn btn-sm gap-1.5 ${
-                      hasActiveFilter || filterPopoverOpen ? 'bg-primary/14 text-primary' : 'btn-ghost'
+                      hasActiveFilter
+                        ? 'bg-primary/12 text-[var(--color-primary-ink)] border border-primary/28 pr-2.5 pl-3'
+                        : filterPopoverOpen
+                          ? 'bg-base-100 text-[var(--color-primary-ink)] border border-primary/35 shadow-xs'
+                          : 'btn-ghost'
                     }`}
                     aria-expanded={filterPopoverOpen}
                     onClick={() => setFilterPopoverOpen(prev => !prev)}
@@ -1690,145 +1849,34 @@ export default function App() {
                     <FadersHorizontal size={15} weight="bold" />
                     <span>筛选与排序</span>
                     {hasActiveFilter ? (
-                      <span className="h-1.5 w-1.5 rounded-full bg-primary" aria-hidden="true" />
+                      <span className="inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-primary px-1 text-[11px] font-bold leading-none text-primary-content tabular-nums">
+                        {activeFilterCount}
+                      </span>
                     ) : null}
                   </button>
-                  <AnimatePresence>
-                    {filterPopoverOpen ? (
-                      <motion.div
-                        className="filter-popover space-y-3.5"
-                        initial={{ opacity: 0, y: -6, scale: 0.97 }}
-                        animate={{ opacity: 1, y: 0, scale: 1 }}
-                        exit={{ opacity: 0, y: -4, scale: 0.98 }}
-                        transition={{ duration: 0.14 }}
-                      >
-                        <div className="space-y-1.5">
-                          <p className="text-[11px] font-semibold text-base-content/55 uppercase">排序方式</p>
-                          <div className="flex flex-wrap gap-1">
-                            {SORT_MODES.map(opt => (
-                              <button
-                                key={opt.value}
-                                type="button"
-                                className={`btn btn-xs h-7 px-2.5 ${
-                                  sortBy === opt.value ? 'btn-primary' : 'btn-ghost'
-                                }`}
-                                onClick={() => updateFilterPreferences({ sortBy: opt.value })}
-                              >
-                                {opt.label}
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-                        <div className="space-y-1.5">
-                          <p className="text-[11px] font-semibold text-base-content/55 uppercase">规格与特性</p>
-                          <div className="flex flex-wrap gap-1">
-                            {SPEC_FILTERS.map(opt => (
-                              <button
-                                key={opt.value}
-                                type="button"
-                                className={`btn btn-xs h-7 px-2.5 ${
-                                  specFilter === opt.value ? 'btn-primary' : 'btn-ghost'
-                                }`}
-                                onClick={() => updateFilterPreferences({ specFilter: opt.value })}
-                              >
-                                {opt.label}
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-                        <div className="space-y-1.5">
-                          <p className="text-[11px] font-semibold text-base-content/55 uppercase">内容分级筛选</p>
-                          <div className="flex flex-wrap gap-1">
-                            {RATING_FILTERS.map(opt => (
-                              <button
-                                key={opt.value}
-                                type="button"
-                                className={`btn btn-xs h-7 px-2.5 ${
-                                  ratingFilter === opt.value ? 'btn-primary' : 'btn-ghost'
-                                }`}
-                                onClick={() => updateFilterPreferences({ ratingFilter: opt.value })}
-                              >
-                                {opt.label}
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-                        <div className="space-y-2">
-                          <div className="flex items-center justify-between gap-2">
-                            <p className="text-[11px] font-semibold text-base-content/55 uppercase">主色调筛选</p>
-                            {colorIndexProgress.running || scanProgress?.phase === 'color-index' ? (
-                              <LatticeLoader
-                                status="working"
-                                pattern="dots"
-                                grid={3}
-                                cellSize={3}
-                                gap={1.5}
-                                fontSize={11}
-                                color={sparkColor}
-                                label="索引中"
-                                showTimer={false}
-                              />
-                            ) : (() => {
-                              const activeBucket = COLOR_BUCKETS.find(b => b.value === (hoveredColorBucket ?? colorFilter))
-                              return activeBucket ? (
-                                <span className="text-[11px] font-medium text-primary tabular-nums">
-                                  {activeBucket.label} · {colorCounts[activeBucket.value] || 0} 项
-                                </span>
-                              ) : null
-                            })()}
-                          </div>
-                          <ColorSwatchPicker
-                            aria-label="按主色调筛选"
-                            shape="circle"
-                            size={34}
-                            className="w-full justify-between"
-                            value={COLOR_BUCKETS.find(b => b.value === colorFilter)?.swatch ?? '#00000000'}
-                            onValueChange={picked => {
-                              const hex = String(formatColor(picked, 'hex') || '').toLowerCase()
-                              const matched = COLOR_BUCKETS.find(b => b.swatch.toLowerCase() === hex)
-                              if (matched) {
-                                updateFilterPreferences({ colorFilter: matched.value })
-                              }
-                            }}
-                          >
-                            {COLOR_BUCKETS.map(bucket => (
-                              <ColorSwatchPickerItem
-                                key={bucket.value}
-                                color={bucket.swatch}
-                                colorName={bucket.label}
-                                onMouseEnter={() => setHoveredColorBucket(bucket.value)}
-                                onMouseLeave={() => setHoveredColorBucket(prev => (prev === bucket.value ? null : prev))}
-                                onClick={event => {
-                                  event.preventDefault()
-                                  updateFilterPreferences({
-                                    colorFilter: colorFilter === bucket.value ? null : bucket.value,
-                                  })
-                                }}
-                              />
-                            ))}
-                          </ColorSwatchPicker>
-                        </div>
-                        {hasActiveFilter ? (
-                          <div className="flex justify-end border-t border-base-300/60 pt-2">
-                            <button
-                              type="button"
-                              className="btn btn-ghost btn-xs"
-                              onClick={() => {
-                                updateFilterPreferences({
-                                  sortBy: 'default',
-                                  specFilter: 'all',
-                                  ratingFilter: 'all',
-                                  colorFilter: null,
-                                })
-                              }}
-                            >
-                              重置全部筛选
-                            </button>
-                          </div>
-                        ) : null}
-                      </motion.div>
-                    ) : null}
-                  </AnimatePresence>
+                  <FilterPopover
+                    open={filterPopoverOpen}
+                    galleryCardLayout={galleryCardLayout}
+                    sortBy={sortBy}
+                    specFilter={specFilter}
+                    ratingFilter={ratingFilter}
+                    colorFilter={colorFilter}
+                    activeFilterCount={activeFilterCount}
+                    hasActiveFilter={hasActiveFilter}
+                    colorCounts={colorCounts}
+                    colorIndexRunning={colorIndexProgress.running || scanProgress?.phase === 'color-index'}
+                    sparkColor={sparkColor}
+                    onChangeCardLayout={nextLayout => persistSettings({ galleryCardLayout: nextLayout })}
+                    onUpdateFilters={updateFilterPreferences}
+                    onResetFilters={() => {
+                      updateFilterPreferences({
+                        sortBy: 'default',
+                        specFilter: 'all',
+                        ratingFilter: 'all',
+                        colorFilter: null,
+                      })
+                    }}
+                  />
                 </div>
               </div>
             </section>
@@ -1866,7 +1914,10 @@ export default function App() {
                 <FusionDemo
                   items={visibleWallpapers}
                   mode={settings.cardMode}
+                  layoutMode={galleryCardLayout}
                   cardSize={gridLayout.cardSize}
+                  cardHeight={gridLayout.cardHeight}
+                  columnGap={gridLayout.columnGap}
                   gridColumns={effectiveColumns}
                   selectionBorderMode={settings.selectionBorderMode}
                   badgeScheme={settings.showArchivedBadge ? 'C' : 'B'}
@@ -1877,17 +1928,15 @@ export default function App() {
                   selectedIds={selectedIds}
                   onToggleSelect={toggleSelection}
                   onSelect={openDetails}
-                  skeletonCount={loading ? Math.max(0, pageSize - visibleWallpapers.length) : 0}
+                  skeletonCount={loading && wallpapers.length === 0 ? pageSize : 0}
                   isDark={isDark}
                   paused={
-                    page !== 'library' ||
                     Boolean(detailItem) ||
                     studioState.open ||
                     dupState.open ||
                     toolboxOpen ||
-                    deleteTargets.length > 0 ||
-                    Boolean(peerPickerState) ||
-                    Boolean(pairingPromptState)
+                    Boolean(frameCaptureState) ||
+                    Boolean(cropState)
                   }
                 />
               ) : wallpapers.length > 0 ? (
@@ -2105,11 +2154,12 @@ export default function App() {
             onRefreshLocalsend={() => sendNativeMessage('localsend.scan.request', {})}
             onRotatePin={() => sendNativeMessage('localsend.rotate-pin.request', {})}
             onUnpairAll={() => sendNativeMessage('localsend.unpair-all.request', {})}
-            suppressEscape={Boolean(peerPickerState || pairingPromptState || toolboxOpen || dupState.open || detailItem || studioState.open || deleteTargets.length > 0)}
+            suppressEscape={Boolean(peerPickerState || pairingPromptState || toolboxOpen || dupState.open || detailItem || studioState.open || deleteTargets.length > 0 || frameCaptureState || cropState)}
             onCheckUpdate={checkLatestUpdate}
             onOpenExternalUrl={openExternalUrl}
             sendNativeMessage={sendNativeMessage}
             persistSettings={persistSettings}
+            ffmpegStatus={ffmpegStatus}
           />
         </div>
 
@@ -2150,8 +2200,10 @@ export default function App() {
             setDetailItem(null)
             openLayerStudio(item)
           }}
+          onCaptureFrame={handleCaptureVideoFrame}
+          onOpenCrop={payload => setCropState(payload)}
           onDelete={item => setDeleteTargets([item])}
-          suppressHotkeys={Boolean(deleteTargets.length > 0 || peerPickerState || pairingPromptState)}
+          suppressHotkeys={Boolean(deleteTargets.length > 0 || peerPickerState || pairingPromptState || frameCaptureState || cropState)}
           onClose={closeDetails}
         />
         <CardContextMenu
@@ -2194,9 +2246,10 @@ export default function App() {
           open={studioState.open}
           state={studioState}
           isNative={isNative}
-          suppressHotkeys={Boolean(peerPickerState || pairingPromptState)}
+          suppressHotkeys={Boolean(peerPickerState || pairingPromptState || cropState)}
           onPreviewChange={handleStudioPreviewChange}
           onExport={handleStudioExport}
+          onOpenCrop={payload => setCropState(payload)}
           onSendToTablet={req => dispatchLocalSendRequest('localsend.send-studio.request', req)}
           onClose={closeLayerStudio}
         />
@@ -2237,6 +2290,44 @@ export default function App() {
           isNative={isNative}
           sendNativeMessage={sendNativeMessage}
           onOpenDuplicates={openDuplicateInspector}
+          ffmpegStatus={ffmpegStatus}
+        />
+        <VideoFrameCaptureDialog
+          open={Boolean(frameCaptureState)}
+          capture={frameCaptureState?.capture || null}
+          heading={frameCaptureState?.heading || '视频高清截帧'}
+          suggestedName={frameCaptureState?.suggestedName || 'wallpull-frame'}
+          isNative={isNative}
+          onPngAction={handlePngAction}
+          onOpenCrop={cap => {
+            const heading = frameCaptureState?.suggestedName
+              ? `${frameCaptureState.suggestedName} · 截帧比例裁切`
+              : '视频截帧比例裁切'
+            const suggestedName = frameCaptureState?.suggestedName || 'wallpull-frame'
+            setFrameCaptureState(null)
+            setCropState({
+              src: cap.dataUrl,
+              heading,
+              suggestedName,
+              sourceKind: 'dataUrl',
+              dataUrl: cap.dataUrl,
+              nativeSize: cap.width > 0 && cap.height > 0 ? { w: cap.width, h: cap.height } : null,
+            })
+          }}
+          onClose={() => setFrameCaptureState(null)}
+        />
+        <ImageCropDialog
+          open={Boolean(cropState)}
+          sourceKind={cropState?.sourceKind || 'dataUrl'}
+          src={cropState?.src || ''}
+          heading={cropState?.heading || '智能比例裁切台'}
+          suggestedName={cropState?.suggestedName || 'wallpull-crop'}
+          nativeSize={cropState?.nativeSize || null}
+          actionDoneSeq={cropActionSeq}
+          isNative={isNative}
+          onCropAction={handleCropAction}
+          onPngAction={handlePngAction}
+          onClose={() => setCropState(null)}
         />
         <audio
           ref={globalAudioRef}

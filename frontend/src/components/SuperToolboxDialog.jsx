@@ -18,6 +18,7 @@ import {
   X,
 } from '@phosphor-icons/react'
 import { formatBytes } from '../appConfig.js'
+import FfmpegStatusBanner from './ui/FfmpegStatusBanner.jsx'
 import FluxProgressBar from './reactbits/FluxProgressBar.jsx'
 
 const LAYOUT_SCHEMES = [
@@ -91,6 +92,7 @@ export default function SuperToolboxDialog({
   isNative,
   sendNativeMessage,
   onOpenDuplicates,
+  ffmpegStatus = null,
 }) {
   const [sidebarTab, setSidebarTab] = useState('archive')
   const [dualTab, setDualTab] = useState('library')
@@ -679,6 +681,20 @@ export default function SuperToolboxDialog({
                 </button>
               </div>
             </header>
+
+            {ffmpegStatus && !ffmpegStatus.available ? (
+              <div className="shrink-0 border-b border-base-300/60 px-6 py-2.5">
+                <FfmpegStatusBanner
+                  compact
+                  status={ffmpegStatus}
+                  isNative={isNative}
+                  onRefresh={() => sendNativeMessage('ffmpeg.status.request', {})}
+                  onOpenToolsDir={() => sendNativeMessage('ffmpeg.open-tools-dir.request', {})}
+                  onPickExe={() => sendNativeMessage('ffmpeg.pick-exe.request', {})}
+                  onClearCustom={() => sendNativeMessage('ffmpeg.clear-custom.request', {})}
+                />
+              </div>
+            ) : null}
 
             <AnimatePresence initial={false}>
               {busy && taskProgress ? (

@@ -35,13 +35,50 @@ struct WallpaperDetailView: View {
     @State private var isCurrentPageZoomed: Bool = false
     @State private var dragDismissOffset: CGFloat = 0
     @State private var showPeerPicker: Bool = false
-    @State private var showInfoSheet: Bool = false
+    @State private var activeSheet: ActiveDetailSheet? = nil
+    @State private var pendingCropPayload: DetailCropPayload? = nil
+    @State private var isPreparingCrop: Bool = false
     @State private var showSingleDeleteConfirm: Bool = false
     @Environment(\.horizontalSizeClass) private var hSizeClass
     @State private var selectedTrackIdx: Int = 0
     @State private var selectedVariantIdx: Int = 0
     @State private var sessionItemIDs: [String] = []
     @State private var bgmExtractTask: Task<Void, Never>? = nil
+    @State private var isCapturingFrame: Bool = false
+
+    private enum ActiveDetailSheet: Identifiable {
+        case info(VaultItem)
+        case capturedFrame(CapturedFramePayload)
+        case crop(DetailCropPayload)
+
+        var id: String {
+            switch self {
+            case .info(let item):
+                return "info-\(item.id)"
+            case .capturedFrame(let payload):
+                return "frame-\(payload.id.uuidString)"
+            case .crop(let payload):
+                return "crop-\(payload.id.uuidString)"
+            }
+        }
+    }
+
+    private struct CapturedFramePayload: Identifiable {
+        let id = UUID()
+        let image: UIImage
+        let timestampSeconds: Double
+        let item: VaultItem
+    }
+
+    private struct DetailCropPayload: Identifiable {
+        let id = UUID()
+        let image: UIImage
+        let titleText: String
+        let isTransparent: Bool
+        let contentRating: String?
+        let nativePixelSizeOverride: CGSize?
+        let fullResImageProvider: (() async -> UIImage?)?
+    }
 
     private var resolvedItems: [VaultItem] {
         guard !sessionItemIDs.isEmpty else { return allItems }
@@ -206,10 +243,51 @@ struct WallpaperDetailView: View {
             bgmExtractTask?.cancel()
             bgmExtractTask = nil
         }
-        .sheet(isPresented: $showInfoSheet) {
-            if let item = currentItem {
+        .sheet(item: $activeSheet, onDismiss: {
+            if let nextCrop = pendingCropPayload {
+                pendingCropPayload = nil
+                DispatchQueue.main.async {
+                    activeSheet = .crop(nextCrop)
+                }
+            }
+        }) { sheet in
+            switch sheet {
+            case .info(let item):
                 DetailInfoSheet(item: item)
                     .preferredColorScheme(vault.appearanceMode.colorScheme)
+            case .capturedFrame(let payload):
+                VideoFramePreviewSheetView(
+                    image: payload.image,
+                    titleText: payload.item.title,
+                    timestampSeconds: payload.timestampSeconds,
+                    contentRating: payload.item.contentRating,
+                    vault: vault,
+                    localSend: localSend,
+                    onOpenCrop: { frameImg in
+                        pendingCropPayload = DetailCropPayload(
+                            image: frameImg,
+                            titleText: "\(payload.item.title) · 截帧",
+                            isTransparent: false,
+                            contentRating: payload.item.contentRating,
+                            nativePixelSizeOverride: nil,
+                            fullResImageProvider: nil
+                        )
+                        activeSheet = nil
+                    },
+                    onClose: { activeSheet = nil }
+                )
+            case .crop(let payload):
+                ImageCropSheetView(
+                    sourceImage: payload.image,
+                    titleText: payload.titleText,
+                    isTransparent: payload.isTransparent,
+                    contentRating: payload.contentRating,
+                    nativePixelSizeOverride: payload.nativePixelSizeOverride,
+                    fullResImageProvider: payload.fullResImageProvider,
+                    vault: vault,
+                    localSend: localSend,
+                    onClose: { activeSheet = nil }
+                )
             }
         }
         .confirmationDialog(
@@ -449,11 +527,49 @@ struct WallpaperDetailView: View {
                 .disabled(isExtractingBGM)
                 .buttonStyle(StickerPressButtonStyle())
             }
+
+            Button {
+                Task { await captureCurrentVideoFrame(for: item) }
+            } label: {
+                HStack(spacing: 4) {
+                    if isCapturingFrame {
+                        ProgressView()
+                            .controlSize(.small)
+                            .tint(chromeForeground)
+                    } else {
+                        Image(systemName: "camera.fill")
+                            .font(.system(size: 11.5, weight: .bold))
+                    }
+                    Text("截帧")
+                        .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                }
+                .foregroundColor(chromeForeground)
+                .padding(.horizontal, 10)
+                .frame(height: 28)
+                .background(chromePillFill, in: Capsule())
+            }
+            .disabled(isCapturingFrame)
+            .buttonStyle(StickerPressButtonStyle())
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
         .background(.ultraThinMaterial, in: Capsule())
         .overlay(Capsule().strokeBorder(chromeForeground.opacity(0.12), lineWidth: 1))
+    }
+
+    private func captureCurrentVideoFrame(for item: VaultItem) async {
+        guard !isCapturingFrame else { return }
+        isCapturingFrame = true
+        defer { isCapturingFrame = false }
+
+        let targetURL = activeMediaURL(for: item)
+        let sec = videoCurrentSec
+        do {
+            let img = try await VideoFrameCaptureHelper.captureFrame(from: targetURL, atSeconds: sec)
+            activeSheet = .capturedFrame(CapturedFramePayload(image: img, timestampSeconds: sec, item: item))
+        } catch {
+            vault.showToast(error.localizedDescription, isError: true)
+        }
     }
 
     private func extractAndShareVideoBGM(for item: VaultItem) async {
@@ -674,10 +790,8 @@ struct WallpaperDetailView: View {
     }
 
     private func bottomDock(item: VaultItem) -> some View {
-        HStack {
-            Spacer(minLength: 0)
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 10) {
+        CenteredAdaptiveDock {
+            HStack(spacing: 10) {
                     if item.mediaType == .image {
                         Button {
                             vault.copyLosslessToClipboard(item: item, variantIndex: selectedVariantIdx)
@@ -704,6 +818,54 @@ struct WallpaperDetailView: View {
                                 .padding(.vertical, 10)
                                 .background(chromePillFill, in: Capsule())
                         }
+                        .buttonStyle(StickerPressButtonStyle())
+
+                        Button {
+                            guard !isPreparingCrop else { return }
+                            isPreparingCrop = true
+                            let targetURL = activeMediaURL(for: item)
+                            let itemTitle = item.title
+                            let isTransparent = item.isTransparentCutout
+                            let contentRating = item.contentRating
+                            Task {
+                                defer { isPreparingCrop = false }
+                                let previewResult = await Task.detached(priority: .userInitiated) { () -> (UIImage, CGSize)? in
+                                    if let loaded = ImageCropSheetView.loadPreviewAndPixelSize(from: targetURL, maxPixelSize: 2048) {
+                                        return loaded
+                                    }
+                                    if let fallback = UIImage(contentsOfFile: targetURL.path),
+                                       let cg = fallback.cgImage {
+                                        return (fallback, CGSize(width: cg.width, height: cg.height))
+                                    }
+                                    return nil
+                                }.value
+                                guard let (previewImg, fullPixelSize) = previewResult else {
+                                    vault.showToast("未能读取图片原文件", isError: true)
+                                    return
+                                }
+                                activeSheet = .crop(DetailCropPayload(
+                                    image: previewImg,
+                                    titleText: itemTitle,
+                                    isTransparent: isTransparent,
+                                    contentRating: contentRating,
+                                    nativePixelSizeOverride: fullPixelSize,
+                                    fullResImageProvider: {
+                                        await Task.detached(priority: .userInitiated) {
+                                            ImageCropSheetView.loadFullResolutionImage(from: targetURL)
+                                        }.value
+                                    }
+                                ))
+                            }
+                        } label: {
+                            Label(isPreparingCrop ? "载入中…" : "比例裁切", systemImage: "crop")
+                                .font(.system(size: 13.5, weight: .semibold))
+                                .foregroundColor(chromeForeground)
+                                .fixedSize(horizontal: true, vertical: false)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 10)
+                                .background(chromePillFill, in: Capsule())
+                        }
+                        .disabled(isPreparingCrop)
                         .buttonStyle(StickerPressButtonStyle())
                     } else {
                         Button {
@@ -752,7 +914,9 @@ struct WallpaperDetailView: View {
                     .buttonStyle(StickerPressButtonStyle())
 
                     Button {
-                        showInfoSheet = true
+                        if let item = currentItem {
+                            activeSheet = .info(item)
+                        }
                     } label: {
                         Image(systemName: "info.circle")
                             .font(.system(size: 15, weight: .semibold))
@@ -799,9 +963,6 @@ struct WallpaperDetailView: View {
                 .padding(8)
                 .background(.ultraThinMaterial, in: Capsule())
                 .overlay(Capsule().strokeBorder(chromeForeground.opacity(0.14), lineWidth: 1))
-            }
-            .frame(maxWidth: hSizeClass == .regular ? nil : .infinity)
-            Spacer(minLength: 0)
         }
         .padding(.horizontal, 16)
         .padding(.bottom, max(windowSafeInsets.bottom, 16) + 6)

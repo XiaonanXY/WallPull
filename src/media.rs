@@ -6,27 +6,90 @@ use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
 use image::imageops::FilterType;
 use image::{ColorType, DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder, ImageReader};
+use serde::Serialize;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
-const THUMB_SIZE: u32 = 720;
+const MAX_THUMB_EDGE: u32 = 800;
 static TMP_MEDIA_SEQ: AtomicU64 = AtomicU64::new(1);
+static CUSTOM_FFMPEG_OVERRIDE: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
 
-pub fn find_executable(exe_name: &str) -> Option<PathBuf> {
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FfmpegStatus {
+    pub available: bool,
+    pub ffmpeg_path: Option<String>,
+    pub ffprobe_available: bool,
+    pub ffprobe_path: Option<String>,
+    pub source: String,
+    pub tools_dir: String,
+    pub custom_path: Option<String>,
+}
+
+fn custom_override_lock() -> &'static RwLock<Option<PathBuf>> {
+    CUSTOM_FFMPEG_OVERRIDE.get_or_init(|| RwLock::new(None))
+}
+
+pub fn set_custom_ffmpeg_override(path: Option<&str>) {
+    let next = path
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    if let Ok(mut guard) = custom_override_lock().write() {
+        *guard = next;
+    }
+}
+
+fn resolve_custom_executable(exe_name: &str, custom: &Path) -> Option<PathBuf> {
+    if !custom.is_file() {
+        return None;
+    }
+    if exe_name.eq_ignore_ascii_case("ffmpeg.exe") {
+        let is_ffmpeg = custom
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("ffmpeg.exe"));
+        if is_ffmpeg {
+            return Some(custom.to_path_buf());
+        }
+        return None;
+    }
+    if exe_name.eq_ignore_ascii_case("ffprobe.exe") {
+        if let Some(parent) = custom.parent() {
+            let sibling = parent.join("ffprobe.exe");
+            if sibling.is_file() {
+                return Some(sibling);
+            }
+        }
+    }
+    None
+}
+
+fn locate_executable_with_source(
+    exe_name: &str,
+    custom_override: Option<&Path>,
+) -> Option<(PathBuf, &'static str)> {
+    if let Some(custom) = custom_override {
+        if let Some(found) = resolve_custom_executable(exe_name, custom) {
+            return Some((found, "custom"));
+        }
+    }
+
     if let Ok(cur_exe) = std::env::current_exe() {
         if let Some(dir) = cur_exe.parent() {
             let bundled = dir.join("Tools").join(exe_name);
             if bundled.is_file() {
-                return Some(bundled);
+                return Some((bundled, "bundled"));
             }
             let same_dir = dir.join(exe_name);
             if same_dir.is_file() {
-                return Some(same_dir);
+                return Some((same_dir, "bundled"));
             }
         }
     }
@@ -35,18 +98,50 @@ pub fn find_executable(exe_name: &str) -> Option<PathBuf> {
         .join("Tools")
         .join(exe_name);
     if local_tools.is_file() {
-        return Some(local_tools);
+        return Some((local_tools, "local"));
     }
 
     if let Some(path_var) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_var) {
             let candidate = dir.join(exe_name);
             if candidate.is_file() {
-                return Some(candidate);
+                return Some((candidate, "path"));
             }
         }
     }
     None
+}
+
+pub fn find_executable(exe_name: &str) -> Option<PathBuf> {
+    let custom = custom_override_lock()
+        .read()
+        .ok()
+        .and_then(|g| g.clone());
+    locate_executable_with_source(exe_name, custom.as_deref()).map(|(p, _)| p)
+}
+
+pub fn detect_ffmpeg_status(custom_path: Option<&str>) -> FfmpegStatus {
+    let clean_custom = custom_path
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    let custom_buf = clean_custom.as_deref().map(PathBuf::from);
+    let ffmpeg_found = locate_executable_with_source("ffmpeg.exe", custom_buf.as_deref());
+    let ffprobe_found = locate_executable_with_source("ffprobe.exe", custom_buf.as_deref());
+    let tools_dir = clean_path_str(&crate::settings::preferred_tools_dir());
+    let (available, ffmpeg_path, source) = match ffmpeg_found {
+        Some((p, src)) => (true, Some(clean_path_str(&p)), src.to_string()),
+        None => (false, None, "missing".to_string()),
+    };
+    FfmpegStatus {
+        available,
+        ffmpeg_path,
+        ffprobe_available: ffprobe_found.is_some(),
+        ffprobe_path: ffprobe_found.map(|(p, _)| clean_path_str(&p)),
+        source,
+        tools_dir,
+        custom_path: clean_custom,
+    }
 }
 
 pub fn detect_media_type(path: &Path) -> Option<&'static str> {
@@ -597,16 +692,20 @@ fn encode_rust_cover_thumbnail(source_path: &Path, tmp: &Path) -> Option<()> {
         return None;
     }
 
-    let side = orig_w.min(orig_h);
-    let crop_x = (orig_w - side) / 2;
-    let crop_y = (orig_h - side) / 2;
-    let square = img.crop_imm(crop_x, crop_y, side, side);
-    let rgba = square
-        .resize_exact(THUMB_SIZE, THUMB_SIZE, FilterType::Lanczos3)
-        .to_rgba8();
+    let resized = if orig_w > MAX_THUMB_EDGE * 2 || orig_h > MAX_THUMB_EDGE * 2 {
+        let mid = img.resize(MAX_THUMB_EDGE * 2, MAX_THUMB_EDGE * 2, FilterType::Triangle);
+        mid.resize(MAX_THUMB_EDGE, MAX_THUMB_EDGE, FilterType::CatmullRom)
+    } else if orig_w > MAX_THUMB_EDGE || orig_h > MAX_THUMB_EDGE {
+        img.resize(MAX_THUMB_EDGE, MAX_THUMB_EDGE, FilterType::CatmullRom)
+    } else {
+        img
+    };
+    let out_w = resized.width().max(1);
+    let out_h = resized.height().max(1);
+    let rgba = resized.to_rgba8();
 
     // Composite alpha onto dark charcoal (#18181B) matching WIC NativeMediaInspector
-    let mut rgb = Vec::with_capacity((THUMB_SIZE * THUMB_SIZE * 3) as usize);
+    let mut rgb = Vec::with_capacity((out_w as usize) * (out_h as usize) * 3);
     for px in rgba.pixels() {
         let [r, g, b, a] = px.0;
         if a == 255 {
@@ -622,10 +721,51 @@ fn encode_rust_cover_thumbnail(source_path: &Path, tmp: &Path) -> Option<()> {
 
     let out_file = File::create(tmp).ok()?;
     let writer = BufWriter::new(out_file);
-    let mut encoder = JpegEncoder::new_with_quality(writer, 92);
+    let mut encoder = JpegEncoder::new_with_quality(writer, 86);
     encoder
-        .encode(&rgb, THUMB_SIZE, THUMB_SIZE, ExtendedColorType::Rgb8)
+        .encode(&rgb, out_w, out_h, ExtendedColorType::Rgb8)
         .ok()
+}
+
+fn clip_encode_sema() -> &'static (Mutex<usize>, Condvar) {
+    static SEMA: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
+    SEMA.get_or_init(|| (Mutex::new(0), Condvar::new()))
+}
+
+pub fn existing_image_thumbnail_path(source_path: &Path, cache_key: &str) -> Option<String> {
+    let dest = cache_root()
+        .join("video-previews")
+        .join(format!("{}-img-thumb-v3.jpg", sanitize_cache_key(cache_key)));
+    let src_meta = fs::metadata(source_path).ok()?;
+    if is_cache_fresh(&src_meta, &dest) {
+        Some(clean_path_str(&dest))
+    } else {
+        None
+    }
+}
+
+pub fn existing_video_preview_path(source_path: &Path, cache_key: &str) -> Option<String> {
+    let dest = cache_root()
+        .join("video-previews")
+        .join(format!("{}-aspect-v4.jpg", sanitize_cache_key(cache_key)));
+    let src_meta = fs::metadata(source_path).ok()?;
+    if is_cache_fresh(&src_meta, &dest) {
+        Some(clean_path_str(&dest))
+    } else {
+        None
+    }
+}
+
+pub fn existing_video_preview_clip_path(source_path: &Path, cache_key: &str) -> Option<String> {
+    let dest = cache_root()
+        .join("video-clips")
+        .join(format!("{}-aspect-v2.mp4", sanitize_cache_key(cache_key)));
+    let src_meta = fs::metadata(source_path).ok()?;
+    if is_cache_fresh(&src_meta, &dest) {
+        Some(clean_path_str(&dest))
+    } else {
+        None
+    }
 }
 
 pub fn create_image_thumbnail_cancellable(
@@ -637,7 +777,7 @@ pub fn create_image_thumbnail_cancellable(
     let thumb_dir = cache_root().join("video-previews");
     fs::create_dir_all(&thumb_dir).ok()?;
     let safe_key = sanitize_cache_key(cache_key);
-    let dest = thumb_dir.join(format!("{safe_key}-img-thumb-v2.jpg"));
+    let dest = thumb_dir.join(format!("{safe_key}-img-thumb-v3.jpg"));
 
     let src_meta = fs::metadata(source_path).ok()?;
     if is_cache_fresh(&src_meta, &dest) {
@@ -660,9 +800,9 @@ pub fn create_image_thumbnail_cancellable(
         "-frames:v",
         "1",
         "-vf",
-        "scale=720:720:force_original_aspect_ratio=increase:flags=lanczos,crop=720:720",
+        "scale='min(800,iw)':'min(800,ih)':force_original_aspect_ratio=decrease:flags=bicubic",
         "-q:v",
-        "2",
+        "4",
     ]));
     args.push(tmp_ff.as_os_str().to_os_string());
     let ok = run_status(ffmpeg, &args, None, Duration::from_secs(20), cancel).unwrap_or(false);
@@ -695,9 +835,9 @@ fn run_ffmpeg_preview_frame(
         "-frames:v",
         "1",
         "-vf",
-        "scale=1024:1024:force_original_aspect_ratio=increase:flags=lanczos,crop=1024:1024",
+        "scale='min(800,iw)':'min(800,ih)':force_original_aspect_ratio=decrease:flags=bicubic",
         "-q:v",
-        "2",
+        "4",
     ]));
     args.push(tmp.as_os_str().to_os_string());
     let ok = run_status(ffmpeg, &args, None, Duration::from_secs(25), cancel).unwrap_or(false);
@@ -717,7 +857,7 @@ pub fn try_create_video_preview_cancellable(
 ) -> Option<String> {
     let preview_dir = cache_root().join("video-previews");
     let safe_key = sanitize_cache_key(cache_key);
-    let dest = preview_dir.join(format!("{safe_key}-square-v3.jpg"));
+    let dest = preview_dir.join(format!("{safe_key}-aspect-v4.jpg"));
     let src_meta = fs::metadata(source_path).ok()?;
     if is_cache_fresh(&src_meta, &dest) {
         return Some(clean_path_str(&dest));
@@ -754,6 +894,31 @@ fn run_ffmpeg_preview_clip(
     tmp: &Path,
     cancel: Option<&AtomicBool>,
 ) -> bool {
+    let (mtx, cv) = clip_encode_sema();
+    {
+        let mut active = mtx.lock().unwrap_or_else(|e| e.into_inner());
+        while *active >= 2 {
+            if cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {
+                return false;
+            }
+            active = cv
+                .wait_timeout(active, Duration::from_millis(200))
+                .map(|(g, _)| g)
+                .unwrap_or_else(|e| e.into_inner().0);
+        }
+        *active += 1;
+    }
+    struct ClipSlotGuard;
+    impl Drop for ClipSlotGuard {
+        fn drop(&mut self) {
+            let (mtx, cv) = clip_encode_sema();
+            let mut active = mtx.lock().unwrap_or_else(|e| e.into_inner());
+            *active = active.saturating_sub(1);
+            cv.notify_one();
+        }
+    }
+    let _slot = ClipSlotGuard;
+
     let mut args = vec![OsString::from("-y")];
     if use_hw_decode {
         args.extend(os_args(["-hwaccel", "auto"]));
@@ -762,16 +927,18 @@ fn run_ffmpeg_preview_clip(
     args.push(source_path.as_os_str().to_os_string());
     args.extend(os_args([
         "-t",
-        "12",
+        "8",
         "-an",
         "-vf",
-        "scale=480:480:force_original_aspect_ratio=increase:flags=lanczos,crop=480:480,fps=30",
+        "scale='max(2,trunc(iw*min(1,min(640/iw,640/ih))/2)*2)':'max(2,trunc(ih*min(1,min(640/iw,640/ih))/2)*2)':flags=fast_bilinear,fps=24",
         "-c:v",
         "libx264",
         "-preset",
-        "veryfast",
+        "superfast",
         "-crf",
-        "23",
+        "25",
+        "-threads",
+        "2",
         "-pix_fmt",
         "yuv420p",
         "-movflags",
@@ -795,7 +962,7 @@ pub fn try_create_video_preview_clip_cancellable(
 ) -> Option<String> {
     let clip_dir = cache_root().join("video-clips");
     let safe_key = sanitize_cache_key(cache_key);
-    let dest = clip_dir.join(format!("{safe_key}-480p-v1.mp4"));
+    let dest = clip_dir.join(format!("{safe_key}-aspect-v2.mp4"));
     let src_meta = fs::metadata(source_path).ok()?;
     if is_cache_fresh(&src_meta, &dest) {
         return Some(clean_path_str(&dest));
@@ -864,6 +1031,47 @@ mod tests {
         pack_multi_size_ico_pure_rust(&src, &dst).unwrap();
         let ico_bytes = fs::read(&dst).unwrap();
         assert_eq!(&ico_bytes[0..6], &[0, 0, 1, 0, 6, 0]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_image_thumbnail_preserves_original_aspect_and_top_edge() {
+        let dir = std::env::temp_dir().join(format!("wallpull_thumb_aspect_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // 1600x900 landscape with pure-red top band (head area) -> 800x450 with intact red top band
+        let mut wide = image::RgbImage::from_pixel(1600, 900, image::Rgb([0, 80, 200]));
+        for y in 0..40 {
+            for x in 0..1600 {
+                wide.put_pixel(x, y, image::Rgb([255, 0, 0]));
+            }
+        }
+        let wide_src = dir.join("wide.png");
+        let wide_out = dir.join("wide_thumb.jpg");
+        wide.save(&wide_src).unwrap();
+        assert!(encode_rust_cover_thumbnail(&wide_src, &wide_out).is_some());
+        let wide_dec = image::open(&wide_out).unwrap().to_rgb8();
+        assert_eq!(wide_dec.dimensions(), (800, 450));
+        let top_px = wide_dec.get_pixel(400, 10);
+        assert!(top_px[0] > 200 && top_px[2] < 50, "top edge must remain red, got {:?}", top_px);
+
+        // 900x1600 portrait -> 450x800
+        let tall = image::RgbImage::from_pixel(900, 1600, image::Rgb([40, 160, 80]));
+        let tall_src = dir.join("tall.png");
+        let tall_out = dir.join("tall_thumb.jpg");
+        tall.save(&tall_src).unwrap();
+        assert!(encode_rust_cover_thumbnail(&tall_src, &tall_out).is_some());
+        assert_eq!(image::image_dimensions(&tall_out).unwrap(), (450, 800));
+
+        // 640x360 smaller than max edge -> preserved at 640x360
+        let small = image::RgbImage::from_pixel(640, 360, image::Rgb([100, 100, 220]));
+        let small_src = dir.join("small.png");
+        let small_out = dir.join("small_thumb.jpg");
+        small.save(&small_src).unwrap();
+        assert!(encode_rust_cover_thumbnail(&small_src, &small_out).is_some());
+        assert_eq!(image::image_dimensions(&small_out).unwrap(), (640, 360));
+
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -947,6 +1155,50 @@ mod tests {
         let heic_part = dir.join("upload.part");
         fs::write(&heic_part, &heic_hdr).unwrap();
         assert_eq!(detect_media_type(&heic_part), Some("image"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn custom_ffmpeg_override_finds_ffmpeg_and_sibling_ffprobe() {
+        let dir = std::env::temp_dir().join(format!("wallpull_ffmpeg_override_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fake_ffmpeg = dir.join("ffmpeg.exe");
+        let fake_ffprobe = dir.join("ffprobe.exe");
+        fs::write(&fake_ffmpeg, b"MZ").unwrap();
+        fs::write(&fake_ffprobe, b"MZ").unwrap();
+
+        let status = detect_ffmpeg_status(fake_ffmpeg.to_str());
+        assert!(status.available);
+        assert!(status.ffprobe_available);
+        assert_eq!(status.source, "custom");
+        assert_eq!(
+            resolve_custom_executable("ffmpeg.exe", &fake_ffmpeg).as_deref(),
+            Some(fake_ffmpeg.as_path())
+        );
+        assert_eq!(
+            resolve_custom_executable("ffprobe.exe", &fake_ffmpeg).as_deref(),
+            Some(fake_ffprobe.as_path())
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn custom_ffmpeg_override_rejects_non_ffmpeg_executable() {
+        let dir = std::env::temp_dir().join(format!(
+            "wallpull_ffmpeg_reject_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fake_other = dir.join("not_ffmpeg.exe");
+        fs::write(&fake_other, b"dummy").expect("write dummy exe");
+
+        assert!(resolve_custom_executable("ffmpeg.exe", &fake_other).is_none());
+        let status = detect_ffmpeg_status(fake_other.to_str());
+        assert_ne!(status.source, "custom");
 
         let _ = fs::remove_dir_all(&dir);
     }

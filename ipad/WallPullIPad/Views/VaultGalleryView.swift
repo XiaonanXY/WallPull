@@ -33,6 +33,8 @@ struct VaultGalleryView: View {
     @State private var catalogPreviewOriginRect: CGRect? = nil
     @State private var catalogPreviewCover: UIImage? = nil
     @State private var isClosingCatalogPreview: Bool = false
+    @State private var galleryViewportWidth: CGFloat = 0
+    @Namespace private var galleryCardNS
 
     private var effectiveScheme: ColorScheme {
         vault.appearanceMode.colorScheme ?? colorScheme
@@ -48,11 +50,24 @@ struct VaultGalleryView: View {
         }
     }
 
-    private var gridColumns: [GridItem] {
-        if vault.cardAspectMode == .square {
-            return [GridItem(.adaptive(minimum: squareMinTileWidth, maximum: squareMinTileWidth + 60), spacing: 18, alignment: .top)]
+    private var unifiedGalleryColumns: [[VaultItem]] {
+        if vault.cardAspectMode == .adaptive {
+            return vault.cachedWaterfallColumns
         }
-        return Array(repeating: GridItem(.flexible(), spacing: 18, alignment: .top), count: vault.columnsCount)
+        guard !filtered.isEmpty else { return [] }
+        let gap: CGFloat = 18
+        let colCount: Int
+        if vault.cardAspectMode == .square {
+            let effectiveW = galleryViewportWidth > 0 ? galleryViewportWidth : max(320, UIScreen.main.bounds.width - 36)
+            colCount = max(2, Int((effectiveW + gap) / (squareMinTileWidth + gap)))
+        } else {
+            colCount = max(2, min(6, vault.columnsCount))
+        }
+        var cols = Array(repeating: [VaultItem](), count: colCount)
+        for (idx, item) in filtered.enumerated() {
+            cols[idx % colCount].append(item)
+        }
+        return cols
     }
 
     private var filtered: [VaultItem] {
@@ -78,13 +93,6 @@ struct VaultGalleryView: View {
     private var allSelectedAreFavorite: Bool {
         let chosen = vault.items.filter { selectedIDs.contains($0.id) }
         return !chosen.isEmpty && chosen.allSatisfy(\.isFavorite)
-    }
-
-    private var cardAspectBinding: Binding<CardAspectMode> {
-        Binding(
-            get: { vault.cardAspectMode },
-            set: { vault.cardAspectMode = $0 }
-        )
     }
 
     var body: some View {
@@ -502,8 +510,7 @@ struct VaultGalleryView: View {
                     }
                     .buttonStyle(StickerPressButtonStyle())
                     .popover(isPresented: $showFilterPopover, arrowEdge: .top) {
-                        filterPopoverContent
-                            .preferredColorScheme(vault.appearanceMode.colorScheme)
+                        FilterSortPopoverView(vault: vault)
                     }
 
                     Button {
@@ -580,227 +587,6 @@ struct VaultGalleryView: View {
         .fixedSize(horizontal: true, vertical: false)
     }
 
-    // Windows-parity structured Filter & Sort Popover (A1-A4)
-    private var filterPopoverContent: some View {
-        let colorCounts = vault.colorBucketCounts()
-        let scheme = effectiveScheme
-        let primaryText = scheme == .dark ? Color.white : Color(hex: "#18181B")
-        let secondaryText = scheme == .dark ? Color.white.opacity(0.62) : Color(hex: "#71717A")
-
-        let contentBody = VStack(alignment: .leading, spacing: 11) {
-            HStack {
-                Text("筛选与排序")
-                    .font(.system(size: 16, weight: .bold, design: .rounded))
-                    .foregroundColor(primaryText)
-                Spacer()
-                if vault.activeFilterCount > 0 {
-                    Button {
-                        vault.resetAllFilters()
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                    } label: {
-                        Label("重置全部筛选", systemImage: "arrow.counterclockwise")
-                            .font(.system(size: 12.5, weight: .semibold))
-                            .foregroundColor(vault.accentColor)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass").foregroundColor(secondaryText)
-                TextField("搜索壁纸名称或文件名…", text: $vault.searchText)
-                    .foregroundColor(primaryText)
-                if !vault.searchText.isEmpty {
-                    Button { vault.searchText = "" } label: {
-                        Image(systemName: "xmark.circle.fill").foregroundColor(secondaryText)
-                    }
-                }
-            }
-            .padding(.horizontal, 12)
-            .frame(height: 34)
-            .background(WallPullPalette.cardSurface(scheme), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).strokeBorder(WallPullPalette.hairline(scheme), lineWidth: 1))
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("排序方式")
-                    .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundColor(secondaryText)
-                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 7) {
-                    ForEach(VaultSortMode.allCases) { mode in
-                        filterChip(title: mode.rawValue, active: vault.sortMode == mode) {
-                            vault.sortMode = mode
-                        }
-                    }
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("内容年龄分级")
-                    .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundColor(secondaryText)
-                HStack(spacing: 7) {
-                    ForEach(ContentRatingFilter.allCases) { opt in
-                        filterChip(title: opt.rawValue, active: vault.ratingFilter == opt) {
-                            vault.ratingFilter = opt
-                        }
-                    }
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("规格与特性筛选")
-                    .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundColor(secondaryText)
-                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 7) {
-                    ForEach(SpecFilter.allCases) { spec in
-                        filterChip(title: spec.rawValue, active: vault.specFilter == spec) {
-                            vault.specFilter = spec
-                        }
-                    }
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text("主色调色板")
-                        .font(.system(size: 11.5, weight: .semibold))
-                        .foregroundColor(secondaryText)
-                    Spacer()
-                    if let activeColor = vault.colorFilter {
-                        Text("\(activeColor.label) · \(colorCounts[activeColor] ?? 0) 项")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundColor(vault.accentColor)
-                    }
-                }
-                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 7) {
-                    ForEach(ColorBucketKind.allCases) { bucket in
-                        let count = colorCounts[bucket] ?? 0
-                        let active = vault.colorFilter == bucket
-                        Button {
-                            vault.colorFilter = active ? nil : bucket
-                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                        } label: {
-                            HStack(spacing: 8) {
-                                Circle()
-                                    .fill(bucket.swatchColor)
-                                    .frame(width: 13, height: 13)
-                                    .overlay(Circle().strokeBorder(primaryText.opacity(0.22), lineWidth: 0.8))
-                                Text(bucket.label)
-                                    .font(.system(size: 12, weight: .medium))
-                                    .foregroundColor(primaryText)
-                                    .lineLimit(1)
-                                Spacer()
-                                Text("\(count)")
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .foregroundColor(secondaryText)
-                            }
-                            .padding(.horizontal, 10)
-                            .frame(height: 31)
-                            .background(
-                                active ? vault.accentColor.opacity(0.16) : WallPullPalette.cardSurface(scheme),
-                                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                    .strokeBorder(active ? vault.accentColor : WallPullPalette.hairline(scheme), lineWidth: active ? 1.5 : 1)
-                            )
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 7) {
-                Text("卡片画幅与网格列数")
-                    .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundColor(secondaryText)
-                WallPullSegmentedPill(
-                    options: CardAspectMode.allCases,
-                    selection: cardAspectBinding,
-                    label: { $0.rawValue },
-                    height: 32
-                )
-
-                HStack(spacing: 8) {
-                    Text(vault.cardAspectMode == .square ? "方块密度" : "每行显示列数")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(primaryText)
-                    Spacer()
-                    HStack(spacing: 5) {
-                        ForEach(2...6, id: \.self) { cols in
-                            let active = vault.columnsCount == cols
-                            Button {
-                                withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
-                                    vault.columnsCount = cols
-                                }
-                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                            } label: {
-                                Text(vault.cardAspectMode == .square ? "\(cols - 1)档" : "\(cols)列")
-                                    .font(.system(size: 11.5, weight: .semibold, design: .rounded))
-                                    .foregroundColor(active ? .white : primaryText)
-                                    .padding(.horizontal, 9)
-                                    .frame(height: 28)
-                                    .background(
-                                        active ? vault.accentColor : WallPullPalette.cardSurface(scheme),
-                                        in: Capsule()
-                                    )
-                                    .overlay(
-                                        Capsule().strokeBorder(
-                                            active ? vault.accentColor : WallPullPalette.hairline(scheme),
-                                            lineWidth: 1
-                                        )
-                                    )
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                }
-            }
-        }
-        .padding(16)
-
-        return Group {
-            if #available(iOS 16.0, *) {
-                ViewThatFits(in: .vertical) {
-                    contentBody
-                    ScrollView(.vertical, showsIndicators: true) {
-                        contentBody
-                    }
-                    .frame(maxHeight: 620)
-                }
-            } else {
-                ScrollView(.vertical, showsIndicators: true) {
-                    contentBody
-                }
-                .frame(maxHeight: 620)
-            }
-        }
-        .frame(width: 420)
-        .background(WallPullPalette.canvas(scheme))
-    }
-
-    private func filterChip(title: String, active: Bool, action: @escaping () -> Void) -> some View {
-        let scheme = effectiveScheme
-        let primaryText = scheme == .dark ? Color.white : Color(hex: "#18181B")
-        return Button {
-            action()
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        } label: {
-            Text(title)
-                .font(.system(size: 12, weight: .semibold, design: .rounded))
-                .foregroundColor(active ? .white : primaryText)
-                .lineLimit(1)
-                .frame(maxWidth: .infinity)
-                .frame(height: 30)
-                .background(active ? vault.accentColor : WallPullPalette.cardSurface(scheme), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .strokeBorder(active ? vault.accentColor : WallPullPalette.hairline(scheme), lineWidth: 1)
-                )
-        }
-        .buttonStyle(.plain)
-    }
-
     @ViewBuilder
     private func galleryCardCell(for item: VaultItem) -> some View {
         WallpaperCardView(
@@ -858,32 +644,35 @@ struct VaultGalleryView: View {
     private var galleryGrid: some View {
         let gap: CGFloat = 18
         let bottomPad: CGFloat = (musicPlayer.activeTrack != nil && isSelecting && !selectedIDs.isEmpty) ? 162 : ((isSelecting || musicPlayer.activeTrack != nil) ? 102 : 34)
+        let cols = unifiedGalleryColumns
         return ZStack(alignment: .top) {
             ScrollView {
-                Group {
-                    if vault.cardAspectMode == .adaptive {
-                        let cols = vault.cachedWaterfallColumns
-                        HStack(alignment: .top, spacing: gap) {
-                            ForEach(Array(cols.enumerated()), id: \.offset) { _, colItems in
-                                LazyVStack(spacing: gap) {
-                                    ForEach(colItems) { item in
-                                        galleryCardCell(for: item)
-                                    }
-                                }
-                                .frame(maxWidth: .infinity, alignment: .top)
-                            }
-                        }
-                    } else {
-                        LazyVGrid(columns: gridColumns, spacing: gap) {
-                            ForEach(filtered) { item in
+                HStack(alignment: .top, spacing: gap) {
+                    ForEach(Array(cols.enumerated()), id: \.offset) { _, colItems in
+                        LazyVStack(spacing: gap) {
+                            ForEach(colItems) { item in
                                 galleryCardCell(for: item)
+                                    .matchedGeometryEffect(id: item.id, in: galleryCardNS)
                             }
                         }
+                        .frame(maxWidth: .infinity, alignment: .top)
                     }
                 }
+                .animation(.spring(response: 0.30, dampingFraction: 0.82), value: vault.cardAspectMode)
+                .animation(.spring(response: 0.30, dampingFraction: 0.82), value: vault.columnsCount)
                 .padding(.horizontal, gap)
                 .padding(.top, 10)
                 .padding(.bottom, bottomPad)
+                .background(
+                    GeometryReader { geo in
+                        Color.clear.preference(key: GalleryViewportWidthKey.self, value: max(0, geo.size.width - gap * 2))
+                    }
+                )
+            }
+            .onPreferenceChange(GalleryViewportWidthKey.self) { nextW in
+                if nextW > 0 && abs(nextW - galleryViewportWidth) > 2 {
+                    galleryViewportWidth = nextW
+                }
             }
             .simultaneousGesture(
                 MagnificationGesture(minimumScaleDelta: 0.08)
@@ -1047,6 +836,236 @@ struct VaultGalleryView: View {
             Spacer()
         }
         .padding(32)
+    }
+}
+
+private struct GalleryViewportWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        let next = nextValue()
+        if next > 0 { value = next }
+    }
+}
+
+private struct FilterSortPopoverView: View {
+    @ObservedObject var vault: LocalVaultStore
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var effectiveScheme: ColorScheme {
+        vault.appearanceMode.colorScheme ?? colorScheme
+    }
+
+    private var cardAspectBinding: Binding<CardAspectMode> {
+        Binding(
+            get: { vault.cardAspectMode },
+            set: { vault.cardAspectMode = $0 }
+        )
+    }
+
+    var body: some View {
+        let colorCounts = vault.colorBucketCounts()
+        let scheme = effectiveScheme
+        let primaryText = scheme == .dark ? Color.white : Color(hex: "#18181B")
+        let secondaryText = scheme == .dark ? Color.white.opacity(0.62) : Color(hex: "#71717A")
+
+        ScrollView(.vertical, showsIndicators: true) {
+            VStack(alignment: .leading, spacing: 11) {
+                HStack {
+                    Text("筛选与排序")
+                        .font(.system(size: 16, weight: .bold, design: .rounded))
+                        .foregroundColor(primaryText)
+                    Spacer()
+                    if vault.activeFilterCount > 0 {
+                        Button {
+                            vault.resetAllFilters()
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        } label: {
+                            Label("重置全部筛选", systemImage: "arrow.counterclockwise")
+                                .font(.system(size: 12.5, weight: .semibold))
+                                .foregroundColor(vault.accentColor)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass").foregroundColor(secondaryText)
+                    StableSearchTextField(placeholder: "搜索壁纸名称或文件名…", text: $vault.searchText, fontSize: 14.5)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 24)
+                    if !vault.searchText.isEmpty {
+                        Button { vault.searchText = "" } label: {
+                            Image(systemName: "xmark.circle.fill").foregroundColor(secondaryText)
+                        }
+                    }
+                }
+                .padding(.horizontal, 12)
+                .frame(height: 36)
+                .background(WallPullPalette.cardSurface(scheme), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).strokeBorder(WallPullPalette.hairline(scheme), lineWidth: 1))
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("排序方式")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundColor(secondaryText)
+                    LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 7) {
+                        ForEach(VaultSortMode.allCases) { mode in
+                            filterChip(title: mode.rawValue, active: vault.sortMode == mode, scheme: scheme, primaryText: primaryText) {
+                                vault.sortMode = mode
+                            }
+                        }
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("内容年龄分级")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundColor(secondaryText)
+                    HStack(spacing: 7) {
+                        ForEach(ContentRatingFilter.allCases) { opt in
+                            filterChip(title: opt.rawValue, active: vault.ratingFilter == opt, scheme: scheme, primaryText: primaryText) {
+                                vault.ratingFilter = opt
+                            }
+                        }
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("规格与特性筛选")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundColor(secondaryText)
+                    LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 7) {
+                        ForEach(SpecFilter.allCases) { spec in
+                            filterChip(title: spec.rawValue, active: vault.specFilter == spec, scheme: scheme, primaryText: primaryText) {
+                                vault.specFilter = spec
+                            }
+                        }
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("主色调色板")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundColor(secondaryText)
+                        Spacer()
+                        if let activeColor = vault.colorFilter {
+                            Text("\(activeColor.label) · \(colorCounts[activeColor] ?? 0) 项")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(vault.accentColor)
+                        }
+                    }
+                    LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 7) {
+                        ForEach(ColorBucketKind.allCases) { bucket in
+                            let count = colorCounts[bucket] ?? 0
+                            let active = vault.colorFilter == bucket
+                            Button {
+                                vault.colorFilter = active ? nil : bucket
+                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            } label: {
+                                HStack(spacing: 8) {
+                                    Circle()
+                                        .fill(bucket.swatchColor)
+                                        .frame(width: 13, height: 13)
+                                        .overlay(Circle().strokeBorder(primaryText.opacity(0.22), lineWidth: 0.8))
+                                    Text(bucket.label)
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundColor(primaryText)
+                                        .lineLimit(1)
+                                    Spacer()
+                                    Text("\(count)")
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .foregroundColor(secondaryText)
+                                }
+                                .padding(.horizontal, 10)
+                                .frame(height: 31)
+                                .background(
+                                    active ? vault.accentColor.opacity(0.16) : WallPullPalette.cardSurface(scheme),
+                                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .strokeBorder(active ? vault.accentColor : WallPullPalette.hairline(scheme), lineWidth: active ? 1.5 : 1)
+                                )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("卡片画幅与网格列数")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundColor(secondaryText)
+                    WallPullSegmentedPill(
+                        options: CardAspectMode.allCases,
+                        selection: cardAspectBinding,
+                        label: { $0.rawValue },
+                        height: 32
+                    )
+
+                    HStack(spacing: 8) {
+                        Text(vault.cardAspectMode == .square ? "方块密度" : "每行显示列数")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(primaryText)
+                        Spacer()
+                        HStack(spacing: 5) {
+                            ForEach(2...6, id: \.self) { cols in
+                                let active = vault.columnsCount == cols
+                                Button {
+                                    withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                                        vault.columnsCount = cols
+                                    }
+                                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                } label: {
+                                    Text(vault.cardAspectMode == .square ? "\(cols - 1)档" : "\(cols)列")
+                                        .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                                        .foregroundColor(active ? .white : primaryText)
+                                        .padding(.horizontal, 9)
+                                        .frame(height: 28)
+                                        .background(
+                                            active ? vault.accentColor : WallPullPalette.cardSurface(scheme),
+                                            in: Capsule()
+                                        )
+                                        .overlay(
+                                            Capsule().strokeBorder(
+                                                active ? vault.accentColor : WallPullPalette.hairline(scheme),
+                                                lineWidth: 1
+                                            )
+                                        )
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(16)
+        }
+        .frame(width: 420)
+        .frame(maxHeight: 620)
+        .background(WallPullPalette.canvas(scheme))
+        .preferredColorScheme(vault.appearanceMode.colorScheme)
+    }
+
+    private func filterChip(title: String, active: Bool, scheme: ColorScheme, primaryText: Color, action: @escaping () -> Void) -> some View {
+        Button {
+            action()
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        } label: {
+            Text(title)
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundColor(active ? .white : primaryText)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity)
+                .frame(height: 30)
+                .background(active ? vault.accentColor : WallPullPalette.cardSurface(scheme), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(active ? vault.accentColor : WallPullPalette.hairline(scheme), lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
     }
 }
 

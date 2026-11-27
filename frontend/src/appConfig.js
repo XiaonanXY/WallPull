@@ -102,6 +102,12 @@ export const SELECTION_BORDER_MODES = [
   { value: 'orbit', label: '旋转边框' },
 ]
 
+export const GALLERY_CARD_LAYOUTS = [
+  { value: 'square', label: '1:1' },
+  { value: 'widescreen', label: '16:10' },
+  { value: 'adaptive', label: '原图比例' },
+]
+
 export const HARDWARE_ACCELERATION_MODES = [
   {
     value: 'gpu',
@@ -117,7 +123,7 @@ export const HARDWARE_ACCELERATION_MODES = [
 
 export const APP_INFO = {
   name: 'WallPull',
-  version: '1.0.3',
+  version: '1.0.4',
   author: 'Xiaonan',
   license: 'GNU GPL-3.0',
   repoUrl: 'https://github.com/XiaonanXY/WallPull',
@@ -176,6 +182,8 @@ export const DEFAULT_SETTINGS = {
   ratingFilter: 'all',
   sortBy: 'default',
   colorFilter: null,
+  customFfmpegPath: null,
+  galleryCardLayout: 'square',
 }
 
 export const MOCK_WALLPAPERS = Array.from({ length: 18 }, (_, index) => ({

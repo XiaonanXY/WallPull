@@ -4,6 +4,7 @@ mod actions;
 mod bridge;
 mod clipboard;
 mod duplicates;
+mod image_capture;
 mod localsend;
 mod media;
 mod models;
@@ -14,6 +15,8 @@ mod scene_studio;
 mod settings;
 mod tex;
 mod tray;
+mod tray_actions;
+mod tray_menu;
 mod we_bridge;
 mod window;
 

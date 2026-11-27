@@ -12,7 +12,7 @@ body:
     attributes:
       label: 软件版本
       description: 可在「设置 → 关于与反馈」中查看当前版本号
-      placeholder: "例如：v1.0.3"
+      placeholder: "例如：v1.0.4"
     validations:
       required: true
   - type: input

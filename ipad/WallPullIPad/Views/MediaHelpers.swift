@@ -1519,7 +1519,10 @@ struct ClampedBadgeTextField: UIViewRepresentable {
 
     func updateUIView(_ uiView: UITextField, context: Context) {
         context.coordinator.text = $text
-        if uiView.markedTextRange == nil && uiView.text != text {
+        if text.isEmpty && !(uiView.text ?? "").isEmpty {
+            uiView.unmarkText()
+            uiView.text = ""
+        } else if uiView.markedTextRange == nil && uiView.text != text {
             uiView.text = text
         }
         if uiView.placeholder != placeholder {
@@ -1553,6 +1556,73 @@ struct ClampedBadgeTextField: UIViewRepresentable {
             }
             if text.wrappedValue != clamped {
                 text.wrappedValue = clamped
+            }
+        }
+
+        func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+            textField.resignFirstResponder()
+            return true
+        }
+    }
+}
+
+struct StableSearchTextField: UIViewRepresentable {
+    let placeholder: String
+    @Binding var text: String
+    var fontSize: CGFloat = 14.5
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text)
+    }
+
+    func makeUIView(context: Context) -> UITextField {
+        let tf = UITextField()
+        tf.placeholder = placeholder
+        tf.text = text
+        tf.font = UIFont.systemFont(ofSize: fontSize, weight: .regular)
+        tf.borderStyle = .none
+        tf.clearButtonMode = .never
+        tf.returnKeyType = .search
+        tf.autocorrectionType = .no
+        tf.autocapitalizationType = .none
+        tf.delegate = context.coordinator
+        tf.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        tf.addTarget(context.coordinator, action: #selector(Coordinator.editingChanged(_:)), for: .editingChanged)
+        return tf
+    }
+
+    func updateUIView(_ uiView: UITextField, context: Context) {
+        context.coordinator.text = $text
+        if text.isEmpty && !(uiView.text ?? "").isEmpty {
+            uiView.unmarkText()
+            uiView.text = ""
+        } else if uiView.markedTextRange == nil && uiView.text != text {
+            uiView.text = text
+        }
+        if uiView.placeholder != placeholder {
+            uiView.placeholder = placeholder
+        }
+    }
+
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        var text: Binding<String>
+
+        init(text: Binding<String>) {
+            self.text = text
+        }
+
+        @objc func editingChanged(_ sender: UITextField) {
+            guard sender.markedTextRange == nil else { return }
+            let val = sender.text ?? ""
+            if text.wrappedValue != val {
+                text.wrappedValue = val
+            }
+        }
+
+        func textFieldDidEndEditing(_ textField: UITextField) {
+            let val = textField.text ?? ""
+            if text.wrappedValue != val {
+                text.wrappedValue = val
             }
         }
 

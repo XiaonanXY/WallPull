@@ -472,8 +472,8 @@ struct LocalSendSheetView: View {
     private func catalogToolbar(for pc: LocalSendPeer) -> some View {
         let searchBox = HStack(spacing: 6) {
             Image(systemName: "magnifyingglass").foregroundColor(.secondary)
-            TextField("搜索壁纸名称…", text: $catalogQuery)
-                .frame(width: 168)
+            StableSearchTextField(placeholder: "搜索壁纸名称…", text: $catalogQuery, fontSize: 14)
+                .frame(width: 168, height: 24)
             if !catalogQuery.isEmpty {
                 Button {
                     catalogQuery = ""

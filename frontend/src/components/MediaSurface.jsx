@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Pause, Play, SpeakerHigh, SpeakerLow, SpeakerSlash } from '@phosphor-icons/react'
+import { Camera, Pause, Play, SpeakerHigh, SpeakerLow, SpeakerSlash } from '@phosphor-icons/react'
 import useVideoPlaybackBudget from '../hooks/useVideoPlaybackBudget.js'
 import {
   getSavedVideoTime,
+  isLegacySquarePreviewUrl,
   isMediaRevealed,
   markMediaRevealed,
   saveVideoTime,
@@ -29,6 +30,7 @@ export default function MediaSurface({
   overrideImageSrc = '',
   videoElementRef = null,
   onIntrinsicSize = null,
+  onCaptureFrame = null,
 }) {
   const internalVideoRef = useRef(null)
   const videoRef = videoElementRef || internalVideoRef
@@ -43,10 +45,12 @@ export default function MediaSurface({
   const onIntrinsicSizeRef = useRef(onIntrinsicSize)
   onIntrinsicSizeRef.current = onIntrinsicSize
 
+  const validPreviewUrl = item.previewUrl && !isLegacySquarePreviewUrl(item.previewUrl) ? item.previewUrl : ''
+  const validPreviewVideoUrl = item.previewVideoUrl && !isLegacySquarePreviewUrl(item.previewVideoUrl) ? item.previewVideoUrl : ''
   const imageSrc = overrideImageSrc || (interactive
-    ? (item.mediaUrl || item.previewUrl)
-    : (item.previewUrl || item.mediaUrl))
-  const videoSrc = interactive ? item.mediaUrl : (item.previewVideoUrl || item.mediaUrl)
+    ? (item.mediaUrl || validPreviewUrl)
+    : (validPreviewUrl || item.mediaUrl))
+  const videoSrc = interactive ? item.mediaUrl : (validPreviewVideoUrl || item.mediaUrl)
   const revealKey = `${item.id}:${item.type === 'video' ? videoSrc : imageSrc}`
   const [ready, setReady] = useState(() => interactive || isMediaRevealed(revealKey))
   const [fullLoaded, setFullLoaded] = useState(false)
@@ -131,8 +135,8 @@ export default function MediaSurface({
   const showPlaceholder = interactive &&
     item.type !== 'video' &&
     !fullLoaded &&
-    Boolean(item.previewUrl) &&
-    item.previewUrl !== imageSrc
+    Boolean(validPreviewUrl) &&
+    validPreviewUrl !== imageSrc
 
   const applySavedTime = useCallback(video => {
     const saved = getSavedVideoTime(item.id)
@@ -140,28 +144,29 @@ export default function MediaSurface({
       const target = saved % video.duration
       if (Math.abs(video.currentTime - target) > 0.18) {
         try {
-          video.currentTime = target
+          if (!interactive && typeof video.fastSeek === 'function') {
+            video.fastSeek(target)
+          } else {
+            video.currentTime = target
+          }
         } catch {
           // ignore seek before ready
         }
       }
     }
     restoredRef.current = true
-  }, [item.id])
+  }, [interactive, item.id])
 
   useEffect(() => {
     const video = videoRef.current
     if (!video || item.type !== 'video') return undefined
 
-    if (videoSrc && video.getAttribute('src') !== videoSrc) {
-      video.src = videoSrc
-    }
     restoredRef.current = false
     const reportVideoSize = () => {
       if (video.videoWidth > 0 && video.videoHeight > 0) {
         onIntrinsicSizeRef.current?.({ width: video.videoWidth, height: video.videoHeight })
       }
-      if (Number.isFinite(video.duration) && video.duration > 0) {
+      if (interactive && Number.isFinite(video.duration) && video.duration > 0) {
         setDuration(video.duration)
       }
     }
@@ -184,7 +189,7 @@ export default function MediaSurface({
       }
       video.pause()
     }
-  }, [applySavedTime, item.id, item.type, videoRef, videoSrc])
+  }, [applySavedTime, interactive, item.id, item.type, videoRef, videoSrc])
 
   useEffect(() => {
     const video = videoRef.current
@@ -203,35 +208,58 @@ export default function MediaSurface({
 
   useEffect(() => {
     const video = videoRef.current
-    if (!video || item.type !== 'video') return
+    if (!video || item.type !== 'video') return undefined
     if (paused || (!interactive && !mayPlay)) {
       wasPausedRef.current = true
       if (restoredRef.current && video.currentTime > 0) {
         saveVideoTime(item.id, video.currentTime)
       }
       video.pause()
-      setIsPlaying(false)
-      return
+      if (interactive) setIsPlaying(false)
+      return undefined
     }
 
-    if (wasPausedRef.current || !restoredRef.current) {
-      wasPausedRef.current = false
-      if (video.readyState >= 1) {
-        applySavedTime(video)
+    let cancelled = false
+    const startPlayback = () => {
+      if (cancelled) return
+      if (wasPausedRef.current || !restoredRef.current) {
+        wasPausedRef.current = false
+        if (video.readyState >= 1) {
+          applySavedTime(video)
+        }
+      }
+      const playPromise = video.play()
+      if (playPromise && typeof playPromise.then === 'function') {
+        playPromise.then(() => {
+          if (interactive && !cancelled) setIsPlaying(true)
+        }).catch(() => {
+          if (!interactive || cancelled) return
+          // Fallback if WebView policy rejects unmuted autoplay without direct gesture
+          video.muted = true
+          setIsMuted(true)
+          video.play()?.then(() => {
+            if (!cancelled) setIsPlaying(true)
+          }).catch(() => {
+            if (!cancelled) setIsPlaying(false)
+          })
+        })
       }
     }
 
-    const playPromise = video.play()
-    if (playPromise && typeof playPromise.then === 'function') {
-      playPromise.then(() => {
-        setIsPlaying(true)
-      }).catch(() => {
-        if (!interactive) return
-        // Fallback if WebView policy rejects unmuted autoplay without direct gesture
-        video.muted = true
-        setIsMuted(true)
-        video.play()?.then(() => setIsPlaying(true)).catch(() => setIsPlaying(false))
-      })
+    // If a remounted video has a saved timestamp and metadata isn't ready yet, wait for
+    // loadedmetadata so we seek BEFORE starting playback (prevents flashing 0:00 then jumping).
+    if (video.readyState < 1 && getSavedVideoTime(item.id) > 0.18) {
+      const onMetaReady = () => startPlayback()
+      video.addEventListener('loadedmetadata', onMetaReady, { once: true })
+      return () => {
+        cancelled = true
+        video.removeEventListener('loadedmetadata', onMetaReady)
+      }
+    }
+
+    startPlayback()
+    return () => {
+      cancelled = true
     }
   }, [applySavedTime, interactive, item.id, item.type, mayPlay, paused, videoRef, videoSrc])
 
@@ -372,25 +400,28 @@ export default function MediaSurface({
           <video
             ref={videoRef}
             src={videoSrc}
-            poster={item.previewUrl || undefined}
+            crossOrigin="anonymous"
+            poster={validPreviewUrl || undefined}
             aria-label={item.title}
             className="fusion-image fusion-video"
             style={{ objectFit: fit, cursor: showFloatingHud ? 'pointer' : undefined }}
             onClick={showFloatingHud ? togglePlayPause : undefined}
             onLoadedData={markReady}
-            onPlay={() => setIsPlaying(true)}
-            onPause={() => setIsPlaying(false)}
-            onLoadedMetadata={event => {
+            onPlay={interactive ? () => setIsPlaying(true) : undefined}
+            onPause={interactive ? () => setIsPlaying(false) : undefined}
+            onLoadedMetadata={interactive ? event => {
               const dur = event.currentTarget.duration
               if (Number.isFinite(dur) && dur > 0) setDuration(dur)
-            }}
+            } : undefined}
             onTimeUpdate={event => {
               const vid = event.currentTarget
-              if (!isScrubbing && Number.isFinite(vid.currentTime)) {
-                setCurrentTime(vid.currentTime)
-              }
-              if (Number.isFinite(vid.duration) && vid.duration > 0 && Math.abs(vid.duration - duration) > 0.2) {
-                setDuration(vid.duration)
+              if (interactive) {
+                if (!isScrubbing && Number.isFinite(vid.currentTime)) {
+                  setCurrentTime(vid.currentTime)
+                }
+                if (Number.isFinite(vid.duration) && vid.duration > 0 && Math.abs(vid.duration - duration) > 0.2) {
+                  setDuration(vid.duration)
+                }
               }
               if (restoredRef.current && vid.currentTime > 0) {
                 saveVideoTime(item.id, vid.currentTime)
@@ -415,7 +446,7 @@ export default function MediaSurface({
           <>
             {showPlaceholder ? (
               <img
-                src={item.previewUrl}
+                src={validPreviewUrl}
                 alt=""
                 aria-hidden="true"
                 className="fusion-image fusion-still absolute inset-0"
@@ -642,6 +673,22 @@ export default function MediaSurface({
               </div>
             </div>
           </div>
+
+          {onCaptureFrame ? (
+            <button
+              type="button"
+              className="wp-video-hud__btn"
+              aria-label="截取当前帧"
+              onClick={event => {
+                event.stopPropagation()
+                event.currentTarget?.blur?.()
+                bumpHudVisibility()
+                onCaptureFrame(videoRef.current)
+              }}
+            >
+              <Camera size={15} weight="fill" aria-hidden="true" />
+            </button>
+          ) : null}
         </div>
       ) : null}
     </div>

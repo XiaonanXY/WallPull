@@ -1,15 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 import { ArrowsClockwise, ChatCircleDots, Cpu, DeviceTablet, GithubLogo, Info, X } from '@phosphor-icons/react'
 import { AnimatePresence, motion } from 'motion/react'
-import { formatColor } from '@appica/ui-react'
-import {
-  ColorSwatchPicker,
-  ColorSwatchPickerItem,
-} from '@appica/ui-react/color-swatch-picker'
 import WakeSlider from './reactbits/WakeSlider.jsx'
+import CrispColorSwatches from './ui/CrispColorSwatches.jsx'
+import FfmpegStatusBanner from './ui/FfmpegStatusBanner.jsx'
 import {
   APP_INFO,
   CARD_MODES,
+  GALLERY_CARD_LAYOUTS,
   HARDWARE_ACCELERATION_MODES,
   NAVIGATION_STYLES,
   SELECTION_BORDER_MODES,
@@ -18,33 +16,6 @@ import {
   formatBytes,
   isValidHexColor,
 } from '../appConfig.js'
-
-function extractSixDigitHex(color) {
-  if (!color) return null
-  if (typeof color === 'string') {
-    const trimmed = color.trim()
-    if (/^#[0-9a-f]{8}$/i.test(trimmed)) return trimmed.slice(0, 7).toLowerCase()
-    if (isValidHexColor(trimmed)) return trimmed.toLowerCase()
-    return null
-  }
-  try {
-    const formatted = formatColor(color, 'hex')
-    if (typeof formatted === 'string') {
-      const trimmed = formatted.trim()
-      if (/^#[0-9a-f]{8}$/i.test(trimmed)) return trimmed.slice(0, 7).toLowerCase()
-      if (isValidHexColor(trimmed)) return trimmed.toLowerCase()
-    }
-  } catch {
-    // fallback below
-  }
-  if (typeof color.red === 'number' && typeof color.green === 'number' && typeof color.blue === 'number') {
-    const toByte = value => Math.max(0, Math.min(255, Math.round(value)))
-    return `#${[color.red, color.green, color.blue]
-      .map(channel => toByte(channel).toString(16).padStart(2, '0'))
-      .join('')}`
-  }
-  return null
-}
 
 export default function SettingsPage({
   visible = true,
@@ -75,6 +46,7 @@ export default function SettingsPage({
   onOpenExternalUrl,
   sendNativeMessage,
   persistSettings,
+  ffmpegStatus = null,
 }) {
   const [savedNotice, setSavedNotice] = useState(false)
   const noticeTimerRef = useRef(null)
@@ -150,7 +122,7 @@ export default function SettingsPage({
 
       <div className={`${layoutMode === 'drawer' ? 'mt-5 space-y-5' : 'mt-8 space-y-6'}`}>
           <section className="space-y-6 rounded-2xl border border-base-300/70 bg-base-200/45 p-6">
-            <h2 className="text-xs font-semibold tracking-wider text-base-content/55 uppercase">
+            <h2 className="text-[13.5px] font-bold tracking-tight text-base-content/80">
               目录与存储
             </h2>
             <fieldset className="fieldset">
@@ -223,10 +195,21 @@ export default function SettingsPage({
                 清理缓存
               </button>
             </div>
+
+            <div className="border-t border-base-300/60 pt-4">
+              <FfmpegStatusBanner
+                status={ffmpegStatus}
+                isNative={isNative}
+                onRefresh={() => sendNativeMessage('ffmpeg.status.request', {})}
+                onOpenToolsDir={() => sendNativeMessage('ffmpeg.open-tools-dir.request', {})}
+                onPickExe={() => sendNativeMessage('ffmpeg.pick-exe.request', {})}
+                onClearCustom={() => sendNativeMessage('ffmpeg.clear-custom.request', {})}
+              />
+            </div>
           </section>
 
           <section className="space-y-6 rounded-2xl border border-base-300/70 bg-base-200/45 p-6">
-            <h2 className="text-xs font-semibold tracking-wider text-base-content/55 uppercase">
+            <h2 className="text-[13.5px] font-bold tracking-tight text-base-content/80">
               外观与交互
             </h2>
             <fieldset className="fieldset">
@@ -252,24 +235,16 @@ export default function SettingsPage({
             <fieldset className="fieldset">
               <legend className="fieldset-legend">界面主题色</legend>
               <div className="flex flex-wrap items-center gap-4">
-                <ColorSwatchPicker
-                  aria-label="界面主题色板"
-                  shape="circle"
-                  size={34}
+                <CrispColorSwatches
+                  ariaLabel="界面主题色板"
+                  items={THEME_COLORS.map(color => ({ value: color, color, label: color }))}
                   value={sparkColor}
-                  onValueChange={color => {
-                    const hex = extractSixDigitHex(color)
-                    if (hex) {
-                      commitSettingPatch({ sparkColor: hex })
-                    }
-                  }}
-                >
-                  {THEME_COLORS.map(color => (
-                    <ColorSwatchPickerItem key={color} color={color} />
-                  ))}
-                </ColorSwatchPicker>
+                  size={28}
+                  className="py-1 pl-0.5"
+                  onSelect={hex => commitSettingPatch({ sparkColor: hex })}
+                />
                 <input
-                  className={`input input-sm w-36 ${
+                  className={`input input-sm w-32 ${
                     isValidHexColor(settings.sparkColor) ? '' : 'input-error'
                   }`}
                   value={settings.sparkColor}
@@ -368,6 +343,26 @@ export default function SettingsPage({
             </fieldset>
 
             <fieldset className="fieldset">
+              <legend className="fieldset-legend">画廊卡片比例</legend>
+              <div className="flex flex-wrap gap-2" role="group" aria-label="画廊卡片比例">
+                {GALLERY_CARD_LAYOUTS.map(item => {
+                  const isActive = (settings.galleryCardLayout || 'square') === item.value
+                  return (
+                    <button
+                      key={item.value}
+                      type="button"
+                      className={`btn btn-sm ${isActive ? 'btn-primary' : 'btn-ghost'}`}
+                      aria-pressed={isActive}
+                      onClick={() => commitSettingPatch({ galleryCardLayout: item.value })}
+                    >
+                      {item.label}
+                    </button>
+                  )
+                })}
+              </div>
+            </fieldset>
+
+            <fieldset className="fieldset">
               <legend className="fieldset-legend">卡片悬浮物理手感</legend>
               <div className="flex flex-wrap gap-2" role="group" aria-label="卡片悬浮手感">
                 {CARD_MODES.map(item => {
@@ -389,7 +384,7 @@ export default function SettingsPage({
           </section>
 
           <section className="space-y-6 rounded-2xl border border-base-300/70 bg-base-200/45 p-6">
-            <h2 className="text-xs font-semibold tracking-wider text-base-content/55 uppercase">
+            <h2 className="text-[13.5px] font-bold tracking-tight text-base-content/80">
               窗口与后台常驻
             </h2>
 
@@ -412,7 +407,7 @@ export default function SettingsPage({
 
           <section className="space-y-6 rounded-2xl border border-base-300/70 bg-base-200/45 p-6">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <h2 className="flex items-center gap-1.5 text-xs font-semibold tracking-wider text-base-content/55">
+              <h2 className="flex items-center gap-1.5 text-[13.5px] font-bold tracking-tight text-base-content/80">
                 <DeviceTablet size={14} weight="bold" />
                 跨端互联
               </h2>
@@ -526,7 +521,7 @@ export default function SettingsPage({
           </section>
 
           <section className="space-y-6 rounded-2xl border border-base-300/70 bg-base-200/45 p-6">
-            <h2 className="text-xs font-semibold tracking-wider text-base-content/55 uppercase">
+            <h2 className="text-[13.5px] font-bold tracking-tight text-base-content/80">
               硬件与渲染
             </h2>
             <fieldset className="fieldset">
@@ -579,7 +574,7 @@ export default function SettingsPage({
 
           <section className="space-y-4 rounded-2xl border border-base-300/70 bg-base-200/45 p-6">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <h2 className="flex items-center gap-1.5 text-xs font-semibold tracking-wider text-base-content/55 uppercase">
+              <h2 className="flex items-center gap-1.5 text-[13.5px] font-bold tracking-tight text-base-content/80">
                 <Info size={14} weight="bold" />
                 关于与反馈
               </h2>

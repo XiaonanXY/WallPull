@@ -529,3 +529,69 @@ extension View {
         ))
     }
 }
+
+private struct DockAvailWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        let next = nextValue()
+        if next > 0 { value = next }
+    }
+}
+
+private struct DockContentWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        let next = nextValue()
+        if next > 0 { value = next }
+    }
+}
+
+struct CenteredAdaptiveDock<Content: View>: View {
+    @ViewBuilder let content: () -> Content
+    @State private var availWidth: CGFloat = 0
+    @State private var contentWidth: CGFloat = 0
+
+    private var needsScroll: Bool {
+        availWidth > 0 && contentWidth > availWidth + 4
+    }
+
+    var body: some View {
+        let measured = content()
+            .fixedSize(horizontal: true, vertical: false)
+            .background(
+                GeometryReader { geo in
+                    Color.clear.preference(key: DockContentWidthKey.self, value: geo.size.width)
+                }
+            )
+            .onPreferenceChange(DockContentWidthKey.self) { next in
+                if abs(next - contentWidth) > 1 {
+                    contentWidth = next
+                }
+            }
+
+        Group {
+            if needsScroll {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    measured
+                }
+            } else {
+                HStack(spacing: 0) {
+                    Spacer(minLength: 0)
+                    measured
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .background(
+            GeometryReader { geo in
+                Color.clear.preference(key: DockAvailWidthKey.self, value: geo.size.width)
+            }
+        )
+        .onPreferenceChange(DockAvailWidthKey.self) { next in
+            if abs(next - availWidth) > 1 {
+                availWidth = next
+            }
+        }
+    }
+}

@@ -67,6 +67,21 @@ pub fn imported_wallpapers_root() -> PathBuf {
     local_app_data_root().join("ImportedWallpapers")
 }
 
+pub fn preferred_tools_dir() -> PathBuf {
+    if let Ok(cur_exe) = std::env::current_exe() {
+        if let Some(dir) = cur_exe.parent() {
+            let bundled = dir.join("Tools");
+            if bundled.is_dir() {
+                return bundled;
+            }
+            if dir.is_dir() {
+                return dir.join("Tools");
+            }
+        }
+    }
+    local_app_data_root().join("Tools")
+}
+
 pub fn append_managed_roots(mut roots: Vec<String>) -> Vec<String> {
     let managed = crate::models::clean_path_str(&imported_wallpapers_root());
     let managed_norm = managed.trim_end_matches(['\\', '/']).to_ascii_lowercase();
@@ -285,6 +300,20 @@ pub fn sanitize_settings(updated: AppSettings) -> AppSettings {
                 });
             }
             out
+        },
+        custom_ffmpeg_path: updated
+            .custom_ffmpeg_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(normalize_path_str),
+        gallery_card_layout: if matches!(
+            updated.gallery_card_layout.as_str(),
+            "square" | "widescreen" | "adaptive"
+        ) {
+            updated.gallery_card_layout
+        } else {
+            "square".to_string()
         },
     }
 }
@@ -712,5 +741,26 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn sanitize_and_persist_v104_gallery_layout_and_ffmpeg_path() {
+        let mut s = AppSettings::default();
+        s.gallery_card_layout = "portrait".to_string();
+        s.custom_ffmpeg_path = Some("   ".to_string());
+        let cleaned = sanitize_settings(s);
+        assert_eq!(cleaned.gallery_card_layout, "square");
+        assert_eq!(cleaned.custom_ffmpeg_path, None);
+
+        let tmp = std::env::temp_dir().join(format!("wp_settings_v104_{}.json", std::process::id()));
+        let _ = fs::remove_file(&tmp);
+        let mut s2 = AppSettings::default();
+        s2.gallery_card_layout = "adaptive".to_string();
+        s2.custom_ffmpeg_path = Some(r"C:\Tools\ffmpeg.exe".to_string());
+        save_settings_to(&tmp, &s2).unwrap();
+        let loaded = load_settings_from(&tmp);
+        assert_eq!(loaded.gallery_card_layout, "adaptive");
+        assert_eq!(loaded.custom_ffmpeg_path.as_deref(), Some(r"C:\Tools\ffmpeg.exe"));
+        let _ = fs::remove_file(&tmp);
     }
 }

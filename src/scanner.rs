@@ -1,6 +1,7 @@
 use crate::duplicates::compute_visual_profile;
 use crate::media::{
-    create_image_thumbnail_cancellable, detect_media_type, find_executable,
+    create_image_thumbnail_cancellable, detect_media_type, existing_image_thumbnail_path,
+    existing_video_preview_clip_path, existing_video_preview_path, find_executable,
     is_recognized_media_path, probe_or_fallback_cancellable, try_create_video_preview_cancellable,
     try_create_video_preview_clip_cancellable, video_has_audio_stream_cancellable,
 };
@@ -464,7 +465,11 @@ where
     let scan_cache: WallpaperScanCache = fs::read(&catalog_path)
         .ok()
         .and_then(|b| serde_json::from_slice::<WallpaperScanCache>(&b).ok())
-        .filter(|c| c.version == 5 || c.version == WallpaperScanCache::CURRENT_VERSION)
+        .filter(|c| {
+            c.version == 5
+                || c.version == 6
+                || c.version == WallpaperScanCache::CURRENT_VERSION
+        })
         .unwrap_or_else(WallpaperScanCache::empty);
 
     let mut cached_map: HashMap<String, WallpaperScanCacheProject> = HashMap::new();
@@ -491,6 +496,7 @@ where
     let mut freshly_parsed_ids: HashSet<String> = HashSet::new();
     let mut reused_batch_buf: Vec<WallpaperItem> = Vec::with_capacity(200);
     let mut backfill_indices: Vec<usize> = Vec::new();
+    let mut upgrade_media_indices: Vec<(usize, String)> = Vec::new();
 
     for root in &roots {
         let Ok(dir_entries) = fs::read_dir(root) else {
@@ -532,14 +538,74 @@ where
                 if let Some(cached) = cached_map.get(&key) {
                     if can_reuse_cached(cached, &ws_id, has_ffmpeg, &p_str) {
                         if !cached.items.is_empty() && !is_cancelled(cancel) {
-                            for it in &cached.items {
-                                let mut it = it.clone();
+                            for (item_idx, orig_it) in cached.items.iter().enumerate() {
+                                let mut it = orig_it.clone();
+                                let mkey = item_media_cache_key(&it, &p_str, item_idx);
+                                let src_p = Path::new(&it.source_path);
+                                let mut needs_media_upgrade = false;
+
+                                if it.item_type == "image" {
+                                    let is_v3 = it
+                                        .preview_path
+                                        .to_ascii_lowercase()
+                                        .ends_with("-img-thumb-v3.jpg")
+                                        && Path::new(&it.preview_path).is_file();
+                                    if !is_v3 {
+                                        if let Some(existing) = existing_image_thumbnail_path(src_p, &mkey) {
+                                            it.preview_path = existing;
+                                            it.has_preview = true;
+                                        } else {
+                                            it.preview_path = it.source_path.clone();
+                                            it.has_preview = true;
+                                            needs_media_upgrade = true;
+                                        }
+                                    }
+                                } else if it.item_type == "video" {
+                                    if it
+                                        .preview_video_path
+                                        .as_deref()
+                                        .map(|vp| is_legacy_square_path(vp) || !Path::new(vp).is_file())
+                                        .unwrap_or(false)
+                                    {
+                                        it.preview_video_path = None;
+                                    }
+                                    if is_legacy_square_path(&it.preview_path)
+                                        || !Path::new(&it.preview_path).is_file()
+                                    {
+                                        it.preview_path.clear();
+                                        it.has_preview = false;
+                                    }
+                                    if !it.preview_path.to_ascii_lowercase().ends_with("-aspect-v4.jpg") {
+                                        if let Some(existing) = existing_video_preview_path(src_p, &mkey) {
+                                            it.preview_path = existing;
+                                            it.has_preview = true;
+                                        } else if has_ffmpeg {
+                                            needs_media_upgrade = true;
+                                        }
+                                    }
+                                    let has_v2_clip = it
+                                        .preview_video_path
+                                        .as_deref()
+                                        .map(|vp| {
+                                            vp.to_ascii_lowercase().ends_with("-aspect-v2.mp4")
+                                                && Path::new(vp).is_file()
+                                        })
+                                        .unwrap_or(false);
+                                    if !has_v2_clip {
+                                        if let Some(existing_clip) = existing_video_preview_clip_path(src_p, &mkey) {
+                                            it.preview_video_path = Some(existing_clip);
+                                        } else if has_ffmpeg {
+                                            needs_media_upgrade = true;
+                                        }
+                                    }
+                                }
+
                                 if it.item_type == "video"
                                     && it.audio_paths.is_none()
-                                    && Path::new(&it.source_path).is_file()
+                                    && src_p.is_file()
                                 {
                                     if video_has_audio_stream_cancellable(
-                                        Path::new(&it.source_path),
+                                        src_p,
                                         ffprobe_path.as_deref(),
                                         cancel,
                                     ) {
@@ -549,6 +615,9 @@ where
                                     }
                                 }
                                 let idx = items.len();
+                                if needs_media_upgrade {
+                                    upgrade_media_indices.push((idx, mkey));
+                                }
                                 if it.color_bucket.is_none() || it.visual_fingerprint.is_none() {
                                     backfill_indices.push(idx);
                                 }
@@ -589,6 +658,135 @@ where
         .num_threads(worker_threads)
         .build()
         .ok();
+
+    if !upgrade_media_indices.is_empty() && !is_cancelled(cancel) {
+        let total = upgrade_media_indices.len();
+        on_progress(ScanProgressInfo {
+            message: &format!("正在优化新版等比缩略图 (0 / {total})…"),
+            phase: "scan",
+            current: 0,
+            total,
+        });
+        let done_counter = AtomicUsize::new(0);
+        let last_emit = Mutex::new(Instant::now());
+        let upgrade_batch_buf: Mutex<Vec<WallpaperItem>> = Mutex::new(Vec::with_capacity(8));
+        let snapshots: Vec<(usize, WallpaperItem, String)> = upgrade_media_indices
+            .into_iter()
+            .map(|(idx, mkey)| (idx, items[idx].clone(), mkey))
+            .collect();
+
+        let run_upgrades = || {
+            snapshots
+                .into_par_iter()
+                .filter_map(|(idx, mut it, mkey)| {
+                    if is_cancelled(cancel) {
+                        return None;
+                    }
+                    let src_p = Path::new(&it.source_path);
+                    let mut changed = false;
+                    if it.item_type == "image" {
+                        if let Some(thumb) = create_image_thumbnail_cancellable(
+                            src_p,
+                            &mkey,
+                            ffmpeg_path.as_deref(),
+                            cancel,
+                        ) {
+                            it.preview_path = thumb;
+                            it.has_preview = true;
+                            changed = true;
+                        }
+                    } else if it.item_type == "video" {
+                        if !it.preview_path.to_ascii_lowercase().ends_with("-aspect-v4.jpg") {
+                            if let Some(gp) = try_create_video_preview_cancellable(
+                                src_p,
+                                &mkey,
+                                ffmpeg_path.as_deref(),
+                                use_hw_decode,
+                                cancel,
+                            ) {
+                                it.preview_path = gp;
+                                it.has_preview = true;
+                                changed = true;
+                            }
+                        }
+                        if !it
+                            .preview_video_path
+                            .as_deref()
+                            .map(|vp| vp.to_ascii_lowercase().ends_with("-aspect-v2.mp4"))
+                            .unwrap_or(false)
+                        {
+                            if let Some(clip) = try_create_video_preview_clip_cancellable(
+                                src_p,
+                                &mkey,
+                                ffmpeg_path.as_deref(),
+                                use_hw_decode,
+                                cancel,
+                            ) {
+                                it.preview_video_path = Some(clip);
+                                changed = true;
+                            }
+                        }
+                    }
+
+                    if changed && !is_cancelled(cancel) {
+                        let flush_chunk = upgrade_batch_buf.lock().ok().and_then(|mut buf| {
+                            buf.push(it.clone());
+                            if buf.len() >= 6 {
+                                Some(std::mem::take(&mut *buf))
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(chunk) = flush_chunk {
+                            on_batch(&chunk);
+                        }
+                    }
+
+                    let done = done_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    let should_emit = done == total
+                        || last_emit
+                            .lock()
+                            .map(|mut t| {
+                                if t.elapsed() >= Duration::from_millis(60) {
+                                    *t = Instant::now();
+                                    true
+                                } else {
+                                    false
+                                }
+                            })
+                            .unwrap_or(false);
+                    if should_emit {
+                        on_progress(ScanProgressInfo {
+                            message: &format!("正在优化新版等比缩略图 ({done} / {total})…"),
+                            phase: "scan",
+                            current: done,
+                            total,
+                        });
+                    }
+                    Some((idx, it))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let upgraded = match &pool {
+            Some(p) => p.install(run_upgrades),
+            None => run_upgrades(),
+        };
+        if let Ok(mut buf) = upgrade_batch_buf.lock() {
+            if !buf.is_empty() && !is_cancelled(cancel) {
+                on_batch(&buf);
+                buf.clear();
+            }
+        }
+        if !is_cancelled(cancel) {
+            for (idx, it) in upgraded {
+                items[idx] = it;
+            }
+            if pending.is_empty() {
+                try_save_catalog(&items, &entries, &live_projects, &catalog_path);
+            }
+        }
+    }
 
     if !backfill_indices.is_empty() && !is_cancelled(cancel) {
         let total = backfill_indices.len();
@@ -689,7 +887,7 @@ where
                     if !parsed_items.is_empty() {
                         let flush_chunk = pending_batch_buf.lock().ok().and_then(|mut buf| {
                             buf.extend(parsed_items.iter().cloned());
-                            if buf.len() >= 16 {
+                            if buf.len() >= 4 {
                                 Some(std::mem::take(&mut *buf))
                             } else {
                                 None
@@ -746,6 +944,11 @@ where
         }
     }
 
+    if !is_cancelled(cancel) && !pending.is_empty() {
+        try_save_catalog(&items, &entries, &live_projects, &catalog_path);
+    }
+
+    let mut titles_updated = false;
     if !is_cancelled(cancel)
         && fetch_online_titles
         && !freshly_parsed_ids.is_empty()
@@ -756,8 +959,10 @@ where
         for item in &mut items {
             if freshly_parsed_ids.contains(&item.workshop_id) {
                 if let Some(t) = official_titles.get(&item.workshop_id) {
-                    if !t.trim().is_empty() {
-                        item.title = t.trim().to_string();
+                    let trimmed = t.trim();
+                    if !trimmed.is_empty() && item.title != trimmed {
+                        item.title = trimmed.to_string();
+                        titles_updated = true;
                     }
                 }
             }
@@ -809,9 +1014,36 @@ where
         entries: entries.clone(),
     };
 
-    if !is_cancelled(cancel) {
+    if !is_cancelled(cancel) && (titles_updated || pending.is_empty()) {
         try_save_catalog(&items, &entries, &live_projects, &catalog_path);
     }
+
+    if !is_cancelled(cancel) {
+        static PRUNED_LEGACY: OnceLock<()> = OnceLock::new();
+        PRUNED_LEGACY.get_or_init(|| {
+            let root = cache_root();
+            std::thread::spawn(move || {
+                for sub in ["video-previews", "video-clips"] {
+                    let dir = root.join(sub);
+                    if let Ok(rd) = fs::read_dir(&dir) {
+                        for entry in rd.flatten() {
+                            let p = entry.path();
+                            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                                let lower = name.to_ascii_lowercase();
+                                if lower.ends_with("-img-thumb-v2.jpg")
+                                    || lower.ends_with("-square-v3.jpg")
+                                    || lower.ends_with("-480p-v1.mp4")
+                                {
+                                    let _ = fs::remove_file(&p);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        });
+    }
+
     WallpaperScanResult { items, report }
 }
 
@@ -1413,10 +1645,34 @@ fn file_sig(path: &Path) -> Option<(u64, u64)> {
     Some((meta.len(), mtime_ms))
 }
 
+fn is_legacy_square_path(p: &str) -> bool {
+    let lower = p.to_ascii_lowercase();
+    lower.ends_with("-img-thumb-v2.jpg")
+        || lower.ends_with("-square-v3.jpg")
+        || lower.ends_with("-480p-v1.mp4")
+}
+
+fn item_media_cache_key(it: &WallpaperItem, proj_dir: &str, item_idx: usize) -> String {
+    let proj_norm = normalize_project_key(proj_dir);
+    let src_norm = normalize_project_key(&it.source_path);
+    let in_proj = !proj_norm.is_empty() && src_norm.starts_with(&proj_norm);
+    if !in_proj {
+        if it.item_type == "video" {
+            format!("{}-scene-video-{}", it.workshop_id, item_idx + 1)
+        } else {
+            format!("{}-scene-img-{}", it.workshop_id, item_idx + 1)
+        }
+    } else if it.item_type == "video" {
+        format!("{}-direct-video", it.workshop_id)
+    } else {
+        format!("{}-direct-img", it.workshop_id)
+    }
+}
+
 fn can_reuse_cached(
     cached: &WallpaperScanCacheProject,
     workshop_id: &str,
-    has_ffmpeg: bool,
+    _has_ffmpeg: bool,
     project_dir: &str,
 ) -> bool {
     if cached.workshop_id != workshop_id
@@ -1444,7 +1700,6 @@ fn can_reuse_cached(
     cached.items.iter().all(|item| {
         item.workshop_id == workshop_id
             && Path::new(&item.source_path).is_file()
-            && (!item.has_preview || Path::new(&item.preview_path).is_file())
             && item
                 .asset_paths
                 .as_ref()
@@ -1455,24 +1710,6 @@ fn can_reuse_cached(
                 .as_ref()
                 .map(|a| a.iter().all(|p| Path::new(p).is_file()))
                 .unwrap_or(true)
-            && (!has_ffmpeg
-                || item.item_type != "video"
-                || (item
-                    .preview_path
-                    .to_ascii_lowercase()
-                    .ends_with("-square-v3.jpg")
-                    && Path::new(&item.preview_path).is_file()
-                    && item
-                        .preview_video_path
-                        .as_deref()
-                        .map(|p| !p.is_empty() && Path::new(p).is_file())
-                        .unwrap_or(false)))
-            && (item.item_type != "image"
-                || (item
-                    .preview_path
-                    .to_ascii_lowercase()
-                    .ends_with("-img-thumb-v2.jpg")
-                    && Path::new(&item.preview_path).is_file()))
     })
 }
 
@@ -1672,14 +1909,14 @@ mod tests {
             assert!(!item.preview_path.starts_with(r"\\?\"));
             assert!(!item.workshop_directory.starts_with(r"\\?\"));
             assert!(
-                item.preview_path.to_ascii_lowercase().ends_with("-square-v3.jpg"),
-                "expected clean extracted 1024px frame for {ws_id}, got {}",
+                item.preview_path.to_ascii_lowercase().ends_with("-aspect-v4.jpg"),
+                "expected clean extracted aspect-preserving frame for {ws_id}, got {}",
                 item.preview_path
             );
             let dims = image::image_dimensions(&item.preview_path).expect("valid preview jpg");
-            assert_eq!(dims, (1024, 1024));
-            let clip = item.preview_video_path.as_deref().expect("expected 480p clip");
-            assert!(clip.to_ascii_lowercase().ends_with("-480p-v1.mp4"));
+            assert!(dims.0 > 0 && dims.1 > 0 && dims.0 <= 800 && dims.1 <= 800);
+            let clip = item.preview_video_path.as_deref().expect("expected aspect clip");
+            assert!(clip.to_ascii_lowercase().ends_with("-aspect-v2.mp4"));
             assert!(Path::new(clip).is_file());
         }
     }

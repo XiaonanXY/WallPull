@@ -380,7 +380,7 @@ struct ToastBannerState: Equatable {
 }
 
 enum AppInfoConstants {
-    static let version = "1.0.3"
+    static let version = "1.0.4"
     static let author = "Xiaonan"
     static let license = "GNU GPL-3.0"
     static let repoURL = URL(string: "https://github.com/XiaonanXY/WallPull")!

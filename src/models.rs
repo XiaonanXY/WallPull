@@ -75,6 +75,9 @@ fn default_all() -> String {
 fn default_sort_default() -> String {
     "default".to_string()
 }
+fn default_gallery_card_layout() -> String {
+    "square".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -142,6 +145,10 @@ pub struct AppSettings {
     pub localsend_pair_pin: String,
     #[serde(default)]
     pub localsend_trusted_peers: Vec<TrustedLanPeer>,
+    #[serde(default)]
+    pub custom_ffmpeg_path: Option<String>,
+    #[serde(default = "default_gallery_card_layout")]
+    pub gallery_card_layout: String,
 }
 
 impl Default for AppSettings {
@@ -174,6 +181,8 @@ impl Default for AppSettings {
             localsend_device_id: String::new(),
             localsend_pair_pin: String::new(),
             localsend_trusted_peers: Vec::new(),
+            custom_ffmpeg_path: None,
+            gallery_card_layout: default_gallery_card_layout(),
         }
     }
 }
@@ -319,7 +328,7 @@ pub struct WallpaperScanCache {
 }
 
 impl WallpaperScanCache {
-    pub const CURRENT_VERSION: i32 = 6;
+    pub const CURRENT_VERSION: i32 = 7;
     pub fn empty() -> Self {
         Self {
             version: Self::CURRENT_VERSION,

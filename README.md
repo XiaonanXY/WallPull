@@ -363,6 +363,46 @@ Windows 与 iPad 双端 **2D 透视拆解台** 同步新增 **「原图对比 / 
 
 ---
 
+## v1.0.4 双端新特性实机预览（40–45）
+
+### 40 · Windows 智能比例裁切工作台（原图无损像素直出，v1.0.4）
+
+<p align="center">
+  <img src="./docs/showcase/42-win-image-crop-studio.png" alt="WallPull Windows 智能比例裁切工作台" width="100%" />
+</p>
+
+### 41 · iPad 智能比例裁切工作台（双指/触控拖框与相册直存，v1.0.4）
+
+<p align="center">
+  <img src="./docs/showcase/43-ipad-image-crop-studio.png" alt="WallPull iPad 智能比例裁切台" width="100%" />
+</p>
+
+### 42 · Windows 视频高清截帧预览与微调（v1.0.4）
+
+<p align="center">
+  <img src="./docs/showcase/44-win-video-frame-capture.png" alt="WallPull Windows 视频高清截帧预览" width="100%" />
+</p>
+
+### 43 · iPad 视频高清截帧预览（暂停定格与高画质 PNG 导出，v1.0.4）
+
+<p align="center">
+  <img src="./docs/showcase/45-ipad-video-frame-capture.png" alt="WallPull iPad 视频高清截帧预览" width="100%" />
+</p>
+
+### 44 · Windows 筛选排序与 4 列对齐画廊卡片（v1.0.4）
+
+<p align="center">
+  <img src="./docs/showcase/46-win-filter-and-sort-v104.png" alt="WallPull Windows 筛选排序面板与 4 列自适应画廊" width="100%" />
+</p>
+
+### 45 · Windows 全新自绘高 DPI 系统托盘菜单（v1.0.4）
+
+<p align="center">
+  <img src="./docs/showcase/47-win-tray-menu.png" alt="WallPull Windows 自绘高清亮暗双色系统托盘菜单" width="100%" />
+</p>
+
+---
+
 ## 下载与使用（普通用户）
 
 ### Windows 桌面端

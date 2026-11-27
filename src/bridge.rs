@@ -8,11 +8,18 @@ use crate::actions::{
 };
 use crate::clipboard::{copy_media_to_clipboard, copy_text_to_clipboard};
 use crate::duplicates::analyze_duplicates;
+use crate::image_capture::{
+    copy_png_bytes_to_clipboard, crop_image_file_normalized, crop_png_bytes_normalized,
+    decode_base64_png_data_url, sanitize_png_stem, save_png_bytes_to_dir,
+};
 use crate::localsend::{
     LocalSendEvent, LocalSendHub, OutgoingTransferFile, SendProgressInfo, SendTransferError,
     TransferSource, mime_for_path,
 };
-use crate::media::{find_executable, is_recognized_media_path, probe_or_fallback};
+use crate::media::{
+    detect_ffmpeg_status, find_executable, is_recognized_media_path, probe_or_fallback,
+    set_custom_ffmpeg_override,
+};
 use crate::models::{
     AppSettings, AudioTrackPayload, GpuAdapterInfo, ItemPrecomputedMeta, TrustedLanPeer,
     WallpaperItem, WallpaperPayloadItem, WallpaperScanReport, WorkshopExtraMetadata,
@@ -28,8 +35,10 @@ use crate::scene_studio::{SceneStudioSession, has_inspectable_2d_scene, open_stu
 use crate::settings::{
     append_managed_roots, cache_root, calculate_cache_size_bytes, clear_media_cache,
     get_gpu_adapters, imported_wallpapers_root, load_settings_from, locate_workshop_roots,
-    resolve_configured_workshop_roots, sanitize_settings, save_settings_to, settings_file_path,
+    preferred_tools_dir, resolve_configured_workshop_roots, sanitize_settings, save_settings_to,
+    settings_file_path,
 };
+use crate::tray_actions::{next_random_seed, pick_random_wallpaper};
 use crate::we_bridge::{
     apply_custom_image, apply_wallpaper_item, apply_wallpaper_properties,
     resolve_wallpaper_asset_path,
@@ -117,6 +126,10 @@ pub enum UiCommand {
         path: Option<String>,
     },
     PickedExportDir {
+        request_id: Option<String>,
+        path: Option<String>,
+    },
+    PickedFfmpegPath {
         request_id: Option<String>,
         path: Option<String>,
     },
@@ -227,6 +240,7 @@ pub struct AppController {
     pub studio_preview_bytes: Arc<Mutex<Option<(u64, Arc<Vec<u8>>)>>>,
     pub studio_baseline_bytes: Arc<Mutex<Option<(u64, Arc<Vec<u8>>)>>>,
     pub localsend: Arc<LocalSendHub>,
+    pub last_random_desktop_id: Option<String>,
     pub exiting_explicitly: bool,
     pub self_test: bool,
 }
@@ -235,6 +249,7 @@ impl AppController {
     pub fn new(hwnd: HWND, self_test: bool) -> Box<Self> {
         let (tx, rx) = mpsc::channel();
         let settings = load_settings_from(&settings_file_path());
+        set_custom_ffmpeg_override(settings.custom_ffmpeg_path.as_deref());
         let active_hw_accel = if settings.hardware_acceleration_mode == "cpu" {
             "cpu".to_string()
         } else {
@@ -362,11 +377,54 @@ impl AppController {
             studio_preview_bytes: Arc::new(Mutex::new(None)),
             studio_baseline_bytes: Arc::new(Mutex::new(None)),
             localsend,
+            last_random_desktop_id: None,
             exiting_explicitly: false,
             self_test,
         });
         app.sync_watcher_roots();
         app
+    }
+
+    pub fn apply_random_desktop_from_tray(&mut self, favorites_only: bool) {
+        let seed = next_random_seed();
+        let Some(picked) = pick_random_wallpaper(
+            &self.wallpapers,
+            &self.settings.favorite_ids,
+            favorites_only,
+            self.last_random_desktop_id.as_deref(),
+            seed,
+        )
+        .cloned() else {
+            let msg = if favorites_only {
+                "当前没有可用的收藏壁纸用于随机切换。"
+            } else {
+                "当前壁纸库为空，请先在主窗口扫描壁纸。"
+            };
+            self.post_json("app.toast", json!({ "message": msg }), None);
+            return;
+        };
+        self.last_random_desktop_id = Some(picked.id.clone());
+        let title = picked.title.clone();
+        let tx = self.tx.clone();
+        let hwnd = self.hwnd.0 as isize;
+        std::thread::spawn(move || {
+            let result = apply_wallpaper_item(&picked, None);
+            send_ui(
+                &tx,
+                hwnd,
+                UiCommand::SetDesktopCompleted {
+                    request_id: None,
+                    title,
+                    result,
+                },
+            );
+        });
+    }
+
+    pub fn open_export_directory(&self) {
+        let dir = PathBuf::from(&self.settings.export_directory);
+        let _ = fs::create_dir_all(&dir);
+        let _ = open_explorer_path(&dir.to_string_lossy());
     }
 
     pub fn shutdown_background_tasks(&mut self) {
@@ -1041,6 +1099,33 @@ impl AppController {
                         self.post_json("settings.value", &self.settings, request_id.as_deref());
                     }
                 }
+                UiCommand::PickedFfmpegPath { request_id, path } => {
+                    if let Some(p) = path {
+                        let probe = detect_ffmpeg_status(Some(&p));
+                        if probe.source == "custom" && probe.available {
+                            self.settings.custom_ffmpeg_path = Some(p);
+                            self.settings = sanitize_settings(self.settings.clone());
+                            set_custom_ffmpeg_override(self.settings.custom_ffmpeg_path.as_deref());
+                            let _ = save_settings_to(&settings_file_path(), &self.settings);
+                            let status = detect_ffmpeg_status(self.settings.custom_ffmpeg_path.as_deref());
+                            self.post_json("settings.value", &self.settings, request_id.as_deref());
+                            self.post_json("ffmpeg.status", &status, request_id.as_deref());
+                            self.post_json(
+                                "wallpapers.action.result",
+                                json!({ "message": "已启用自定义 FFmpeg 组件" }),
+                                request_id.as_deref(),
+                            );
+                        } else {
+                            let status = detect_ffmpeg_status(self.settings.custom_ffmpeg_path.as_deref());
+                            self.post_json("ffmpeg.status", &status, request_id.as_deref());
+                            self.post_json(
+                                "wallpapers.action.result",
+                                json!({ "message": "所选文件不可用，请确认选择正确的 ffmpeg.exe" }),
+                                request_id.as_deref(),
+                            );
+                        }
+                    }
+                }
                 UiCommand::ExportWithPicker {
                     request_id,
                     ids,
@@ -1376,6 +1461,7 @@ impl AppController {
                     return Ok(());
                 }
                 let maximized = unsafe { IsZoomed(self.hwnd).as_bool() };
+                let ffmpeg_status = detect_ffmpeg_status(self.settings.custom_ffmpeg_path.as_deref());
                 self.post_json(
                     "app.state",
                     json!({
@@ -1388,6 +1474,7 @@ impl AppController {
                         "cacheSizeBytes": 0,
                         "maximized": maximized,
                         "appVersion": env!("CARGO_PKG_VERSION"),
+                        "ffmpegStatus": ffmpeg_status,
                     }),
                     req_id.as_deref(),
                 );
@@ -2309,26 +2396,54 @@ impl AppController {
                 let p = payload.ok_or_else(|| "设置内容为空。".to_string())?;
                 let parsed: AppSettings = serde_json::from_value(p.clone())
                     .map_err(|_| "设置内容无效。".to_string())?;
+                let prev = self.settings.clone();
                 let mut next = sanitize_settings(parsed);
                 next.localsend_device_id = self.settings.localsend_device_id.clone();
                 next.localsend_pair_pin = self.settings.localsend_pair_pin.clone();
                 next.localsend_trusted_peers = self.settings.localsend_trusted_peers.clone();
                 self.settings = next;
+                let ffmpeg_changed = prev.custom_ffmpeg_path != self.settings.custom_ffmpeg_path;
+                let watcher_changed = prev.workshop_root != self.settings.workshop_root
+                    || prev.export_directory != self.settings.export_directory;
+                let localsend_cfg_changed = prev.localsend_enabled != self.settings.localsend_enabled
+                    || prev.localsend_alias != self.settings.localsend_alias
+                    || prev.export_directory != self.settings.export_directory;
+                let favorites_changed = prev.favorite_ids != self.settings.favorite_ids;
+                let theme_changed = prev.theme_mode != self.settings.theme_mode;
+
+                if ffmpeg_changed {
+                    set_custom_ffmpeg_override(self.settings.custom_ffmpeg_path.as_deref());
+                }
                 save_settings_to(&settings_file_path(), &self.settings)?;
-                self.sync_watcher_roots();
-                self.localsend.update_config(
-                    self.settings.localsend_enabled,
-                    &self.settings.localsend_alias,
-                    &self.settings.export_directory,
-                );
-                self.localsend.set_favorite_ids(&self.settings.favorite_ids);
-                self.apply_window_theme(self.settings.theme_mode == "dark");
+                if watcher_changed {
+                    self.sync_watcher_roots();
+                }
+                if localsend_cfg_changed {
+                    self.localsend.update_config(
+                        self.settings.localsend_enabled,
+                        &self.settings.localsend_alias,
+                        &self.settings.export_directory,
+                    );
+                }
+                if favorites_changed {
+                    self.localsend.set_favorite_ids(&self.settings.favorite_ids);
+                }
+                if theme_changed {
+                    self.apply_window_theme(self.settings.theme_mode == "dark");
+                }
                 self.post_json("settings.value", &self.settings, req_id.as_deref());
-                self.post_json(
-                    "localsend.status",
-                    self.localsend.status_snapshot(),
-                    req_id.as_deref(),
-                );
+                if ffmpeg_changed {
+                    let ffmpeg_status =
+                        detect_ffmpeg_status(self.settings.custom_ffmpeg_path.as_deref());
+                    self.post_json("ffmpeg.status", &ffmpeg_status, req_id.as_deref());
+                }
+                if localsend_cfg_changed || favorites_changed {
+                    self.post_json(
+                        "localsend.status",
+                        self.localsend.status_snapshot(),
+                        req_id.as_deref(),
+                    );
+                }
                 Ok(())
             }
             "settings.pick-workshop.request" => {
@@ -2817,6 +2932,317 @@ impl AppController {
                             },
                         ),
                         Err(SendTransferError::Message(msg)) => send_ui(
+                            &tx,
+                            hwnd,
+                            UiCommand::PostJson {
+                                msg_type: "error".into(),
+                                payload: json!({ "message": msg }),
+                                request_id: rq,
+                            },
+                        ),
+                    }
+                });
+                Ok(())
+            }
+            "ffmpeg.status.request" => {
+                let status = detect_ffmpeg_status(self.settings.custom_ffmpeg_path.as_deref());
+                self.post_json("ffmpeg.status", &status, req_id.as_deref());
+                Ok(())
+            }
+            "ffmpeg.open-tools-dir.request" => {
+                let dir = preferred_tools_dir();
+                fs::create_dir_all(&dir).map_err(|e| format!("创建 Tools 目录失败：{e}"))?;
+                open_explorer_path(&dir.to_string_lossy())
+            }
+            "ffmpeg.pick-exe.request" => {
+                let tx = self.tx.clone();
+                let hwnd = self.hwnd.0 as isize;
+                let rq = req_id.clone();
+                std::thread::spawn(move || {
+                    let picked = rfd::FileDialog::new()
+                        .add_filter("FFmpeg 可执行文件", &["exe"])
+                        .pick_file()
+                        .map(|p| p.to_string_lossy().into_owned());
+                    send_ui(
+                        &tx,
+                        hwnd,
+                        UiCommand::PickedFfmpegPath {
+                            request_id: rq,
+                            path: picked,
+                        },
+                    );
+                });
+                Ok(())
+            }
+            "ffmpeg.clear-custom.request" => {
+                self.settings.custom_ffmpeg_path = None;
+                set_custom_ffmpeg_override(None);
+                save_settings_to(&settings_file_path(), &self.settings)?;
+                let status = detect_ffmpeg_status(None);
+                self.post_json("settings.value", &self.settings, req_id.as_deref());
+                self.post_json("ffmpeg.status", &status, req_id.as_deref());
+                Ok(())
+            }
+            "media.png-action.request" => {
+                let data_url = payload
+                    .and_then(|p| p.get("dataUrl"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "缺少图片数据。".to_string())?
+                    .to_string();
+                let mode = payload
+                    .and_then(|p| p.get("mode"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("copy")
+                    .to_string();
+                let stem = payload
+                    .and_then(|p| p.get("stem"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("wallpull-capture")
+                    .to_string();
+                let export_dir = PathBuf::from(&self.settings.export_directory);
+                let tx = self.tx.clone();
+                let hwnd = self.hwnd.0 as isize;
+                let rq = req_id.clone();
+
+                std::thread::spawn(move || {
+                    let res: Result<Value, String> = (|| {
+                        let png_bytes = decode_base64_png_data_url(&data_url)?;
+                        match mode.as_str() {
+                            "copy" => {
+                                copy_png_bytes_to_clipboard(&png_bytes, &stem)?;
+                                Ok(json!({ "message": "已将高清 PNG 复制到剪贴板，可直接 Ctrl+V 粘贴发送" }))
+                            }
+                            "save" => {
+                                let dest = save_png_bytes_to_dir(&png_bytes, &export_dir, &stem)?;
+                                Ok(json!({
+                                    "message": format!("已保存 PNG 到导出目录：{}", dest.file_name().and_then(|n| n.to_str()).unwrap_or("capture.png")),
+                                    "destination": clean_path_str(&dest),
+                                }))
+                            }
+                            "save-as" => {
+                                let _ = fs::create_dir_all(&export_dir);
+                                let safe_name = format!("{}.png", sanitize_png_stem(&stem));
+                                let Some(dest) = rfd::FileDialog::new()
+                                    .add_filter("PNG 图像", &["png"])
+                                    .set_directory(&export_dir)
+                                    .set_file_name(safe_name)
+                                    .save_file()
+                                else {
+                                    return Ok(json!({ "cancelled": true }));
+                                };
+                                fs::write(&dest, &png_bytes).map_err(|e| format!("保存 PNG 失败：{e}"))?;
+                                Ok(json!({
+                                    "message": format!("已保存 PNG：{}", dest.file_name().and_then(|n| n.to_str()).unwrap_or("capture.png")),
+                                    "destination": clean_path_str(&dest),
+                                }))
+                            }
+                            _ => Err("不支持的 PNG 操作模式。".to_string()),
+                        }
+                    })();
+                    match res {
+                        Ok(payload_val) => {
+                            if payload_val.get("cancelled").and_then(|v| v.as_bool()) != Some(true) {
+                                send_ui(
+                                    &tx,
+                                    hwnd,
+                                    UiCommand::PostJson {
+                                        msg_type: "wallpapers.action.result".into(),
+                                        payload: payload_val,
+                                        request_id: rq,
+                                    },
+                                );
+                            }
+                        }
+                        Err(msg) => send_ui(
+                            &tx,
+                            hwnd,
+                            UiCommand::PostJson {
+                                msg_type: "error".into(),
+                                payload: json!({ "message": msg }),
+                                request_id: rq,
+                            },
+                        ),
+                    }
+                });
+                Ok(())
+            }
+            "media.crop-action.request" => {
+                let source_kind = payload
+                    .and_then(|p| p.get("sourceKind"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("wallpaper")
+                    .to_string();
+                let mode = payload
+                    .and_then(|p| p.get("mode"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("copy")
+                    .to_string();
+                let stem = payload
+                    .and_then(|p| p.get("stem"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("wallpull-crop")
+                    .to_string();
+                let rect = payload.and_then(|p| p.get("rect"));
+                let rx = rect.and_then(|r| r.get("x")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let ry = rect.and_then(|r| r.get("y")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let rw = rect.and_then(|r| r.get("w")).and_then(|v| v.as_f64()).unwrap_or(1.0);
+                let rh = rect.and_then(|r| r.get("h")).and_then(|v| v.as_f64()).unwrap_or(1.0);
+
+                let wallpaper_path = if source_kind == "wallpaper" {
+                    let wid = payload
+                        .and_then(|p| p.get("wallpaperId"))
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| "缺少壁纸 ID，无法读取原文件。".to_string())?;
+                    let w = self
+                        .wallpapers
+                        .get(wid)
+                        .ok_or_else(|| "未在库中找到该壁纸，请重新扫描后重试。".to_string())?;
+                    let asset_idx = payload
+                        .and_then(|p| p.get("assetIndex"))
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as usize);
+                    let is_decodable_img = |p: &Path| {
+                        p.is_file() && crate::media::detect_media_type(p) == Some("image")
+                    };
+                    let primary = resolve_wallpaper_asset_path(w, asset_idx);
+                    let chosen = if !primary.is_empty() && is_decodable_img(Path::new(&primary)) {
+                        Some(PathBuf::from(primary))
+                    } else if let Some(first_asset) = w
+                        .asset_paths
+                        .as_ref()
+                        .and_then(|assets| assets.iter().find(|a| is_decodable_img(Path::new(a))))
+                    {
+                        Some(PathBuf::from(first_asset))
+                    } else if !w.preview_path.is_empty() && is_decodable_img(Path::new(&w.preview_path)) {
+                        Some(PathBuf::from(&w.preview_path))
+                    } else {
+                        None
+                    };
+                    Some(chosen.ok_or_else(|| {
+                        "该壁纸暂无可直接裁切的图片原文件，请尝试从「透视拆解台」进入裁切。".to_string()
+                    })?)
+                } else {
+                    None
+                };
+
+                let studio_task = if source_kind == "studio" {
+                    let (_, session, _) = self
+                        .studio_session
+                        .as_ref()
+                        .ok_or_else(|| "拆解台会话已关闭，请重新打开后再裁切。".to_string())?;
+                    let visible_set: HashSet<usize> = payload
+                        .and_then(|p| p.get("layerIndices"))
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|n| n.as_u64().map(|x| x as usize))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let trim_bounds = payload
+                        .and_then(|p| p.get("trimBounds"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let include_bg = payload
+                        .and_then(|p| p.get("includeBackground"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    Some((session.clone(), visible_set, include_bg, !include_bg && trim_bounds))
+                } else {
+                    None
+                };
+
+                let data_url_opt = if source_kind == "dataUrl" {
+                    Some(
+                        payload
+                            .and_then(|p| p.get("dataUrl"))
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| "缺少截帧图片数据。".to_string())?
+                            .to_string(),
+                    )
+                } else {
+                    None
+                };
+
+                let export_dir = PathBuf::from(&self.settings.export_directory);
+                let tx = self.tx.clone();
+                let hwnd = self.hwnd.0 as isize;
+                let rq = req_id.clone();
+
+                std::thread::spawn(move || {
+                    let res: Result<Value, String> = (|| {
+                        let (png_bytes, cw, ch) = if let Some(path) = wallpaper_path {
+                            crop_image_file_normalized(&path, rx, ry, rw, rh)?
+                        } else if let Some((session, vis_set, include_bg, trim)) = studio_task {
+                            let (full_png, r) = session.render_subset_to_png_bytes(
+                                &vis_set,
+                                0,
+                                !include_bg,
+                                trim,
+                            )?;
+                            if !r.has_pixels {
+                                return Err("当前勾选图层画面为空，请至少保留一个可见图层。".to_string());
+                            }
+                            crop_png_bytes_normalized(&full_png, rx, ry, rw, rh)?
+                        } else if let Some(data_url) = data_url_opt {
+                            let raw_png = decode_base64_png_data_url(&data_url)?;
+                            crop_png_bytes_normalized(&raw_png, rx, ry, rw, rh)?
+                        } else {
+                            return Err("不支持的裁切图片来源类型。".to_string());
+                        };
+
+                        match mode.as_str() {
+                            "copy" => {
+                                copy_png_bytes_to_clipboard(&png_bytes, &stem)?;
+                                Ok(json!({
+                                    "message": format!("已将原分辨率裁切 PNG（{cw} × {ch}）复制到剪贴板，可直接 Ctrl+V 粘贴发送")
+                                }))
+                            }
+                            "save" => {
+                                let dest = save_png_bytes_to_dir(&png_bytes, &export_dir, &stem)?;
+                                Ok(json!({
+                                    "message": format!("已保存原分辨率裁切 PNG（{cw} × {ch}）：{}", dest.file_name().and_then(|n| n.to_str()).unwrap_or("crop.png")),
+                                    "destination": clean_path_str(&dest),
+                                }))
+                            }
+                            "save-as" => {
+                                let _ = fs::create_dir_all(&export_dir);
+                                let safe_name = format!("{}.png", sanitize_png_stem(&stem));
+                                let Some(dest) = rfd::FileDialog::new()
+                                    .add_filter("PNG 图像", &["png"])
+                                    .set_directory(&export_dir)
+                                    .set_file_name(safe_name)
+                                    .save_file()
+                                else {
+                                    return Ok(json!({ "cancelled": true }));
+                                };
+                                fs::write(&dest, &png_bytes).map_err(|e| format!("保存裁切 PNG 失败：{e}"))?;
+                                Ok(json!({
+                                    "message": format!("已保存原分辨率裁切 PNG（{cw} × {ch}）：{}", dest.file_name().and_then(|n| n.to_str()).unwrap_or("crop.png")),
+                                    "destination": clean_path_str(&dest),
+                                }))
+                            }
+                            _ => Err("不支持的 PNG 操作模式。".to_string()),
+                        }
+                    })();
+                    match res {
+                        Ok(payload_val) => {
+                            let msg_type = if payload_val.get("cancelled").and_then(|v| v.as_bool()) == Some(true) {
+                                "media.crop-action.cancelled"
+                            } else {
+                                "wallpapers.action.result"
+                            };
+                            send_ui(
+                                &tx,
+                                hwnd,
+                                UiCommand::PostJson {
+                                    msg_type: msg_type.into(),
+                                    payload: payload_val,
+                                    request_id: rq,
+                                },
+                            );
+                        }
+                        Err(msg) => send_ui(
                             &tx,
                             hwnd,
                             UiCommand::PostJson {

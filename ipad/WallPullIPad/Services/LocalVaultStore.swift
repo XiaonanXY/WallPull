@@ -1275,14 +1275,17 @@ final class LocalVaultStore: ObservableObject {
         }
     }
 
-    func copyUIImageLosslessToClipboard(_ image: UIImage) {
+    func copyUIImageLosslessToClipboard(
+        _ image: UIImage,
+        toastMessage: String = "已无损复制透明立绘到剪贴板，切去微信直接粘贴"
+    ) {
         guard let png = image.pngData() else {
             showToast("编码透明 PNG 失败", isError: true)
             return
         }
         UIPasteboard.general.setItems([[UTType.png.identifier: png]])
         UINotificationFeedbackGenerator().notificationOccurred(.success)
-        showToast("已无损复制透明立绘到剪贴板，切去微信直接粘贴")
+        showToast(toastMessage)
     }
 
     func copyIncomingBytesToClipboard(_ data: Data, fileName: String, senderAlias: String) {
@@ -1305,7 +1308,9 @@ final class LocalVaultStore: ObservableObject {
         _ image: UIImage,
         title: String,
         isTransparent: Bool,
-        contentRating: String? = nil
+        contentRating: String? = nil,
+        sourceDevice: String = "透视拆解台",
+        toastMessage: String = "已将拆图成品收入离线壁纸库"
     ) async -> VaultItem? {
         guard let png = image.pngData() else { return nil }
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("wp_studio_\(UUID().uuidString).png")
@@ -1315,13 +1320,13 @@ final class LocalVaultStore: ObservableObject {
             from: tmp,
             suggestedFileName: "\(title).png",
             titleOverride: title,
-            sourceDevice: "透视拆解台",
+            sourceDevice: sourceDevice,
             isCutoutHint: isTransparent,
             contentRating: contentRating
         )
         if created != nil {
             UINotificationFeedbackGenerator().notificationOccurred(.success)
-            showToast("已将拆图成品收入离线壁纸库")
+            showToast(toastMessage)
         }
         return created
     }

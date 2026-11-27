@@ -7,6 +7,7 @@ import {
   CaretRight,
   Columns,
   Copy,
+  Crop,
   Desktop,
   DeviceTablet,
   DownloadSimple,
@@ -54,6 +55,7 @@ export default function SceneLayerStudioDialog({
   suppressHotkeys = false,
   onPreviewChange,
   onExport,
+  onOpenCrop,
   onSendToTablet,
   onClose,
 }) {
@@ -607,6 +609,32 @@ export default function SceneLayerStudioDialog({
               <Copy size={15} weight="bold" />
               复制透明图
             </button>
+            {onOpenCrop && state?.previewUrl ? (
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                disabled={!manifest || visibleSet.size === 0}
+                onClick={() => {
+                  let estimatedSize = null
+                  if (manifest?.canvasWidth > 0 && manifest?.canvasHeight > 0) {
+                    estimatedSize = { w: manifest.canvasWidth, h: manifest.canvasHeight }
+                  }
+                  onOpenCrop({
+                    src: state.previewUrl,
+                    heading: `${state.title || '拆解立绘'} · 比例裁切`,
+                    suggestedName: `${state.title || 'scene'}_立绘`,
+                    sourceKind: 'studio',
+                    layerIndices: [...visibleSet],
+                    trimBounds: false,
+                    includeBackground,
+                    nativeSize: estimatedSize,
+                  })
+                }}
+              >
+                <Crop size={15} weight="bold" />
+                比例裁切
+              </button>
+            ) : null}
             <button
               type="button"
               className="btn btn-ghost btn-sm"

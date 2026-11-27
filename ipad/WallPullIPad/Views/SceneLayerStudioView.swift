@@ -37,6 +37,7 @@ struct SceneLayerStudioView: View {
     @State private var isCompositedTrimmed: Bool = false
     @State private var isBatchExportingCharacters: Bool = false
     @State private var renderTask: Task<Void, Never>? = nil
+    @State private var showCropSheet: Bool = false
 
     private var effectiveScheme: ColorScheme {
         vault.appearanceMode.colorScheme ?? colorScheme
@@ -126,6 +127,55 @@ struct SceneLayerStudioView: View {
             }
             .navigationViewStyle(.stack)
             .preferredColorScheme(vault.appearanceMode.colorScheme)
+        }
+        .sheet(isPresented: $showCropSheet) {
+            if let img = compositedImage {
+                let activeLayersSnapshot = Array(visibleLayerIndices)
+                let keepBG = includeBackground
+                let trimmed = isCompositedTrimmed
+                let nativeOverride: CGSize? = {
+                    guard let m = onlineManifest, m.canvasWidth > 0, m.canvasHeight > 0 else {
+                        return nil
+                    }
+                    if !trimmed {
+                        return CGSize(width: m.canvasWidth, height: m.canvasHeight)
+                    }
+                    if let cg = img.cgImage {
+                        let scale = max(1.0, CGFloat(max(m.canvasWidth, m.canvasHeight)) / 2048.0)
+                        return CGSize(
+                            width: (CGFloat(cg.width) * scale).rounded(),
+                            height: (CGFloat(cg.height) * scale).rounded()
+                        )
+                    }
+                    return nil
+                }()
+                let fullResFetcher: (() async -> UIImage?)? = {
+                    guard onlineManifest != nil, let peer = localSend.primaryPCPeer, let rid = item.remoteID else {
+                        return nil
+                    }
+                    return {
+                        await localSend.renderStudioFrame(
+                            remoteID: rid,
+                            visibleLayers: activeLayersSnapshot,
+                            maxDimension: 0,
+                            preserveTransparency: !keepBG,
+                            trimBounds: trimmed,
+                            peer: peer
+                        )
+                    }
+                }()
+                ImageCropSheetView(
+                    sourceImage: img,
+                    titleText: "\(item.title) · 拆图",
+                    isTransparent: !includeBackground,
+                    contentRating: item.contentRating,
+                    nativePixelSizeOverride: nativeOverride,
+                    fullResImageProvider: fullResFetcher,
+                    vault: vault,
+                    localSend: localSend,
+                    onClose: { showCropSheet = false }
+                )
+            }
         }
         .task(id: item.id) {
             await loadStudioSession()
@@ -695,7 +745,7 @@ struct SceneLayerStudioView: View {
     }
 
     private var bottomDock: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
+        CenteredAdaptiveDock {
             HStack(spacing: 10) {
                 Button {
                     guard let compositedImage else { return }
@@ -749,6 +799,20 @@ struct SceneLayerStudioView: View {
                 .disabled(compositedImage == nil)
                 .buttonStyle(StickerPressButtonStyle())
 
+                Button {
+                    showCropSheet = true
+                } label: {
+                    Label("比例裁切", systemImage: "crop")
+                        .font(.system(size: 13.5, weight: .semibold))
+                        .foregroundColor(chromeForeground)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 9)
+                        .background(chromePillFill, in: Capsule())
+                }
+                .disabled(compositedImage == nil || isRendering)
+                .buttonStyle(StickerPressButtonStyle())
+
                 if characterGroupsCount > 0 {
                     Button {
                         Task { await exportAllCharacterCutouts() }
@@ -774,12 +838,12 @@ struct SceneLayerStudioView: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
+            .background(WallPullPalette.canvas(effectiveScheme).opacity(0.92), in: Capsule())
+            .overlay(
+                Capsule().strokeBorder(WallPullPalette.hairline(effectiveScheme), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.18), radius: 14, y: 5)
         }
-        .background(WallPullPalette.canvas(effectiveScheme).opacity(0.92), in: Capsule())
-        .overlay(
-            Capsule().strokeBorder(WallPullPalette.hairline(effectiveScheme), lineWidth: 1)
-        )
-        .shadow(color: .black.opacity(0.18), radius: 14, y: 5)
         .padding(.horizontal, 16)
         .padding(.bottom, 6)
     }

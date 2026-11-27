@@ -1,5 +1,8 @@
 use crate::bridge::{AppController, UiCommand, WM_UI_COMMAND};
-use crate::tray::{CMD_TRAY_EXIT, CMD_TRAY_SHOW, TrayManager, WM_TRAY_CALLBACK};
+use crate::tray::{
+    CMD_TRAY_EXIT, CMD_TRAY_OPEN_EXPORT, CMD_TRAY_RANDOM_ALL, CMD_TRAY_RANDOM_FAV,
+    CMD_TRAY_SHOW, TrayManager, WM_TRAY_CALLBACK,
+};
 use serde_json::json;
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use windows::Win32::Foundation::{
@@ -406,13 +409,50 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_TRAY_CALLBACK => {
             let evt = (lparam.0 & 0xFFFF) as u32;
+            let picked_cmd = if evt == WM_RBUTTONUP || evt == WM_CONTEXTMENU {
+                let menu_args = unsafe { get_state_mut(hwnd) }.map(|st| {
+                    let has_wallpapers = !st.app.wallpapers.is_empty();
+                    let has_favorites = st
+                        .app
+                        .settings
+                        .favorite_ids
+                        .iter()
+                        .any(|id| st.app.wallpapers.contains_key(id));
+                    (
+                        st.app.settings.theme_mode == "dark",
+                        st.app.settings.spark_color.clone(),
+                        has_favorites,
+                        has_wallpapers,
+                    )
+                });
+                menu_args.and_then(|(is_dark, spark_color, has_favorites, has_wallpapers)| {
+                    crate::tray_menu::show_tray_popup_menu(
+                        hwnd,
+                        is_dark,
+                        &spark_color,
+                        has_favorites,
+                        has_wallpapers,
+                    )
+                })
+            } else {
+                None
+            };
             if let Some(st) = unsafe { get_state_mut(hwnd) } {
                 if evt == WM_LBUTTONUP || evt == WM_LBUTTONDBLCLK {
                     unsafe { restore_and_activate_window(hwnd) };
                 } else if evt == WM_RBUTTONUP || evt == WM_CONTEXTMENU {
-                    if let Some(cmd) = st.tray.show_context_menu() {
+                    if let Some(cmd) = picked_cmd {
                         match cmd {
                             CMD_TRAY_SHOW => unsafe { restore_and_activate_window(hwnd) },
+                            CMD_TRAY_RANDOM_FAV => {
+                                st.app.apply_random_desktop_from_tray(true);
+                            }
+                            CMD_TRAY_RANDOM_ALL => {
+                                st.app.apply_random_desktop_from_tray(false);
+                            }
+                            CMD_TRAY_OPEN_EXPORT => {
+                                st.app.open_export_directory();
+                            }
                             CMD_TRAY_EXIT => {
                                 st.app.notify_ui(UiCommand::ExitExplicit);
                             }

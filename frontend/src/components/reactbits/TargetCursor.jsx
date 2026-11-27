@@ -91,8 +91,6 @@ const TargetCursor = ({
     const press = { x: 0, v: 0 };
     const presence = { x: 0, v: 0 };
     let target = null;
-    let targetRect = null;
-    let targetIsDynamic = false;
     let targetRadius = 0;
     let quarter = 0;
     let spinSpeed = 0;
@@ -141,15 +139,7 @@ const TargetCursor = ({
         quarter = Math.round(angle / QUARTER);
         const corner = parseFloat(getComputedStyle(target).borderTopLeftRadius) || 0;
         targetRadius = corner;
-        targetIsDynamic =
-          target.classList.contains('holo-card__rotor') ||
-          target.classList.contains('fusion-magnet-inner') ||
-          target.classList.contains('decay-card');
-        targetRect = target.getBoundingClientRect();
         spinSpeed = 0;
-      } else {
-        targetRect = null;
-        targetIsDynamic = false;
       }
     };
 
@@ -160,7 +150,22 @@ const TargetCursor = ({
       last = now;
 
       if (target && !target.isConnected) lockOn(null);
-      const rect = target ? (targetIsDynamic ? target.getBoundingClientRect() : targetRect) : null;
+      let rect = target ? target.getBoundingClientRect() : null;
+      if (
+        target &&
+        rect &&
+        pointer.inside &&
+        !pointer.pressed &&
+        (rect.width <= 0 ||
+          rect.height <= 0 ||
+          pointer.x < rect.left - 8 ||
+          pointer.x > rect.right + 8 ||
+          pointer.y < rect.top - 8 ||
+          pointer.y > rect.bottom + 8)
+      ) {
+        lockOn(findTarget(pointer.x, pointer.y, null));
+        rect = target ? target.getBoundingClientRect() : null;
+      }
       const locked = !!rect && pointer.inside;
       const snapW = 4.6 / s.hoverDuration;
       const snapK = snapW * snapW;
@@ -320,9 +325,6 @@ const TargetCursor = ({
         clickRaf = 0;
         if (!alive || !pointer.inside) return;
         lockOn(findTarget(pointer.x, pointer.y));
-        if (target && target.isConnected) {
-          targetRect = target.getBoundingClientRect();
-        }
         wake();
       });
     };
@@ -351,9 +353,6 @@ const TargetCursor = ({
     const onScrollOrResize = () => {
       if (!pointer.inside) return;
       lockOn(findTarget(pointer.x, pointer.y));
-      if (target && target.isConnected) {
-        targetRect = target.getBoundingClientRect();
-      }
       wake();
     };
 

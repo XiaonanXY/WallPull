@@ -26,20 +26,31 @@ export function preloadImageUrl(url) {
   }
 }
 
-export function preloadWallpaperBatch(items, startIndex = 0, count = 24) {
+export function isGeneratedThumbUrl(url) {
+  return typeof url === 'string' && /(?:-img-thumb-v3\.jpg|-aspect-v4\.jpg)(?:[?#]|$)/i.test(url)
+}
+
+export function isLegacySquarePreviewUrl(url) {
+  return typeof url === 'string' && /(?:-img-thumb-v2\.jpg|-square-v3\.jpg|-480p-v1\.mp4)(?:[?#]|$)/i.test(url)
+}
+
+export function preloadWallpaperBatch(items, startIndex = 0, count = 12) {
   if (!Array.isArray(items) || items.length === 0) return
   const slice = items.slice(startIndex, startIndex + count)
   const run = () => {
     for (const item of slice) {
-      const url = item.previewUrl || (item.type !== 'video' ? item.mediaUrl : '')
-      if (url) preloadImageUrl(url)
+      if (isGeneratedThumbUrl(item.previewUrl)) {
+        preloadImageUrl(item.previewUrl)
+      }
     }
   }
-  if (typeof globalThis.requestIdleCallback === 'function') {
-    globalThis.requestIdleCallback(run, { timeout: 600 })
-  } else {
-    globalThis.setTimeout(run, 32)
-  }
+  globalThis.setTimeout(() => {
+    if (typeof globalThis.requestIdleCallback === 'function') {
+      globalThis.requestIdleCallback(run, { timeout: 600 })
+    } else {
+      run()
+    }
+  }, 180)
 }
 
 export function getSavedVideoTime(id) {
